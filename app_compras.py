@@ -109,35 +109,39 @@ def main():
     with col_form:
         st.markdown(f"**📝 Nova Compra - {sku_sel}**")
         
-        # BOTÕES DE FORNECEDORES (FORA DO FORM)
-        if lista_forn and 'forn_selecionado' not in st.session_state:
-            st.caption("📋 Fornecedores recentes (clique para usar):")
-            cols_btn = st.columns(min(len(lista_forn), 4))
-            for idx, f in enumerate(lista_forn[:8]):  # Máx 8
-                if cols_btn[idx % 4].button(f, key=f"forn_{idx}", use_container_width=True):
-                    st.session_state.forn_selecionado = f
-                    st.rerun()
+        # ===== FORNECEDOR (FORA DO FORM) =====
+        st.markdown("**Fornecedor**")
+        
+        col_sel, col_novo = st.columns([1.2, 1])
+        
+        # Selectbox: fornecedores existentes
+        forn_existente = col_sel.selectbox(
+            "Selecionar existente",
+            [""] + lista_forn,
+            key="sel_forn_existente"
+        )
+        
+        # Text input: cadastrar novo
+        forn_novo = col_novo.text_input(
+            "Ou cadastrar novo",
+            placeholder="Digite novo",
+            key="txt_forn_novo"
+        )
+        
+        # Determinar qual usar (novo sobrepõe existente)
+        if forn_novo.strip():
+            forn_final = forn_novo.strip()
+        elif forn_existente:
+            forn_final = forn_existente
+        else:
+            forn_final = ""
+        
+        # ===== FIM FORNECEDOR =====
         
         with st.form("frm", clear_on_submit=True):
             c1, c2 = st.columns(2)
             dt = c1.date_input("Data", date.today(), format="DD/MM/YYYY")
             nf = c2.text_input("NF nº", placeholder="Opcional")
-            
-            # FORNECEDOR - Text input simples
-            st.markdown("**Fornecedor**")
-            
-            # Se clicou em um botão, usar esse valor
-            valor_inicial = st.session_state.get('forn_selecionado', '')
-            if valor_inicial:
-                del st.session_state.forn_selecionado
-            
-            forn = st.text_input(
-                "Digite o nome",
-                value=valor_inicial,
-                placeholder="Digite o nome do fornecedor",
-                key="forn_input",
-                label_visibility="collapsed"
-            )
             
             c3, c4 = st.columns(2)
             qtd = c3.number_input("Qtd", 1, step=1)
@@ -147,8 +151,8 @@ def main():
             
             if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary"):
                 # VALIDAÇÕES
-                if not forn or not forn.strip():
-                    st.error("⚠️ Preencha o Fornecedor")
+                if not forn_final:
+                    st.error("⚠️ Selecione ou cadastre um fornecedor")
                 elif not pnf or not pnf.strip():
                     st.error("⚠️ Preencha o Preço NF")
                 else:
@@ -166,7 +170,7 @@ def main():
                                     (data_compra, sku, fornecedor, quantidade, preco_unitario, custo_considerado, valor_total, numero_nf)
                                     VALUES (:d, :s, :f, :q, :p, :c, :t, :nf)
                                 """), {
-                                    "d": dt, "s": sku_sel, "f": forn.strip(), "q": qtd, 
+                                    "d": dt, "s": sku_sel, "f": forn_final, "q": qtd, 
                                     "p": v_nf, "c": v_custo, "t": qtd * v_nf, "nf": nf.strip() or None
                                 })
                             
