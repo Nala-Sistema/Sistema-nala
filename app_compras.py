@@ -188,7 +188,7 @@ def main():
                             st.error("❌ Valores devem ser positivos")
                         else:
                             with engine.begin() as conn:  # Auto-commit
-                                # Gravar histórico
+                                # 1. Gravar histórico
                                 conn.execute(text("""
                                     INSERT INTO fato_compras 
                                     (data_compra, sku, fornecedor, quantidade, preco_unitario, custo_considerado, valor_total, numero_nf)
@@ -197,6 +197,13 @@ def main():
                                     "d": dt, "s": sku_sel, "f": forn_final, "q": qtd, 
                                     "p": v_nf, "c": v_custo, "t": qtd * v_nf, "nf": nf.strip() or None
                                 })
+                                
+                                # 2. SINCRONIZAR dim_produtos_custos com preco_unitario
+                                conn.execute(text("""
+                                    UPDATE dim_produtos_custos 
+                                    SET preco_compra = :p
+                                    WHERE sku = :s
+                                """), {"p": v_nf, "s": sku_sel})
                             
                             st.success(f"✅ Gravado! Preço NF: {fmt_moeda(v_nf)} | Custo Considerado: {fmt_moeda(v_custo)}")
                             st.rerun()
@@ -307,9 +314,28 @@ def main():
                 if cy.button("🗑️ Excluir"):
                     try:
                         with engine.begin() as conn:
+                            # 1. Deletar o registro
                             conn.execute(text("DELETE FROM fato_compras WHERE id = :id"), {"id": sel})
+                            
+                            # 2. SINCRONIZAR: Buscar última compra restante
+                            ultimo_registro = conn.execute(text("""
+                                SELECT preco_unitario 
+                                FROM fato_compras 
+                                WHERE sku = :s 
+                                ORDER BY id DESC 
+                                LIMIT 1
+                            """), {"s": sku_sel}).fetchone()
+                            
+                            # 3. Atualizar dim_produtos_custos
+                            novo_preco = float(ultimo_registro[0]) if ultimo_registro else 0.0
+                            
+                            conn.execute(text("""
+                                UPDATE dim_produtos_custos 
+                                SET preco_compra = :p
+                                WHERE sku = :s
+                            """), {"p": novo_preco, "s": sku_sel})
                         
-                        st.success("✅ Registro excluído!")
+                        st.success(f"✅ Registro excluído! Preço restaurado: {fmt_moeda(novo_preco)}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {e}")
