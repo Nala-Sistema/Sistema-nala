@@ -86,26 +86,14 @@ def main():
             dt = c1.date_input("Data", date.today(), format="DD/MM/YYYY")
             nf = c2.text_input("NF nº", placeholder="Opcional")
             
-            # FORNECEDOR FLUIDO (sem radio button)
-            forn = st.text_input(
-                "Fornecedor", 
-                placeholder="Digite ou selecione",
-                help="💡 Digite um nome novo ou escolha um existente abaixo"
-            )
+            # FORNECEDOR - Selectbox + Campo Novo
+            opcoes_forn = [""] + lista_forn + ["➕ Cadastrar Novo"]
+            escolha_forn = st.selectbox("Fornecedor", opcoes_forn)
             
-            # Mostrar sugestões se houver
-            if lista_forn:
-                st.caption("📋 Fornecedores cadastrados:")
-                cols_forn = st.columns(min(len(lista_forn), 4))
-                for idx, f in enumerate(lista_forn[:8]):  # Máx 8 sugestões
-                    if cols_forn[idx % 4].button(f, key=f"btn_{f}", use_container_width=True):
-                        st.session_state.forn_selecionado = f
-                        st.rerun()
-            
-            # Se clicou em um botão, preencher
-            if 'forn_selecionado' in st.session_state:
-                forn = st.session_state.forn_selecionado
-                del st.session_state.forn_selecionado
+            if escolha_forn == "➕ Cadastrar Novo":
+                forn = st.text_input("Nome do Novo Fornecedor", placeholder="Digite o nome completo", key="novo_forn")
+            else:
+                forn = escolha_forn
             
             c3, c4 = st.columns(2)
             qtd = c3.number_input("Qtd", 1, step=1)
