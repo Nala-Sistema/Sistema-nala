@@ -109,21 +109,35 @@ def main():
     with col_form:
         st.markdown(f"**📝 Nova Compra - {sku_sel}**")
         
+        # BOTÕES DE FORNECEDORES (FORA DO FORM)
+        if lista_forn and 'forn_selecionado' not in st.session_state:
+            st.caption("📋 Fornecedores recentes (clique para usar):")
+            cols_btn = st.columns(min(len(lista_forn), 4))
+            for idx, f in enumerate(lista_forn[:8]):  # Máx 8
+                if cols_btn[idx % 4].button(f, key=f"forn_{idx}", use_container_width=True):
+                    st.session_state.forn_selecionado = f
+                    st.rerun()
+        
         with st.form("frm", clear_on_submit=True):
             c1, c2 = st.columns(2)
             dt = c1.date_input("Data", date.today(), format="DD/MM/YYYY")
             nf = c2.text_input("NF nº", placeholder="Opcional")
             
-            # FORNECEDOR - Selectbox + Campo Novo
-            opcoes_forn = [""] + lista_forn + ["➕ Cadastrar Novo"]
-            escolha_forn = st.selectbox("Fornecedor", opcoes_forn)
+            # FORNECEDOR - Text input simples
+            st.markdown("**Fornecedor**")
             
-            if escolha_forn == "➕ Cadastrar Novo":
-                forn = st.text_input("Nome do Novo Fornecedor", value="", placeholder="Digite o nome completo", key="novo_forn")
-            elif escolha_forn == "":
-                forn = ""
-            else:
-                forn = escolha_forn
+            # Se clicou em um botão, usar esse valor
+            valor_inicial = st.session_state.get('forn_selecionado', '')
+            if valor_inicial:
+                del st.session_state.forn_selecionado
+            
+            forn = st.text_input(
+                "Digite o nome",
+                value=valor_inicial,
+                placeholder="Digite o nome do fornecedor",
+                key="forn_input",
+                label_visibility="collapsed"
+            )
             
             c3, c4 = st.columns(2)
             qtd = c3.number_input("Qtd", 1, step=1)
@@ -192,7 +206,7 @@ def main():
                 r = conn.execute(query, {"s": sku_sel}).fetchone()
             
             if r:
-                nf_val, emb, mdo, ads, custo_cons = r
+                nf_val, emb, mdo, ads, custo_cons = [float(x) for x in r]
                 
                 # CUSTO TOTAL = Preço NF + Custos Fixos
                 custo_total = nf_val + emb + mdo + ads
@@ -226,9 +240,9 @@ def main():
             """), {"s": sku_sel}).fetchone()
         
         if custos_fixos:
-            emb_fix, mdo_fix, ads_fix = custos_fixos
+            emb_fix, mdo_fix, ads_fix = float(custos_fixos[0]), float(custos_fixos[1]), float(custos_fixos[2])
         else:
-            emb_fix, mdo_fix, ads_fix = 0, 0, 0
+            emb_fix, mdo_fix, ads_fix = 0.0, 0.0, 0.0
         
         df_h = pd.read_sql(text("""
             SELECT id, data_compra, fornecedor, numero_nf, quantidade, preco_unitario, custo_considerado
@@ -241,10 +255,10 @@ def main():
             df_show = df_h.copy()
             df_show['Data'] = df_show['data_compra'].apply(fmt_data)
             df_show['NF nº'] = df_show['numero_nf'].fillna('-')
-            df_show['Preço NF'] = df_show['preco_unitario'].apply(fmt_moeda)
-            df_show['Custo Considerado'] = df_show['custo_considerado'].apply(fmt_moeda)
-            # CUSTO TOTAL = Preço NF + Custos Fixos
-            df_show['Custo Total'] = df_show['preco_unitario'].apply(lambda x: fmt_moeda(x + emb_fix + mdo_fix + ads_fix))
+            df_show['Preço NF'] = df_show['preco_unitario'].apply(lambda x: fmt_moeda(float(x)))
+            df_show['Custo Considerado'] = df_show['custo_considerado'].apply(lambda x: fmt_moeda(float(x)))
+            # CUSTO TOTAL = Preço NF + Custos Fixos (converter para float)
+            df_show['Custo Total'] = df_show['preco_unitario'].apply(lambda x: fmt_moeda(float(x) + emb_fix + mdo_fix + ads_fix))
             
             st.dataframe(
                 df_show[['id', 'Data', 'fornecedor', 'NF nº', 'quantidade', 'Preço NF', 'Custo Considerado', 'Custo Total']],
