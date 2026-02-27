@@ -24,31 +24,37 @@ def main():
     st.markdown("""
         <style>
         /* Remover espaços */
-        .main { padding-top: 0.5rem !important; }
-        .block-container { padding-top: 1rem !important; padding-bottom: 0.5rem !important; }
-        h1, h2, h3, h4 { margin: 0 !important; padding: 0.3rem 0 !important; font-size: 1rem !important; }
+        .main { padding-top: 0.3rem !important; }
+        .block-container { padding-top: 0.5rem !important; padding-bottom: 0.3rem !important; }
+        h1, h2, h3, h4 { margin: 0 !important; padding: 0.2rem 0 !important; font-size: 0.95rem !important; }
         
         /* Cards compactos */
         div[data-testid="stMetric"] { 
             background-color: #f8f9fa; 
             border: 1px solid #dee2e6; 
-            padding: 6px 8px !important; 
-            border-radius: 5px; 
-            height: 60px !important;
+            padding: 5px 8px !important; 
+            border-radius: 4px; 
+            height: 55px !important;
             display: flex;
             flex-direction: column;
             justify-content: center;
-            margin: 2px 0 !important;
+            margin: 1px 0 !important;
         }
-        div[data-testid="stMetric"] label { font-size: 0.7rem !important; margin: 0 !important; }
-        div[data-testid="stMetric"] div { font-size: 0.95rem !important; font-weight: 600; margin: 0 !important; }
+        div[data-testid="stMetric"] label { font-size: 0.68rem !important; margin: 0 !important; }
+        div[data-testid="stMetric"] div { font-size: 0.9rem !important; font-weight: 600; margin: 0 !important; }
         
-        /* Form compacto */
+        /* Form compacto com altura fixa */
         .stForm { 
             border: 1px solid #dee2e6; 
-            padding: 10px !important; 
-            border-radius: 5px; 
+            padding: 8px !important; 
+            border-radius: 4px; 
             background-color: #fff;
+            min-height: 440px !important;
+        }
+        
+        /* Container de cards alinhado */
+        div[data-testid="column"]:has(div[data-testid="stMetric"]) {
+            min-height: 440px !important;
         }
         
         /* Labels menores */
@@ -56,30 +62,45 @@ def main():
         div[data-testid="stTextInput"] label,
         div[data-testid="stDateInput"] label,
         div[data-testid="stNumberInput"] label { 
-            font-size: 0.75rem !important; 
+            font-size: 0.72rem !important; 
             font-weight: 500;
-            margin-bottom: 2px !important;
+            margin-bottom: 1px !important;
         }
         
         /* Inputs menores */
         input, select { 
-            font-size: 0.85rem !important; 
-            padding: 4px 8px !important;
-            min-height: 32px !important;
+            font-size: 0.82rem !important; 
+            padding: 3px 6px !important;
+            min-height: 30px !important;
         }
         
         /* Tabela */
-        .stDataFrame { font-size: 0.8rem !important; }
+        .stDataFrame { font-size: 0.78rem !important; }
         
         /* Botões */
         .stButton button { 
-            padding: 6px 12px !important; 
-            font-size: 0.85rem !important;
+            padding: 5px 10px !important; 
+            font-size: 0.82rem !important;
         }
         
         /* Espaçamento entre elementos */
         div[data-testid="column"] > div { margin-bottom: 0 !important; }
-        hr { margin: 8px 0 !important; }
+        hr { margin: 6px 0 !important; }
+        
+        /* Mensagens de sucesso/erro */
+        .stSuccess, .stError, .stWarning { 
+            padding: 6px 10px !important; 
+            font-size: 0.82rem !important;
+            margin: 4px 0 !important;
+        }
+        
+        /* Caption (nome do produto) */
+        .stCaption { 
+            font-size: 0.7rem !important;
+            color: #666 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -99,6 +120,9 @@ def main():
     if not sku_sel:
         st.info("Selecione um produto.")
         return
+    
+    # Buscar nome do produto UMA VEZ
+    nome_produto = df_p[df_p['sku'] == sku_sel]['nome'].iloc[0] if not df_p[df_p['sku'] == sku_sel].empty else ""
 
     st.markdown("---")
 
@@ -108,6 +132,7 @@ def main():
     # FORMULÁRIO
     with col_form:
         st.markdown(f"**📝 Nova Compra - {sku_sel}**")
+        st.caption(nome_produto)
         
         # ===== FORNECEDOR (FORA DO FORM) =====
         st.markdown("**Fornecedor**")
@@ -185,6 +210,7 @@ def main():
     # INDICADORES
     with col_ind:
         st.markdown(f"**📊 {sku_sel}**")
+        st.caption(nome_produto)
         
         query = text("""
             WITH ult AS (
@@ -232,7 +258,7 @@ def main():
 
     # HISTÓRICO
     st.markdown("---")
-    st.markdown(f"**🕒 Histórico - {sku_sel}**")
+    st.markdown(f"**🕒 Histórico - {sku_sel} - {nome_produto}**")
     
     try:
         # Buscar custos fixos do produto
