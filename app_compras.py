@@ -167,7 +167,7 @@ def main():
         qtd = c3.number_input("Qtd", 1, step=1, key="qtd_compra")
         pnf = c4.text_input("Preço NF", placeholder="Ex: 15,50", key="preco_nf")
         
-        custo_input = st.text_input("Custo Considerado", placeholder="Opcional - se vazio = Preço NF", key="custo_consid")
+        custo_input = st.text_input("Custo Considerado", placeholder="Opcional - se vazio = Custo Total", key="custo_consid")
         
         # ===== BOTÃO GRAVAR =====
         if st.button("💾 Gravar Compra", use_container_width=True, type="primary", key="btn_gravar"):
@@ -179,7 +179,23 @@ def main():
             else:
                 try:
                     v_nf = float(pnf.replace(',', '.').strip())
-                    v_custo = float(custo_input.replace(',', '.').strip()) if custo_input.strip() else v_nf
+                    
+                    # Se Custo Considerado vazio, calcular custo total
+                    if custo_input.strip():
+                        v_custo = float(custo_input.replace(',', '.').strip())
+                    else:
+                        # Buscar custos fixos para calcular custo total
+                        with engine.connect() as conn_custos:
+                            custos_fixos = conn_custos.execute(text("""
+                                SELECT COALESCE(embalagem, 0), COALESCE(mdo, 0), COALESCE(custo_ads, 0)
+                                FROM dim_produtos_custos WHERE sku = :s
+                            """), {"s": sku_sel}).fetchone()
+                        
+                        if custos_fixos:
+                            emb_val, mdo_val, ads_val = [float(x) for x in custos_fixos]
+                            v_custo = v_nf + emb_val + mdo_val + ads_val  # Custo total
+                        else:
+                            v_custo = v_nf  # Fallback
                     
                     if v_nf <= 0 or v_custo <= 0:
                         st.error("❌ Valores devem ser positivos")
@@ -252,18 +268,18 @@ def main():
                         ult = conn.execute(query_ult, {"s": sku_sel}).fetchone()
                         preco_digitado = float(ult[0]) if ult else 0.0
                 
-                # Custo Considerado digitado (ou igual ao preço NF)
+                # CÁLCULO AUTOMÁTICO DO CUSTO TOTAL
+                custo_total_calculado = preco_digitado + emb + mdo + ads
+                
+                # Custo Considerado: Se vazio, usa CUSTO TOTAL (não Preço NF!)
                 custo_consid_valor = 0.0
                 try:
                     if custo_input and custo_input.strip():
                         custo_consid_valor = float(custo_input.replace(',', '.').strip())
                     else:
-                        custo_consid_valor = preco_digitado
+                        custo_consid_valor = custo_total_calculado  # ✅ Usa custo total calculado
                 except:
-                    custo_consid_valor = preco_digitado
-                
-                # CÁLCULO AUTOMÁTICO
-                custo_total_calculado = preco_digitado + emb + mdo + ads
+                    custo_consid_valor = custo_total_calculado
                 
                 # CARDS
                 c1, c2 = st.columns(2)
@@ -279,7 +295,10 @@ def main():
                 
                 # Dica visual
                 if preco_digitado > 0:
-                    st.caption("✅ Calculadora ativa (usando valor digitado)")
+                    if custo_input and custo_input.strip():
+                        st.caption("✅ Custo Considerado definido manualmente")
+                    else:
+                        st.caption("ℹ️ Custo Considerado = Custo Total (automático)")
                 else:
                     st.caption("ℹ️ Digite o Preço NF para calcular")
                 
