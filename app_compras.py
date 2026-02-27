@@ -129,30 +129,28 @@ def main():
     # LAYOUT
     col_form, col_ind = st.columns([1.6, 1.4])
 
-    # FORMULÁRIO
+    # FORMULÁRIO (SEM st.form para permitir calculadora ao vivo)
     with col_form:
         st.markdown(f"**📝 Nova Compra - {sku_sel}** - {nome_produto[:50]}")
         
-        # ===== FORNECEDOR (FORA DO FORM) =====
+        # ===== FORNECEDOR =====
         st.markdown("**Fornecedor**")
         
         col_sel, col_novo = st.columns([1.2, 1])
         
-        # Selectbox: fornecedores existentes
         forn_existente = col_sel.selectbox(
             "Selecionar existente",
             [""] + lista_forn,
             key="sel_forn_existente"
         )
         
-        # Text input: cadastrar novo
         forn_novo = col_novo.text_input(
             "Ou cadastrar novo",
             placeholder="Digite novo",
             key="txt_forn_novo"
         )
         
-        # Determinar qual usar (novo sobrepõe existente)
+        # Determinar qual usar
         if forn_novo.strip():
             forn_final = forn_novo.strip()
         elif forn_existente:
@@ -160,104 +158,133 @@ def main():
         else:
             forn_final = ""
         
-        # ===== FIM FORNECEDOR =====
+        # ===== DADOS DA COMPRA =====
+        c1, c2 = st.columns(2)
+        dt = c1.date_input("Data", date.today(), format="DD/MM/YYYY", key="data_compra")
+        nf = c2.text_input("NF nº", placeholder="Opcional", key="num_nf")
         
-        with st.form("frm", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            dt = c1.date_input("Data", date.today(), format="DD/MM/YYYY")
-            nf = c2.text_input("NF nº", placeholder="Opcional")
-            
-            c3, c4 = st.columns(2)
-            qtd = c3.number_input("Qtd", 1, step=1)
-            pnf = c4.text_input("Preço NF", placeholder="Ex: 15,50")
-            
-            custo = st.text_input("Custo Considerado", placeholder="Opcional - se vazio = Preço NF")
-            
-            if st.form_submit_button("💾 Gravar", use_container_width=True, type="primary"):
-                # VALIDAÇÕES
-                if not forn_final:
-                    st.error("⚠️ Selecione ou cadastre um fornecedor")
-                elif not pnf or not pnf.strip():
-                    st.error("⚠️ Preencha o Preço NF")
-                else:
-                    try:
-                        v_nf = float(pnf.replace(',', '.').strip())
-                        v_custo = float(custo.replace(',', '.').strip()) if custo.strip() else v_nf
+        c3, c4 = st.columns(2)
+        qtd = c3.number_input("Qtd", 1, step=1, key="qtd_compra")
+        pnf = c4.text_input("Preço NF", placeholder="Ex: 15,50", key="preco_nf")
+        
+        custo_input = st.text_input("Custo Considerado", placeholder="Opcional - se vazio = Preço NF", key="custo_consid")
+        
+        # ===== BOTÃO GRAVAR =====
+        if st.button("💾 Gravar Compra", use_container_width=True, type="primary", key="btn_gravar"):
+            # VALIDAÇÕES
+            if not forn_final:
+                st.error("⚠️ Selecione ou cadastre um fornecedor")
+            elif not pnf or not pnf.strip():
+                st.error("⚠️ Preencha o Preço NF")
+            else:
+                try:
+                    v_nf = float(pnf.replace(',', '.').strip())
+                    v_custo = float(custo_input.replace(',', '.').strip()) if custo_input.strip() else v_nf
+                    
+                    if v_nf <= 0 or v_custo <= 0:
+                        st.error("❌ Valores devem ser positivos")
+                    else:
+                        with engine.begin() as conn:
+                            # 1. Gravar histórico
+                            conn.execute(text("""
+                                INSERT INTO fato_compras 
+                                (data_compra, sku, fornecedor, quantidade, preco_unitario, custo_considerado, valor_total, numero_nf)
+                                VALUES (:d, :s, :f, :q, :p, :c, :t, :nf)
+                            """), {
+                                "d": dt, "s": sku_sel, "f": forn_final, "q": qtd, 
+                                "p": v_nf, "c": v_custo, "t": qtd * v_nf, "nf": nf.strip() or None
+                            })
+                            
+                            # 2. SINCRONIZAR dim_produtos_custos
+                            conn.execute(text("""
+                                UPDATE dim_produtos_custos 
+                                SET preco_compra = :p
+                                WHERE sku = :s
+                            """), {"p": v_nf, "s": sku_sel})
                         
-                        if v_nf <= 0 or v_custo <= 0:
-                            st.error("❌ Valores devem ser positivos")
-                        else:
-                            with engine.begin() as conn:  # Auto-commit
-                                # 1. Gravar histórico
-                                conn.execute(text("""
-                                    INSERT INTO fato_compras 
-                                    (data_compra, sku, fornecedor, quantidade, preco_unitario, custo_considerado, valor_total, numero_nf)
-                                    VALUES (:d, :s, :f, :q, :p, :c, :t, :nf)
-                                """), {
-                                    "d": dt, "s": sku_sel, "f": forn_final, "q": qtd, 
-                                    "p": v_nf, "c": v_custo, "t": qtd * v_nf, "nf": nf.strip() or None
-                                })
-                                
-                                # 2. SINCRONIZAR dim_produtos_custos com preco_unitario
-                                conn.execute(text("""
-                                    UPDATE dim_produtos_custos 
-                                    SET preco_compra = :p
-                                    WHERE sku = :s
-                                """), {"p": v_nf, "s": sku_sel})
-                            
-                            st.success(f"✅ Gravado! Preço NF: {fmt_moeda(v_nf)} | Custo Considerado: {fmt_moeda(v_custo)}")
-                            st.rerun()
-                            
-                    except ValueError:
-                        st.error("❌ Valores inválidos. Use: 15,50")
-                    except Exception as e:
-                        st.error(f"❌ Erro: {e}")
+                        st.success(f"✅ Gravado! Preço NF: {fmt_moeda(v_nf)} | Custo Considerado: {fmt_moeda(v_custo)}")
+                        st.rerun()
+                        
+                except ValueError:
+                    st.error("❌ Valores inválidos. Use: 15,50")
+                except Exception as e:
+                    st.error(f"❌ Erro: {e}")
 
-    # INDICADORES
+    # INDICADORES (CALCULADORA AO VIVO)
     with col_ind:
         st.markdown(f"**📊 {sku_sel}** - {nome_produto[:50]}")
         
-        query = text("""
-            WITH ult AS (
-                SELECT preco_unitario, custo_considerado
-                FROM fato_compras
-                WHERE sku = :s
-                ORDER BY id DESC
-                LIMIT 1
-            )
+        # Buscar custos fixos
+        query_custos = text("""
             SELECT 
-                COALESCE(u.preco_unitario, 0) as nf,
                 COALESCE(c.embalagem, 0) as emb,
                 COALESCE(c.mdo, 0) as mdo,
-                COALESCE(c.custo_ads, 0) as ads,
-                COALESCE(u.custo_considerado, 0) as custo_cons
+                COALESCE(c.custo_ads, 0) as ads
             FROM dim_produtos_custos c
-            LEFT JOIN ult u ON true
             WHERE c.sku = :s
         """)
         
         try:
             with engine.connect() as conn:
-                r = conn.execute(query, {"s": sku_sel}).fetchone()
+                custos = conn.execute(query_custos, {"s": sku_sel}).fetchone()
             
-            if r:
-                nf_val, emb, mdo, ads, custo_cons = [float(x) for x in r]
+            if custos:
+                emb, mdo, ads = [float(x) for x in custos]
                 
-                # CUSTO TOTAL = Preço NF + Custos Fixos
-                custo_total = nf_val + emb + mdo + ads
+                # CALCULADORA: Tentar usar valor digitado no campo Preço NF
+                preco_digitado = 0.0
+                try:
+                    if pnf and pnf.strip():
+                        preco_digitado = float(pnf.replace(',', '.').strip())
+                except:
+                    preco_digitado = 0.0
                 
+                # Se não digitou ainda, buscar última compra
+                if preco_digitado == 0.0:
+                    query_ult = text("""
+                        SELECT COALESCE(preco_unitario, 0)
+                        FROM fato_compras
+                        WHERE sku = :s
+                        ORDER BY id DESC
+                        LIMIT 1
+                    """)
+                    with engine.connect() as conn:
+                        ult = conn.execute(query_ult, {"s": sku_sel}).fetchone()
+                        preco_digitado = float(ult[0]) if ult else 0.0
+                
+                # Custo Considerado digitado (ou igual ao preço NF)
+                custo_consid_valor = 0.0
+                try:
+                    if custo_input and custo_input.strip():
+                        custo_consid_valor = float(custo_input.replace(',', '.').strip())
+                    else:
+                        custo_consid_valor = preco_digitado
+                except:
+                    custo_consid_valor = preco_digitado
+                
+                # CÁLCULO AUTOMÁTICO
+                custo_total_calculado = preco_digitado + emb + mdo + ads
+                
+                # CARDS
                 c1, c2 = st.columns(2)
-                c1.metric("NF Atual", fmt_moeda(nf_val))
-                c2.metric("Embalagem", fmt_moeda(emb))
+                c1.metric("💵 NF Digitado", fmt_moeda(preco_digitado))
+                c2.metric("📦 Embalagem", fmt_moeda(emb))
                 
                 c3, c4 = st.columns(2)
-                c3.metric("MDO", fmt_moeda(mdo))
-                c4.metric("ADS", fmt_moeda(ads))
+                c3.metric("👷 MDO", fmt_moeda(mdo))
+                c4.metric("📢 ADS", fmt_moeda(ads))
                 
-                st.metric("📦 CUSTO TOTAL", fmt_moeda(custo_total))
-                st.metric("💎 Custo Considerado", fmt_moeda(custo_cons))
+                st.metric("📊 CUSTO TOTAL", fmt_moeda(custo_total_calculado))
+                st.metric("💎 Custo Considerado", fmt_moeda(custo_consid_valor))
+                
+                # Dica visual
+                if preco_digitado > 0:
+                    st.caption("✅ Calculadora ativa (usando valor digitado)")
+                else:
+                    st.caption("ℹ️ Digite o Preço NF para calcular")
+                
             else:
-                st.warning("Sem dados de custo")
+                st.warning("⚠️ Produto sem dados de custo")
         except Exception as e:
             st.error(f"❌ {e}")
 
