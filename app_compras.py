@@ -18,40 +18,68 @@ def fmt_data(d):
     return d.strftime('%d/%m/%Y')
 
 def main():
-    st.markdown("<h3>🛒 Registro de Compras</h3>", unsafe_allow_html=True)
+    st.markdown("<h4 style='margin:0;padding:5px 0;'>🛒 Registro de Compras</h4>", unsafe_allow_html=True)
     
-    # CSS COMPACTO
+    # CSS ULTRA COMPACTO
     st.markdown("""
         <style>
-        /* Compactar tudo */
-        .main { padding-top: 1rem; }
-        h1, h2, h3 { margin: 0; padding: 0.5rem 0; font-size: 1.2rem; }
+        /* Remover espaços */
+        .main { padding-top: 0.5rem !important; }
+        .block-container { padding-top: 1rem !important; padding-bottom: 0.5rem !important; }
+        h1, h2, h3, h4 { margin: 0 !important; padding: 0.3rem 0 !important; font-size: 1rem !important; }
+        
+        /* Cards compactos */
         div[data-testid="stMetric"] { 
             background-color: #f8f9fa; 
             border: 1px solid #dee2e6; 
-            padding: 8px 10px; 
-            border-radius: 6px; 
-            height: 70px;
+            padding: 6px 8px !important; 
+            border-radius: 5px; 
+            height: 60px !important;
             display: flex;
             flex-direction: column;
             justify-content: center;
+            margin: 2px 0 !important;
         }
-        div[data-testid="stMetric"] label { font-size: 0.75rem !important; }
-        div[data-testid="stMetric"] div { font-size: 1.1rem !important; font-weight: 600; }
+        div[data-testid="stMetric"] label { font-size: 0.7rem !important; margin: 0 !important; }
+        div[data-testid="stMetric"] div { font-size: 0.95rem !important; font-weight: 600; margin: 0 !important; }
+        
+        /* Form compacto */
         .stForm { 
             border: 1px solid #dee2e6; 
-            padding: 12px; 
-            border-radius: 6px; 
+            padding: 10px !important; 
+            border-radius: 5px; 
             background-color: #fff;
         }
+        
+        /* Labels menores */
         div[data-testid="stSelectbox"] label,
         div[data-testid="stTextInput"] label,
         div[data-testid="stDateInput"] label,
         div[data-testid="stNumberInput"] label { 
-            font-size: 0.85rem !important; 
+            font-size: 0.75rem !important; 
             font-weight: 500;
+            margin-bottom: 2px !important;
         }
-        .stDataFrame { font-size: 0.85rem; }
+        
+        /* Inputs menores */
+        input, select { 
+            font-size: 0.85rem !important; 
+            padding: 4px 8px !important;
+            min-height: 32px !important;
+        }
+        
+        /* Tabela */
+        .stDataFrame { font-size: 0.8rem !important; }
+        
+        /* Botões */
+        .stButton button { 
+            padding: 6px 12px !important; 
+            font-size: 0.85rem !important;
+        }
+        
+        /* Espaçamento entre elementos */
+        div[data-testid="column"] > div { margin-bottom: 0 !important; }
+        hr { margin: 8px 0 !important; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -91,7 +119,9 @@ def main():
             escolha_forn = st.selectbox("Fornecedor", opcoes_forn)
             
             if escolha_forn == "➕ Cadastrar Novo":
-                forn = st.text_input("Nome do Novo Fornecedor", placeholder="Digite o nome completo", key="novo_forn")
+                forn = st.text_input("Nome do Novo Fornecedor", value="", placeholder="Digite o nome completo", key="novo_forn")
+            elif escolha_forn == "":
+                forn = ""
             else:
                 forn = escolha_forn
             
@@ -116,7 +146,7 @@ def main():
                             st.error("❌ Valores devem ser positivos")
                         else:
                             with engine.begin() as conn:  # Auto-commit
-                                # 1. Gravar histórico
+                                # Gravar histórico
                                 conn.execute(text("""
                                     INSERT INTO fato_compras 
                                     (data_compra, sku, fornecedor, quantidade, preco_unitario, custo_considerado, valor_total, numero_nf)
@@ -125,22 +155,8 @@ def main():
                                     "d": dt, "s": sku_sel, "f": forn.strip(), "q": qtd, 
                                     "p": v_nf, "c": v_custo, "t": qtd * v_nf, "nf": nf.strip() or None
                                 })
-                                
-                                # 2. Atualizar custo (FORÇAR UPDATE)
-                                result = conn.execute(text("""
-                                    UPDATE dim_produtos_custos 
-                                    SET preco_compra = :c,
-                                        custo_final = :c + COALESCE(embalagem, 0) + COALESCE(mdo, 0) + COALESCE(custo_ads, 0)
-                                    WHERE sku = :s
-                                    RETURNING preco_compra, custo_final
-                                """), {"c": v_custo, "s": sku_sel})
-                                
-                                updated = result.fetchone()
-                                if updated:
-                                    st.success(f"✅ Gravado! Custo atualizado: {fmt_moeda(updated[0])}")
-                                else:
-                                    st.warning("⚠️ Gravado, mas produto não tem registro em dim_produtos_custos")
                             
+                            st.success(f"✅ Gravado! Preço NF: {fmt_moeda(v_nf)} | Custo Considerado: {fmt_moeda(v_custo)}")
                             st.rerun()
                             
                     except ValueError:
@@ -165,11 +181,8 @@ def main():
                 COALESCE(c.embalagem, 0) as emb,
                 COALESCE(c.mdo, 0) as mdo,
                 COALESCE(c.custo_ads, 0) as ads,
-                COALESCE(c.preco_compra, 0) as pc,
-                COALESCE(c.custo_final, 0) as cf,
-                COALESCE(p.preco_a_ser_considerado, 0) as pv
+                COALESCE(u.custo_considerado, 0) as custo_cons
             FROM dim_produtos_custos c
-            LEFT JOIN dim_produtos p ON c.sku = p.sku
             LEFT JOIN ult u ON true
             WHERE c.sku = :s
         """)
@@ -179,7 +192,10 @@ def main():
                 r = conn.execute(query, {"s": sku_sel}).fetchone()
             
             if r:
-                nf_val, emb, mdo, ads, pc, cf, pv = r
+                nf_val, emb, mdo, ads, custo_cons = r
+                
+                # CUSTO TOTAL = Preço NF + Custos Fixos
+                custo_total = nf_val + emb + mdo + ads
                 
                 c1, c2 = st.columns(2)
                 c1.metric("NF Atual", fmt_moeda(nf_val))
@@ -189,11 +205,8 @@ def main():
                 c3.metric("MDO", fmt_moeda(mdo))
                 c4.metric("ADS", fmt_moeda(ads))
                 
-                st.metric("📦 CUSTO TOTAL", fmt_moeda(cf))
-                st.metric("💰 PREÇO VENDA", fmt_moeda(pv))
-                
-                # DEBUG
-                st.caption(f"Debug: preco_compra={fmt_moeda(pc)} | calculado={fmt_moeda(pc+emb+mdo+ads)}")
+                st.metric("📦 CUSTO TOTAL", fmt_moeda(custo_total))
+                st.metric("💎 Custo Considerado", fmt_moeda(custo_cons))
             else:
                 st.warning("Sem dados de custo")
         except Exception as e:
@@ -204,8 +217,21 @@ def main():
     st.markdown(f"**🕒 Histórico - {sku_sel}**")
     
     try:
+        # Buscar custos fixos do produto
+        with engine.connect() as conn:
+            custos_fixos = conn.execute(text("""
+                SELECT COALESCE(embalagem, 0), COALESCE(mdo, 0), COALESCE(custo_ads, 0)
+                FROM dim_produtos_custos
+                WHERE sku = :s
+            """), {"s": sku_sel}).fetchone()
+        
+        if custos_fixos:
+            emb_fix, mdo_fix, ads_fix = custos_fixos
+        else:
+            emb_fix, mdo_fix, ads_fix = 0, 0, 0
+        
         df_h = pd.read_sql(text("""
-            SELECT id, data_compra, fornecedor, numero_nf, quantidade, preco_unitario, custo_considerado, valor_total
+            SELECT id, data_compra, fornecedor, numero_nf, quantidade, preco_unitario, custo_considerado
             FROM fato_compras 
             WHERE sku = :s 
             ORDER BY id DESC
@@ -217,17 +243,18 @@ def main():
             df_show['NF nº'] = df_show['numero_nf'].fillna('-')
             df_show['Preço NF'] = df_show['preco_unitario'].apply(fmt_moeda)
             df_show['Custo Considerado'] = df_show['custo_considerado'].apply(fmt_moeda)
-            df_show['Valor Total'] = df_show['valor_total'].apply(fmt_moeda)
+            # CUSTO TOTAL = Preço NF + Custos Fixos
+            df_show['Custo Total'] = df_show['preco_unitario'].apply(lambda x: fmt_moeda(x + emb_fix + mdo_fix + ads_fix))
             
             st.dataframe(
-                df_show[['id', 'Data', 'fornecedor', 'NF nº', 'quantidade', 'Preço NF', 'Custo Considerado', 'Valor Total']],
+                df_show[['id', 'Data', 'fornecedor', 'NF nº', 'quantidade', 'Preço NF', 'Custo Considerado', 'Custo Total']],
                 use_container_width=True,
                 hide_index=True
             )
             
             # EXCLUSÃO
             with st.expander("🗑️ Excluir Registro"):
-                st.warning("Custo será restaurado para a compra anterior.")
+                st.warning("⚠️ Esta ação não pode ser desfeita.")
                 
                 cx, cy = st.columns([3, 1])
                 opts = [(r['id'], f"ID {r['id']} - {fmt_data(r['data_compra'])} - {r['fornecedor']} - {fmt_moeda(r['custo_considerado'])}") 
@@ -239,22 +266,8 @@ def main():
                     try:
                         with engine.begin() as conn:
                             conn.execute(text("DELETE FROM fato_compras WHERE id = :id"), {"id": sel})
-                            
-                            ult = conn.execute(text("""
-                                SELECT custo_considerado FROM fato_compras 
-                                WHERE sku = :s ORDER BY id DESC LIMIT 1
-                            """), {"s": sku_sel}).fetchone()
-                            
-                            novo = float(ult[0]) if ult else 0.0
-                            
-                            conn.execute(text("""
-                                UPDATE dim_produtos_custos 
-                                SET preco_compra = :c, 
-                                    custo_final = :c + COALESCE(embalagem,0) + COALESCE(mdo,0) + COALESCE(custo_ads,0)
-                                WHERE sku = :s
-                            """), {"c": novo, "s": sku_sel})
                         
-                        st.success(f"Excluído! Custo: {fmt_moeda(novo)}")
+                        st.success("✅ Registro excluído!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {e}")
