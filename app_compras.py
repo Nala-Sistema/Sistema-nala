@@ -131,8 +131,7 @@ def main():
 
     # FORMULÁRIO
     with col_form:
-        st.markdown(f"**📝 Nova Compra - {sku_sel}**")
-        st.caption(nome_produto)
+        st.markdown(f"**📝 Nova Compra - {sku_sel}** - {nome_produto[:50]}")
         
         # ===== FORNECEDOR (FORA DO FORM) =====
         st.markdown("**Fornecedor**")
@@ -209,8 +208,7 @@ def main():
 
     # INDICADORES
     with col_ind:
-        st.markdown(f"**📊 {sku_sel}**")
-        st.caption(nome_produto)
+        st.markdown(f"**📊 {sku_sel}** - {nome_produto[:50]}")
         
         query = text("""
             WITH ult AS (
