@@ -77,31 +77,45 @@ def processar_ml(arquivo, loja, imposto, engine):
     # Processar
     vendas = []
     for idx, row in df.iterrows():
-        if pd.isna(row['sku']):
+        try:
+            # Verificar SKU
+            if pd.isna(row['sku']):
+                continue
+            
+            sku = str(row['sku']).strip()
+            receita = limpar_numero(row['receita'])
+            tarifa = abs(limpar_numero(row['tarifa']))
+            
+            # Quantidade - tratamento seguro
+            try:
+                qtd_val = row['qtd'] if 'qtd' in df.columns else 1
+                qtd = int(qtd_val) if not pd.isna(qtd_val) else 1
+            except:
+                qtd = 1
+            
+            custo = custos_dict.get(sku, 0) * qtd
+            imposto_val = receita * (imposto / 100)
+            margem = receita - tarifa - imposto_val - custo
+            margem_pct = (margem / receita * 100) if receita > 0 else 0
+            
+            # Dados opcionais
+            pedido = str(row['pedido']) if 'pedido' in df.columns else ''
+            data = converter_data_ml(row['data']) if 'data' in df.columns else ''
+            
+            vendas.append({
+                'pedido': pedido,
+                'data': data,
+                'sku': sku,
+                'qtd': qtd,
+                'receita': round(receita, 2),
+                'tarifa': round(tarifa, 2),
+                'imposto': round(imposto_val, 2),
+                'custo': round(custo, 2),
+                'margem': round(margem, 2),
+                'margem_%': round(margem_pct, 2)
+            })
+        except Exception as e:
             continue
-        
-        sku = str(row['sku']).strip()
-        receita = limpar_numero(row['receita'])
-        tarifa = abs(limpar_numero(row['tarifa']))
-        qtd = int(row['qtd']) if 'qtd' in df.columns and pd.notna(row['qtd']) else 1
-        
-        custo = custos_dict.get(sku, 0) * qtd
-        imposto_val = receita * (imposto / 100)
-        margem = receita - tarifa - imposto_val - custo
-        margem_pct = (margem / receita * 100) if receita > 0 else 0
-        
-        vendas.append({
-            'pedido': str(row['pedido']) if 'pedido' in df.columns else '',
-            'data': converter_data_ml(row['data']) if 'data' in df.columns else '',
-            'sku': sku,
-            'qtd': qtd,
-            'receita': round(receita, 2),
-            'tarifa': round(tarifa, 2),
-            'imposto': round(imposto_val, 2),
-            'custo': round(custo, 2),
-            'margem': round(margem, 2),
-            'margem_%': round(margem_pct, 2)
-        })
     
     if not vendas:
         st.error("❌ Nenhuma venda processada")
