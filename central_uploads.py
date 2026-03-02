@@ -76,14 +76,14 @@ def processar_ml(arquivo, loja, imposto, engine):
     
     # Processar
     vendas = []
-    for _, row in df.iterrows():
-        if pd.isna(row.get('sku')):
+    for idx, row in df.iterrows():
+        if pd.isna(row['sku']):
             continue
         
         sku = str(row['sku']).strip()
-        receita = limpar_numero(row.get('receita', 0))
-        tarifa = abs(limpar_numero(row.get('tarifa', 0)))
-        qtd = int(row.get('qtd', 1)) if pd.notna(row.get('qtd')) else 1
+        receita = limpar_numero(row['receita'])
+        tarifa = abs(limpar_numero(row['tarifa']))
+        qtd = int(row['qtd']) if 'qtd' in df.columns and pd.notna(row['qtd']) else 1
         
         custo = custos_dict.get(sku, 0) * qtd
         imposto_val = receita * (imposto / 100)
@@ -91,8 +91,8 @@ def processar_ml(arquivo, loja, imposto, engine):
         margem_pct = (margem / receita * 100) if receita > 0 else 0
         
         vendas.append({
-            'pedido': str(row.get('pedido', '')),
-            'data': converter_data_ml(row.get('data')),
+            'pedido': str(row['pedido']) if 'pedido' in df.columns else '',
+            'data': converter_data_ml(row['data']) if 'data' in df.columns else '',
             'sku': sku,
             'qtd': qtd,
             'receita': round(receita, 2),
