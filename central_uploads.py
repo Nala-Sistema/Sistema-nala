@@ -143,12 +143,13 @@ def processar_mercado_livre(arquivo, loja, imposto_percentual, engine):
         query = """
             SELECT id_plataforma as mlb, sku, comissao_percentual, frete_estimado
             FROM dim_config_marketplace 
-            WHERE marketplace = 'MERCADO_LIVRE'
+            WHERE marketplace = 'MERCADO_LIVRE' OR marketplace = 'MERCADO LIVRE'
         """
         df_base_anuncios = pd.read_sql(query, engine)
         base_anuncios_dict = df_base_anuncios.set_index('mlb').to_dict('index')
-    except:
-        st.error("⚠️ Base de anúncios ML não encontrada! Configure em 'Config → Mercado Livre'")
+    except Exception as e:
+        st.error(f"⚠️ Erro ao buscar base de anúncios: {str(e)}")
+        st.warning("Configure em 'Config → Mercado Livre' antes de importar vendas")
         return None
     
     # 6. BUSCAR CUSTOS DE PRODUTOS
@@ -160,8 +161,8 @@ def processar_mercado_livre(arquivo, loja, imposto_percentual, engine):
         """
         df_custos = pd.read_sql(query_custos, engine)
         custos_dict = df_custos.set_index('sku').to_dict('index')
-    except:
-        st.error("⚠️ Tabela de SKUs não encontrada!")
+    except Exception as e:
+        st.error(f"⚠️ Erro ao buscar custos: {str(e)}")
         return None
     
     # 7. PROCESSAR VENDAS
@@ -250,7 +251,7 @@ def processar_mercado_livre(arquivo, loja, imposto_percentual, engine):
                 vendas_processadas.append({
                     'numero_pedido': numero_pedido,
                     'data_venda': data_venda,
-                    'marketplace': 'MERCADO_LIVRE',
+                    'marketplace': 'MERCADO LIVRE',
                     'loja': loja,
                     'sku': sku,
                     'mlb_produto': mlb,
@@ -315,7 +316,7 @@ def processar_mercado_livre(arquivo, loja, imposto_percentual, engine):
             vendas_processadas.append({
                 'numero_pedido': numero_pedido,
                 'data_venda': data_venda,
-                'marketplace': 'MERCADO_LIVRE',
+                'marketplace': 'MERCADO LIVRE',
                 'loja': loja,
                 'sku': sku,
                 'mlb_produto': mlb,
@@ -430,8 +431,10 @@ def main():
             # Botão processar
             if st.button("🚀 Processar Relatório", type="primary"):
                 with st.spinner("Processando..."):
-                    # Processar conforme marketplace
-                    if marketplace_sel == 'MERCADO_LIVRE':
+                    # Processar conforme marketplace (aceita tanto com espaço quanto com underscore)
+                    marketplace_normalizado = marketplace_sel.strip().upper()
+                    
+                    if 'MERCADO' in marketplace_normalizado and 'LIVRE' in marketplace_normalizado:
                         df_processado = processar_mercado_livre(arquivo, loja_sel, imposto, engine)
                     else:
                         st.error(f"Marketplace {marketplace_sel} ainda não implementado. Aguarde próximas versões!")
