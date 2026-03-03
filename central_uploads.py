@@ -368,7 +368,13 @@ def main():
                             valor_liquido = receita - tarifa - imposto
                             
                             sql = "INSERT INTO fact_vendas_snapshot (marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace, valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido, margem_total, margem_percentual, data_processamento, arquivo_origem) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)"
-                            
+                            # Validar SKU
+                            if not row['sku'] or row['sku'].strip() == '':
+                            continue
+    
+                            # Verificar se SKU existe
+                            if row['sku'] not in custos_dict and row['sku'] not in st.session_state.get('skus_validados', set()):
+                            continue
                             cursor.execute(sql, (mktp, loja, row['pedido'], data_venda, row['sku'], '', qtd, preco_venda, 0, 0, receita, custo_unit, custo_total, imposto, tarifa, 0, 0, 0, tarifa, valor_liquido, margem, margem_pct, info['arquivo_nome']))
                             
                             registros += 1
@@ -397,3 +403,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
