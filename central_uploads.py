@@ -33,11 +33,7 @@ def converter_data_ml(data_str):
     try:
         if isinstance(data_str, datetime):
             return data_str.strftime("%d/%m/%Y")
-        meses = {
-            'janeiro':'01','fevereiro':'02','marco':'03','abril':'04',
-            'maio':'05','junho':'06','julho':'07','agosto':'08',
-            'setembro':'09','outubro':'10','novembro':'11','dezembro':'12'
-        }
+        meses = {'janeiro':'01','fevereiro':'02','marco':'03','abril':'04','maio':'05','junho':'06','julho':'07','agosto':'08','setembro':'09','outubro':'10','novembro':'11','dezembro':'12'}
         partes = str(data_str).lower().split()
         return f"{partes[0].zfill(2)}/{meses.get(partes[2],'01')}/{partes[4]}"
     except:
@@ -104,6 +100,11 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
                     continue
             
             sku = str(row['sku']).strip()
+            
+            if not sku or sku == '':
+                linhas_descartadas += 1
+                continue
+            
             receita = limpar_numero(row['receita'])
             
             if receita == 0:
@@ -346,14 +347,27 @@ def main():
             
             if st.button("GRAVAR NO BANCO", type="primary"):
                 try:
+                    df_skus_validos = pd.read_sql("SELECT sku FROM dim_skus WHERE ativo = TRUE", engine)
+                    skus_validos = set(df_skus_validos['sku'].tolist())
+                    
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
                     
                     registros = 0
                     erros = 0
+                    skus_invalidos = set()
                     
                     for _, row in df_proc.iterrows():
                         try:
+                            if not row['sku'] or row['sku'].strip() == '':
+                                erros += 1
+                                continue
+                            
+                            if row['sku'] not in skus_validos:
+                                skus_invalidos.add(row['sku'])
+                                erros += 1
+                                continue
+                            
                             data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
                             qtd = int(row['qtd'])
                             receita = float(row['receita'])
@@ -368,13 +382,7 @@ def main():
                             valor_liquido = receita - tarifa - imposto
                             
                             sql = "INSERT INTO fact_vendas_snapshot (marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace, valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido, margem_total, margem_percentual, data_processamento, arquivo_origem) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)"
-                            # Validar SKU
-                            if not row['sku'] or row['sku'].strip() == '':
-                            continue
-    
-                            # Verificar se SKU existe
-                            if row['sku'] not in custos_dict and row['sku'] not in st.session_state.get('skus_validados', set()):
-                            continue
+                            
                             cursor.execute(sql, (mktp, loja, row['pedido'], data_venda, row['sku'], '', qtd, preco_venda, 0, 0, receita, custo_unit, custo_total, imposto, tarifa, 0, 0, 0, tarifa, valor_liquido, margem, margem_pct, info['arquivo_nome']))
                             
                             registros += 1
@@ -388,7 +396,12 @@ def main():
                     cursor.close()
                     conn.close()
                     
-                    st.success(f"{registros} vendas gravadas! ({erros} erros)")
+                    st.success(f"{registros} vendas gravadas!")
+                    if erros > 0:
+                        st.warning(f"{erros} erros (SKUs invalidos ou vazios)")
+                    if skus_invalidos:
+                        st.error(f"SKUs nao cadastrados: {', '.join(list(skus_invalidos)[:5])}")
+                    
                     del st.session_state['df_proc']
                     st.balloons()
                     
@@ -403,4 +416,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
