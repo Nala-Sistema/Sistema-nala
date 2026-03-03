@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import openpyxl
 from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
 import io
@@ -358,31 +357,42 @@ def main():
             
             if st.button("✅ GRAVAR NO BANCO", type="primary"):
                 try:
-                    with engine.begin() as conn:
-                        registros = 0
-                        for _, row in df_proc.iterrows():
-                            try:
-                                conn.execute(text("""
-                                    INSERT INTO fact_vendas_snapshot (
-                                        marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
-                                        quantidade, valor_venda_efetivo, custo_total, margem_total, margem_percentual
-                                    ) VALUES (:m, :l, :p, :d, :s, :q, :r, :c, :mg, :mp)
-                                """), {
-                                    'm': mktp, 'l': loja, 'p': row['pedido'],
-                                    'd': datetime.strptime(row['data'], "%d/%m/%Y").date(),
-                                    's': row['sku'], 'q': int(row['qtd']),
-                                    'r': float(row['receita']), 'c': float(row['custo']),
-                                    'mg': float(row['margem']), 'mp': float(row['margem_%'])
-                                })
-                                registros += 1
-                            except Exception as e:
-                                st.warning(f"Erro linha: {str(e)[:50]}")
+                    conn = engine.raw_connection()
+                    cursor = conn.cursor()
                     
-                    st.success(f"✅ {registros} vendas gravadas!")
+                    registros = 0
+                    erros = 0
+                    
+                    for _, row in df_proc.iterrows():
+                        try:
+                            cursor.execute("""
+                                INSERT INTO fact_vendas_snapshot 
+                                (marketplace_origem, loja_origem, numero_pedido, data_venda, sku, quantidade, valor_venda_efetivo, custo_total, margem_total, margem_percentual)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """, (
+                                mktp, loja, row['pedido'],
+                                datetime.strptime(row['data'], "%d/%m/%Y").date(),
+                                row['sku'], int(row['qtd']),
+                                float(row['receita']), float(row['custo']),
+                                float(row['margem']), float(row['margem_%'])
+                            ))
+                            registros += 1
+                        except Exception as e:
+                            conn.rollback()
+                            erros += 1
+                            if erros == 1:
+                                st.warning(f"Primeiro erro: {str(e)[:150]}")
+                    
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    
+                    st.success(f"✅ {registros} vendas gravadas! ({erros} erros/duplicadas)")
                     del st.session_state['df_proc']
                     st.balloons()
+                    
                 except Exception as e:
-                    st.error(f"Erro: {e}")
+                    st.error(f"❌ Erro: {e}")
     
     with tab2:
         tab_vendas_consolidadas(engine)
