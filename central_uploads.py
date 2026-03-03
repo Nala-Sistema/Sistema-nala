@@ -56,7 +56,6 @@ def limpar_numero(valor):
         return 0.0
 
 def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
-    # Detectar header
     df_raw = pd.read_excel(arquivo, header=None, nrows=20)
     header_idx = 5
     for idx in range(20):
@@ -66,7 +65,6 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     
     df = pd.read_excel(arquivo, header=header_idx)
     
-    # Renomear
     rename = {}
     for col in df.columns:
         c = str(col).lower().strip()
@@ -83,7 +81,6 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     if not all(c in df.columns for c in ['sku','receita','tarifa']):
         return None, "❌ Colunas não encontradas"
     
-    # Buscar custos
     query = """
         SELECT s.sku, COALESCE(c.custo_final, 0) as custo
         FROM dim_skus s
@@ -93,20 +90,6 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     df_custos = pd.read_sql(query, engine)
     custos_dict = df_custos.set_index('sku')['custo'].to_dict()
     
-    # Detectar período
-    datas = []
-    for d in df['data'].dropna():
-        try:
-            dc = converter_data_ml(d)
-            if dc:
-                datas.append(datetime.strptime(dc, "%d/%m/%Y"))
-        except:
-            continue
-    
-    periodo_inicio = min(datas).strftime("%d/%m/%Y") if datas else None
-    periodo_fim = max(datas).strftime("%d/%m/%Y") if datas else None
-    
-    # Processar
     vendas = []
     skus_sem_custo = set()
     
@@ -117,6 +100,10 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
             
             sku = str(row['sku']).strip()
             receita = limpar_numero(row['receita'])
+            
+            if receita == 0:
+                continue
+            
             tarifa = abs(limpar_numero(row['tarifa']))
             
             try:
@@ -134,19 +121,22 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
             margem = receita - tarifa - imposto_val - custo_total
             margem_pct = (margem / receita * 100) if receita > 0 else 0
             
+            data_venda = converter_data_ml(row.get('data'))
+            
             vendas.append({
                 'pedido': str(row.get('pedido', '')),
-                'data': converter_data_ml(row.get('data')),
+                'data': data_venda,
                 'sku': sku,
                 'mlb': str(row.get('mlb', '')) if 'mlb' in df.columns else '',
                 'qtd': qtd,
-                'receita': round(receita, 2),
-                'tarifa': round(tarifa, 2),
-                'imposto': round(imposto_val, 2),
-                'custo': round(custo_total, 2),
-                'margem': round(margem, 2),
-                'margem_%': round(margem_pct, 2),
-                'tem_custo': custo_unit > 0
+                'receita': receita,
+                'tarifa': tarifa,
+                'imposto': imposto_val,
+                'custo': custo_total,
+                'margem': margem,
+                'margem_%': margem_pct,
+                'tem_custo': custo_unit > 0,
+                '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
         except:
             continue
@@ -156,6 +146,10 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     
     df_result = pd.DataFrame(vendas)
     
+    datas_validas = [v['_data_obj'] for v in vendas if v['_data_obj']]
+    periodo_inicio = min(datas_validas).strftime("%d/%m/%Y") if datas_validas else None
+    periodo_fim = max(datas_validas).strftime("%d/%m/%Y") if datas_validas else None
+    
     info = {
         'total_linhas': len(df_result),
         'periodo_inicio': periodo_inicio,
@@ -163,6 +157,8 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
         'skus_sem_custo': len(skus_sem_custo),
         'arquivo_nome': arquivo.name
     }
+    
+    df_result = df_result.drop(columns=['_data_obj'])
     
     return df_result, info
 
@@ -337,10 +333,92 @@ def main():
                         if info['skus_sem_custo'] > 0:
                             st.warning(f"⚠️ {info['skus_sem_custo']} SKUs sem custo")
                         
-                        st.dataframe(df_proc.head(20), use_container_width=True)
+                        df_preview = df_proc.copy()
+                        df_preview['receita'] = df_preview['receita'].apply(formatar_valor)
+                        df_preview['tarifa'] = df_preview['tarifa'].apply(formatar_valor)
+                        df_preview['imposto'] = df_preview['imposto'].apply(formatar_valor)
+                        df_preview['custo'] = df_preview['custo'].apply(formatar_valor)
+                        df_preview['margem'] = df_preview['margem'].apply(formatar_valor)
+                        df_preview['margem_%'] = df_preview['margem_%'].apply(formatar_percentual)
                         
-                        if st.button("✅ Confirmar (em desenvolvimento)", disabled=True):
-                            st.info("Gravação será implementada em breve")
+                        st.dataframe(df_preview.head(20), use_container_width=True)
+                        
+                        if st.button("✅ Confirmar e Gravar no Banco", type="primary"):
+                            try:
+                                with st.spinner("Gravando vendas no banco..."):
+                                    with engine.connect() as conn:
+                                        registros_inseridos = 0
+                                        
+                                        for _, row in df_proc.iterrows():
+                                            data_venda_obj = datetime.strptime(row['data'], "%d/%m/%Y")
+                                            
+                                            query_insert = text("""
+                                                INSERT INTO fact_vendas_snapshot (
+                                                    marketplace_origem, loja_origem, numero_pedido,
+                                                    data_venda, sku, codigo_anuncio, quantidade,
+                                                    preco_venda, valor_venda_efetivo, custo_unitario,
+                                                    custo_total, imposto, comissao, total_tarifas,
+                                                    margem_total, margem_percentual, data_processamento
+                                                ) VALUES (
+                                                    :mktp, :loja, :pedido, :data, :sku, :mlb, :qtd,
+                                                    :preco, :receita, :custo_unit, :custo_total,
+                                                    :imposto, :tarifa, :tarifa, :margem, :margem_pct,
+                                                    NOW()
+                                                )
+                                                ON CONFLICT (numero_pedido, sku) DO NOTHING
+                                            """)
+                                            
+                                            result = conn.execute(query_insert, {
+                                                'mktp': mktp,
+                                                'loja': loja,
+                                                'pedido': row['pedido'],
+                                                'data': data_venda_obj.date(),
+                                                'sku': row['sku'],
+                                                'mlb': row['mlb'],
+                                                'qtd': row['qtd'],
+                                                'preco': row['receita'] / row['qtd'],
+                                                'receita': row['receita'],
+                                                'custo_unit': row['custo'] / row['qtd'] if row['qtd'] > 0 else 0,
+                                                'custo_total': row['custo'],
+                                                'imposto': row['imposto'],
+                                                'tarifa': row['tarifa'],
+                                                'margem': row['margem'],
+                                                'margem_pct': row['margem_%']
+                                            })
+                                            
+                                            if result.rowcount > 0:
+                                                registros_inseridos += 1
+                                        
+                                        query_log = text("""
+                                            INSERT INTO log_uploads (
+                                                usuario, marketplace, loja, arquivo_nome,
+                                                periodo_inicio, periodo_fim, total_linhas,
+                                                linhas_importadas, skus_sem_custo
+                                            ) VALUES (
+                                                'Admin', :mktp, :loja, :arq, :inicio, :fim,
+                                                :total, :importadas, :sem_custo
+                                            )
+                                        """)
+                                        
+                                        conn.execute(query_log, {
+                                            'mktp': mktp,
+                                            'loja': loja,
+                                            'arq': info['arquivo_nome'],
+                                            'inicio': datetime.strptime(info['periodo_inicio'], "%d/%m/%Y").date(),
+                                            'fim': datetime.strptime(info['periodo_fim'], "%d/%m/%Y").date(),
+                                            'total': info['total_linhas'],
+                                            'importadas': registros_inseridos,
+                                            'sem_custo': info['skus_sem_custo']
+                                        })
+                                        
+                                        conn.commit()
+                                    
+                                    st.success(f"✅ {registros_inseridos} vendas gravadas com sucesso!")
+                                    st.balloons()
+                                    
+                            except Exception as e:
+                                st.error(f"❌ Erro ao gravar: {str(e)}")
+                                st.exception(e)
                     else:
                         st.error(info)
                 else:
