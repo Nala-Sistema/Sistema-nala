@@ -359,11 +359,21 @@ def main():
                         if st.button("✅ Confirmar e Gravar no Banco", type="primary"):
                             try:
                                 with st.spinner("Gravando vendas no banco..."):
+                                    st.write("🔍 Iniciando gravação...")
+                                    
                                     erros_gravacao = []
+                                    registros_inseridos = 0
+                                    registros_duplicados = 0
+                                    
+                                    try:
+                                        with engine.connect() as test_conn:
+                                            result = test_conn.execute(text("SELECT 1"))
+                                            st.write("✅ Conexão com banco OK")
+                                    except Exception as e_conn:
+                                        st.error(f"❌ Erro de conexão: {e_conn}")
+                                        raise
                                     
                                     with engine.begin() as conn:
-                                        registros_inseridos = 0
-                                        
                                         for idx_row, row in df_proc.iterrows():
                                             try:
                                                 data_venda_obj = datetime.strptime(row['data'], "%d/%m/%Y")
@@ -381,10 +391,9 @@ def main():
                                                         :imposto, :tarifa, :tarifa, :margem, :margem_pct,
                                                         NOW()
                                                     )
-                                                    ON CONFLICT (numero_pedido, sku) DO NOTHING
                                                 """)
                                                 
-                                                result = conn.execute(query_insert, {
+                                                params = {
                                                     'mktp': mktp,
                                                     'loja': loja,
                                                     'pedido': row['pedido'],
@@ -400,47 +409,67 @@ def main():
                                                     'tarifa': float(row['tarifa']),
                                                     'margem': float(row['margem']),
                                                     'margem_pct': float(row['margem_%'])
-                                                })
+                                                }
+                                                
+                                                result = conn.execute(query_insert, params)
                                                 
                                                 if result.rowcount > 0:
                                                     registros_inseridos += 1
+                                                    if idx_row < 3:
+                                                        st.write(f"✅ Linha {idx_row}: {row['pedido']} - {row['sku']}")
+                                                        
                                             except Exception as e_row:
-                                                erros_gravacao.append(f"Linha {idx_row}: {str(e_row)[:100]}")
+                                                erro_msg = str(e_row)
+                                                if 'duplicate key' in erro_msg.lower() or 'unique constraint' in erro_msg.lower():
+                                                    registros_duplicados += 1
+                                                else:
+                                                    erros_gravacao.append(f"Linha {idx_row} ({row['pedido']}-{row['sku']}): {erro_msg[:200]}")
+                                                    if idx_row < 3:
+                                                        st.warning(f"⚠️ Linha {idx_row}: {erro_msg[:100]}")
                                         
-                                        query_log = text("""
-                                            INSERT INTO log_uploads (
-                                                usuario, marketplace, loja, arquivo_nome,
-                                                periodo_inicio, periodo_fim, total_linhas,
-                                                linhas_importadas, skus_sem_custo
-                                            ) VALUES (
-                                                'Admin', :mktp, :loja, :arq, :inicio, :fim,
-                                                :total, :importadas, :sem_custo
-                                            )
-                                        """)
-                                        
-                                        conn.execute(query_log, {
-                                            'mktp': mktp,
-                                            'loja': loja,
-                                            'arq': info['arquivo_nome'],
-                                            'inicio': datetime.strptime(info['periodo_inicio'], "%d/%m/%Y").date(),
-                                            'fim': datetime.strptime(info['periodo_fim'], "%d/%m/%Y").date(),
-                                            'total': info['total_linhas'],
-                                            'importadas': registros_inseridos,
-                                            'sem_custo': info['skus_sem_custo']
-                                        })
+                                        try:
+                                            query_log = text("""
+                                                INSERT INTO log_uploads (
+                                                    usuario, marketplace, loja, arquivo_nome,
+                                                    periodo_inicio, periodo_fim, total_linhas,
+                                                    linhas_importadas, skus_sem_custo
+                                                ) VALUES (
+                                                    'Admin', :mktp, :loja, :arq, :inicio, :fim,
+                                                    :total, :importadas, :sem_custo
+                                                )
+                                            """)
+                                            
+                                            conn.execute(query_log, {
+                                                'mktp': mktp,
+                                                'loja': loja,
+                                                'arq': info['arquivo_nome'],
+                                                'inicio': datetime.strptime(info['periodo_inicio'], "%d/%m/%Y").date(),
+                                                'fim': datetime.strptime(info['periodo_fim'], "%d/%m/%Y").date(),
+                                                'total': info['total_linhas'],
+                                                'importadas': registros_inseridos,
+                                                'sem_custo': info['skus_sem_custo']
+                                            })
+                                        except Exception as e_log:
+                                            st.warning(f"Log não gravado: {e_log}")
                                     
-                                    st.success(f"✅ {registros_inseridos} vendas gravadas com sucesso!")
+                                    st.success(f"✅ {registros_inseridos} vendas NOVAS gravadas!")
+                                    
+                                    if registros_duplicados > 0:
+                                        st.info(f"ℹ️ {registros_duplicados} registros já existiam")
                                     
                                     if erros_gravacao:
-                                        with st.expander(f"⚠️ {len(erros_gravacao)} erros na gravação"):
+                                        with st.expander(f"⚠️ {len(erros_gravacao)} erros"):
                                             for erro in erros_gravacao[:10]:
-                                                st.warning(erro)
+                                                st.error(erro)
                                     
-                                    st.balloons()
+                                    if registros_inseridos > 0:
+                                        st.balloons()
                                     
                             except Exception as e:
-                                st.error(f"❌ Erro ao gravar: {str(e)}")
+                                st.error(f"❌ ERRO GERAL: {str(e)}")
                                 st.code(str(e))
+                                import traceback
+                                st.code(traceback.format_exc())
                     else:
                         st.error(info)
                 else:
