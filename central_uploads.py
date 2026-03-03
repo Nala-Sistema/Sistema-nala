@@ -34,7 +34,7 @@ def converter_data_ml(data_str):
         if isinstance(data_str, datetime):
             return data_str.strftime("%d/%m/%Y")
         meses = {
-            'janeiro':'01','fevereiro':'02','março':'03','abril':'04',
+            'janeiro':'01','fevereiro':'02','marco':'03','abril':'04',
             'maio':'05','junho':'06','julho':'07','agosto':'08',
             'setembro':'09','outubro':'10','novembro':'11','dezembro':'12'
         }
@@ -64,26 +64,27 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     rename = {}
     for col in df.columns:
         c = str(col).lower().strip()
-        if 'n.' in c and 'venda' in c: rename[col] = 'pedido'
-        elif 'data' in c and 'venda' in c: rename[col] = 'data'
-        elif c == 'sku': rename[col] = 'sku'
-        elif 'estado' in c: rename[col] = 'status'
-        elif 'unidades' in c: rename[col] = 'qtd'
-        elif 'receita' in c and 'produtos' in c: rename[col] = 'receita'
-        elif 'tarifa' in c and 'venda' in c: rename[col] = 'tarifa'
-        elif '#' in c and 'anúncio' in c: rename[col] = 'mlb'
+        if 'n.' in c and 'venda' in c:
+            rename[col] = 'pedido'
+        elif 'data' in c and 'venda' in c:
+            rename[col] = 'data'
+        elif c == 'sku':
+            rename[col] = 'sku'
+        elif 'estado' in c:
+            rename[col] = 'status'
+        elif 'unidades' in c:
+            rename[col] = 'qtd'
+        elif 'receita' in c and 'produtos' in c:
+            rename[col] = 'receita'
+        elif 'tarifa' in c and 'venda' in c:
+            rename[col] = 'tarifa'
     
     df = df.rename(columns=rename)
     
     if not all(c in df.columns for c in ['sku','receita','tarifa']):
-        return None, "❌ Colunas não encontradas"
+        return None, "Colunas nao encontradas"
     
-    query = """
-        SELECT s.sku, COALESCE(c.custo_final, 0) as custo
-        FROM dim_skus s
-        LEFT JOIN dim_produtos_custos c ON s.sku = c.sku
-        WHERE s.ativo = TRUE
-    """
+    query = "SELECT s.sku, COALESCE(c.custo_final, 0) as custo FROM dim_skus s LEFT JOIN dim_produtos_custos c ON s.sku = c.sku WHERE s.ativo = TRUE"
     df_custos = pd.read_sql(query, engine)
     custos_dict = df_custos.set_index('sku')['custo'].to_dict()
     
@@ -132,14 +133,13 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
                 'pedido': str(row.get('pedido', '')),
                 'data': data_venda,
                 'sku': sku,
-                'mlb': str(row.get('mlb', '')) if 'mlb' in df.columns else '',
                 'qtd': qtd,
                 'receita': receita,
                 'tarifa': tarifa,
                 'imposto': imposto_val,
                 'custo': custo_total,
                 'margem': margem,
-                'margem_%': margem_pct,
+                'margem_pct': margem_pct,
                 'tem_custo': custo_unit > 0,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
@@ -147,7 +147,7 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
             continue
     
     if not vendas:
-        return None, f"❌ Nenhuma venda válida ({linhas_descartadas} linhas descartadas)"
+        return None, f"Nenhuma venda valida ({linhas_descartadas} descartadas)"
     
     df_result = pd.DataFrame(vendas)
     
@@ -169,30 +169,29 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     return df_result, info
 
 def tab_vendas_consolidadas(engine):
-    st.subheader("📊 Vendas Consolidadas")
+    st.subheader("Vendas Consolidadas")
     
     col1, col2, col3, col4 = st.columns(4)
     
-    periodo = col1.selectbox("Período:", 
-        ["Hoje", "Ontem", "Últimos 7 dias", "Últimos 15 dias", "Últimos 30 dias", "Personalizado"])
+    periodo = col1.selectbox("Periodo:", ["Hoje", "Ontem", "Ultimos 7 dias", "Ultimos 15 dias", "Ultimos 30 dias", "Personalizado"])
     
     hoje = datetime.now().date()
     if periodo == "Hoje":
         data_ini = data_fim = hoje
     elif periodo == "Ontem":
         data_ini = data_fim = hoje - timedelta(days=1)
-    elif periodo == "Últimos 7 dias":
+    elif "7" in periodo:
         data_ini = hoje - timedelta(days=7)
         data_fim = hoje
-    elif periodo == "Últimos 15 dias":
+    elif "15" in periodo:
         data_ini = hoje - timedelta(days=15)
         data_fim = hoje
-    elif periodo == "Últimos 30 dias":
+    elif "30" in periodo:
         data_ini = hoje - timedelta(days=30)
         data_fim = hoje
     else:
         data_ini = col2.date_input("De:", hoje - timedelta(days=30))
-        data_fim = col2.date_input("Até:", hoje)
+        data_fim = col2.date_input("Ate:", hoje)
     
     df_lojas = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
     mktp_filtro = col3.selectbox("Marketplace:", ["Todos"] + df_lojas['marketplace'].tolist())
@@ -203,10 +202,7 @@ def tab_vendas_consolidadas(engine):
     else:
         loja_filtro = "Todas"
     
-    query = f"""
-        SELECT * FROM fact_vendas_snapshot
-        WHERE data_venda BETWEEN '{data_ini}' AND '{data_fim}'
-    """
+    query = f"SELECT * FROM fact_vendas_snapshot WHERE data_venda BETWEEN '{data_ini}' AND '{data_fim}'"
     if mktp_filtro != "Todos":
         query += f" AND marketplace_origem = '{mktp_filtro}'"
     if loja_filtro != "Todas":
@@ -218,7 +214,7 @@ def tab_vendas_consolidadas(engine):
         df_vendas = pd.DataFrame()
     
     if df_vendas.empty:
-        st.warning("⚠️ Nenhuma venda encontrada")
+        st.warning("Nenhuma venda encontrada")
         return
     
     df_com_custo = df_vendas[df_vendas['custo_total'] > 0]
@@ -235,7 +231,7 @@ def tab_vendas_consolidadas(engine):
     except:
         df_ant_com_custo = pd.DataFrame()
     
-    st.markdown("### 📈 Indicadores do Período")
+    st.markdown("### Indicadores do Periodo")
     
     c1, c2, c3, c4 = st.columns(4)
     
@@ -243,8 +239,7 @@ def tab_vendas_consolidadas(engine):
     receita_ant = df_ant_com_custo['valor_venda_efetivo'].sum() if not df_ant_com_custo.empty else 0
     var_receita = ((receita_atual - receita_ant) / receita_ant * 100) if receita_ant > 0 else 0
     
-    c1.metric("Receita Total", formatar_valor(receita_atual), 
-              f"{formatar_percentual(var_receita)} vs período anterior")
+    c1.metric("Receita Total", formatar_valor(receita_atual), f"{formatar_percentual(var_receita)} vs periodo anterior")
     
     pedidos_atual = len(df_com_custo)
     pedidos_ant = len(df_ant_com_custo) if not df_ant_com_custo.empty else 0
@@ -256,57 +251,51 @@ def tab_vendas_consolidadas(engine):
     margem_ant = df_ant_com_custo['margem_percentual'].mean() if not df_ant_com_custo.empty else 0
     var_margem = margem_atual - margem_ant
     
-    c3.metric("Margem Média", formatar_percentual(margem_atual), formatar_percentual(var_margem))
+    c3.metric("Margem Media", formatar_percentual(margem_atual), formatar_percentual(var_margem))
     
-    c4.metric("⚠️ Pendentes", formatar_quantidade(len(df_sem_custo)),
-              formatar_valor(df_sem_custo['valor_venda_efetivo'].sum()) + " não contabilizados",
-              delta_color="off")
+    c4.metric("Pendentes", formatar_quantidade(len(df_sem_custo)), formatar_valor(df_sem_custo['valor_venda_efetivo'].sum()) + " nao contabilizados", delta_color="off")
     
     st.write("---")
-    st.subheader("📋 Detalhamento de Vendas")
+    st.subheader("Detalhamento de Vendas")
     
     df_display = df_vendas.copy()
     df_display['data_venda'] = pd.to_datetime(df_display['data_venda']).dt.strftime('%d/%m/%Y')
     
-    st.dataframe(df_display[['data_venda', 'numero_pedido', 'sku', 'quantidade', 
-                             'valor_venda_efetivo', 'custo_total', 'margem_percentual']].head(50),
-                use_container_width=True, height=400)
+    st.dataframe(df_display[['data_venda', 'numero_pedido', 'sku', 'quantidade', 'valor_venda_efetivo', 'custo_total', 'margem_percentual']].head(50), use_container_width=True, height=400)
     
-    if st.button("📊 Download Excel"):
+    if st.button("Download Excel"):
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             df_vendas.to_excel(writer, index=False, sheet_name='Vendas')
-        st.download_button("⬇️ Baixar", buffer.getvalue(),
-                          f"vendas_{data_ini}_{data_fim}.xlsx",
-                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Baixar", buffer.getvalue(), f"vendas_{data_ini}_{data_fim}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 def tab_uploads_historico(engine):
-    st.subheader("📥 Histórico")
+    st.subheader("Historico")
     
     try:
         df_log = pd.read_sql("SELECT * FROM log_uploads ORDER BY data_upload DESC LIMIT 50", engine)
         if not df_log.empty:
             st.dataframe(df_log, use_container_width=True)
         else:
-            st.info("Nenhuma importação registrada")
+            st.info("Nenhuma importacao registrada")
     except:
-        st.info("Histórico não disponível")
+        st.info("Historico nao disponivel")
 
 def main():
-    st.header("💰 Central de Vendas")
+    st.header("Central de Vendas")
     engine = get_engine()
     
     try:
         df_lojas = pd.read_sql("SELECT marketplace, loja, imposto FROM dim_lojas", engine)
     except:
-        st.error("⚠️ Configure lojas em Config")
+        st.error("Configure lojas em Config")
         return
     
     if df_lojas.empty:
-        st.warning("⚠️ Cadastre lojas")
+        st.warning("Cadastre lojas")
         return
     
-    tab1, tab2, tab3 = st.tabs(["🚀 Processar Upload", "📊 Vendas Consolidadas", "📥 Histórico"])
+    tab1, tab2, tab3 = st.tabs(["Processar Upload", "Vendas Consolidadas", "Historico"])
     
     with tab1:
         col1, col2, col3 = st.columns(3)
@@ -316,11 +305,11 @@ def main():
         loja = col2.selectbox("Loja:", lojas)
         imposto = df_lojas[df_lojas['loja'] == loja]['imposto'].values[0]
         
-        st.info(f"⚙️ {loja} | Imposto: {formatar_percentual(imposto)}")
+        st.info(f"{loja} | Imposto: {formatar_percentual(imposto)}")
         
-        arquivo = st.file_uploader("📁 Upload XLSX", type=['xlsx'])
+        arquivo = st.file_uploader("Upload XLSX", type=['xlsx'])
         
-        if arquivo and st.button("🔍 Analisar"):
+        if arquivo and st.button("Analisar"):
             if 'MERCADO' in mktp.upper() and 'LIVRE' in mktp.upper():
                 df_proc, info = processar_mercado_livre(arquivo, loja, imposto, engine)
                 
@@ -337,25 +326,25 @@ def main():
             mktp = st.session_state['mktp']
             loja = st.session_state['loja']
             
-            st.success(f"✅ {info['total_linhas']} vendas processadas!")
+            st.success(f"{info['total_linhas']} vendas processadas!")
             
             col_a, col_b = st.columns(2)
-            col_a.info(f"**Período:** {info['periodo_inicio']} a {info['periodo_fim']}")
-            col_b.info(f"**Loja:** {loja}")
+            col_a.info(f"Periodo: {info['periodo_inicio']} a {info['periodo_fim']}")
+            col_b.info(f"Loja: {loja}")
             
             if info.get('linhas_descartadas', 0) > 0:
-                st.info(f"ℹ️ {info['linhas_descartadas']} linhas descartadas")
+                st.info(f"{info['linhas_descartadas']} linhas descartadas")
             
             df_preview = df_proc.copy()
             df_preview['receita'] = df_preview['receita'].apply(formatar_valor)
             df_preview['tarifa'] = df_preview['tarifa'].apply(formatar_valor)
             df_preview['custo'] = df_preview['custo'].apply(formatar_valor)
             df_preview['margem'] = df_preview['margem'].apply(formatar_valor)
-            df_preview['margem_%'] = df_preview['margem_%'].apply(formatar_percentual)
+            df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
             
             st.dataframe(df_preview.head(20), use_container_width=True)
             
-            if st.button("✅ GRAVAR NO BANCO", type="primary"):
+            if st.button("GRAVAR NO BANCO", type="primary"):
                 try:
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
@@ -372,27 +361,16 @@ def main():
                             tarifa = float(row['tarifa'])
                             imposto = float(row['imposto'])
                             margem = float(row['margem'])
-                            margem_pct = float(row['margem_%'])
+                            margem_pct = float(row['margem_pct'])
                             
                             preco_venda = receita / qtd if qtd > 0 else receita
                             custo_unit = custo_total / qtd if qtd > 0 else custo_total
                             valor_liquido = receita - tarifa - imposto
                             
-                            cursor.execute("""
-                                INSERT INTO fact_vendas_snapshot (
-                                    marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio,
-                                    quantidade, preco_venda, desconto_parceiro, desconto_marketplace, valor_venda_efetivo,
-                                    custo_unitario, custo_total, imposto, comissao, frete, tarifa_fixa, outros_custos,
-                                    total_tarifas, valor_liquido, margem_total, margem_percentual, data_processamento, arquivo_origem
-                                ) VALUES (
-                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s
-                                )
-                            """, (
-                                mktp, loja, row['pedido'], data_venda, row['sku'], row.get('mlb', ''),
-                                qtd, preco_venda, 0, 0, receita,
-                                custo_unit, custo_total, imposto, tarifa, 0, 0, 0,
-                                tarifa, valor_liquido, margem, margem_pct, info['arquivo_nome']
-                            ))
+                            sql = "INSERT INTO fact_vendas_snapshot (marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace, valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido, margem_total, margem_percentual, data_processamento, arquivo_origem) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)"
+                            
+                            cursor.execute(sql, (mktp, loja, row['pedido'], data_venda, row['sku'], '', qtd, preco_venda, 0, 0, receita, custo_unit, custo_total, imposto, tarifa, 0, 0, 0, tarifa, valor_liquido, margem, margem_pct, info['arquivo_nome']))
+                            
                             registros += 1
                         except Exception as e:
                             conn.rollback()
@@ -404,12 +382,12 @@ def main():
                     cursor.close()
                     conn.close()
                     
-                    st.success(f"✅ {registros} vendas gravadas! ({erros} erros)")
+                    st.success(f"{registros} vendas gravadas! ({erros} erros)")
                     del st.session_state['df_proc']
                     st.balloons()
                     
                 except Exception as e:
-                    st.error(f"❌ Erro: {e}")
+                    st.error(f"Erro: {e}")
     
     with tab2:
         tab_vendas_consolidadas(engine)
@@ -419,66 +397,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
----
-
-# 📋 **RESUMO COMPLETO PARA PRÓXIMA CONVERSA**
-
-## **CONTEXTO GERAL DO PROJETO**
-
-**Sistema Nala** - ERP completo para gestão de e-commerce multi-marketplace desenvolvido em Python/Streamlit + PostgreSQL (Neon).
-
-**Negócio:** Thiago gerencia vendas em 14 lojas distribuídas em 5 marketplaces:
-- Mercado Livre (4 lojas): ML-Nala, ML-LPT, ML-YanniRJ, ML-YanniSP
-- Amazon (4 lojas): AMZ-Innovare(CPF), AMZ-Nala, AMZ-LPT, AMZ-Yanni
-- Shopee (3 lojas): Shopee Lithouse, Shopee Litstore, Shopee-LPT
-- Shein (2 lojas): Shein Yanni, Shein LPT
-- Magalu (1 loja): Magalu-Nala
-
----
-
-## **ARQUITETURA DO BANCO DE DADOS (Neon PostgreSQL)**
-
-### **Tabelas Principais:**
-
-**1. fact_vendas_snapshot (26 colunas):**
-```
-- id, marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio
-- id_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace
-- valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao, frete
-- tarifa_fixa, outros_custos, total_tarifas, valor_liquido, margem_total
-- margem_percentual, data_processamento, arquivo_origem
-```
-
-**2. dim_lojas:**
-```
-- marketplace, loja, imposto (%)
-- 14 lojas cadastradas com alíquotas de imposto
-```
-
-**3. dim_skus:**
-```
-- sku, nome_produto, categoria, subcategoria, ativo, data_cadastro
-- codigo_fornecedor, observacoes
-- NÃO contém custos (custos estão em dim_produtos_custos)
-```
-
-**4. dim_produtos_custos:**
-```
-- sku, preco_compra, embalagem, mdo, custo_final, custo_ads, cod_fornecedor
-- Tabela separada para custos dos SKUs
-```
-
-**5. dim_config_marketplace:**
-```
-- id, marketplace, loja, modalidade, comissao_padrao, valor_fixo_padrao
-- sku, id_anuncio_plataforma, asin, logistica
-- tag, curva_calculada (colunas adicionadas recentemente)
-```
-
-**6. log_uploads:**
-```
-- id, data_upload, usuario, marketplace, loja, arquivo_nome, arquivo_caminho
-- periodo_inicio, periodo_fim, total_linhas, linhas_importadas, linhas_erro
-- tem_duplicatas, skus_sem_custo, status
