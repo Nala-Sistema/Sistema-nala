@@ -365,29 +365,46 @@ def main():
                     
                     for _, row in df_proc.iterrows():
                         try:
+                            data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
+                            qtd = int(row['qtd'])
+                            receita = float(row['receita'])
+                            custo_total = float(row['custo'])
+                            tarifa = float(row['tarifa'])
+                            imposto = float(row['imposto'])
+                            margem = float(row['margem'])
+                            margem_pct = float(row['margem_%'])
+                            
+                            preco_venda = receita / qtd if qtd > 0 else receita
+                            custo_unit = custo_total / qtd if qtd > 0 else custo_total
+                            valor_liquido = receita - tarifa - imposto
+                            
                             cursor.execute("""
-                                INSERT INTO fact_vendas_snapshot 
-                                (marketplace_origem, loja_origem, numero_pedido, data_venda, sku, quantidade, valor_venda_efetivo, custo_total, margem_total, margem_percentual)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                INSERT INTO fact_vendas_snapshot (
+                                    marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio,
+                                    quantidade, preco_venda, desconto_parceiro, desconto_marketplace, valor_venda_efetivo,
+                                    custo_unitario, custo_total, imposto, comissao, frete, tarifa_fixa, outros_custos,
+                                    total_tarifas, valor_liquido, margem_total, margem_percentual, data_processamento, arquivo_origem
+                                ) VALUES (
+                                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s
+                                )
                             """, (
-                                mktp, loja, row['pedido'],
-                                datetime.strptime(row['data'], "%d/%m/%Y").date(),
-                                row['sku'], int(row['qtd']),
-                                float(row['receita']), float(row['custo']),
-                                float(row['margem']), float(row['margem_%'])
+                                mktp, loja, row['pedido'], data_venda, row['sku'], row.get('mlb', ''),
+                                qtd, preco_venda, 0, 0, receita,
+                                custo_unit, custo_total, imposto, tarifa, 0, 0, 0,
+                                tarifa, valor_liquido, margem, margem_pct, info['arquivo_nome']
                             ))
                             registros += 1
                         except Exception as e:
                             conn.rollback()
                             erros += 1
                             if erros == 1:
-                                st.warning(f"Primeiro erro: {str(e)[:150]}")
+                                st.warning(f"Erro: {str(e)[:150]}")
                     
                     conn.commit()
                     cursor.close()
                     conn.close()
                     
-                    st.success(f"✅ {registros} vendas gravadas! ({erros} erros/duplicadas)")
+                    st.success(f"✅ {registros} vendas gravadas! ({erros} erros)")
                     del st.session_state['df_proc']
                     st.balloons()
                     
@@ -402,3 +419,66 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+
+---
+
+# 📋 **RESUMO COMPLETO PARA PRÓXIMA CONVERSA**
+
+## **CONTEXTO GERAL DO PROJETO**
+
+**Sistema Nala** - ERP completo para gestão de e-commerce multi-marketplace desenvolvido em Python/Streamlit + PostgreSQL (Neon).
+
+**Negócio:** Thiago gerencia vendas em 14 lojas distribuídas em 5 marketplaces:
+- Mercado Livre (4 lojas): ML-Nala, ML-LPT, ML-YanniRJ, ML-YanniSP
+- Amazon (4 lojas): AMZ-Innovare(CPF), AMZ-Nala, AMZ-LPT, AMZ-Yanni
+- Shopee (3 lojas): Shopee Lithouse, Shopee Litstore, Shopee-LPT
+- Shein (2 lojas): Shein Yanni, Shein LPT
+- Magalu (1 loja): Magalu-Nala
+
+---
+
+## **ARQUITETURA DO BANCO DE DADOS (Neon PostgreSQL)**
+
+### **Tabelas Principais:**
+
+**1. fact_vendas_snapshot (26 colunas):**
+```
+- id, marketplace_origem, loja_origem, numero_pedido, data_venda, sku, codigo_anuncio
+- id_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace
+- valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao, frete
+- tarifa_fixa, outros_custos, total_tarifas, valor_liquido, margem_total
+- margem_percentual, data_processamento, arquivo_origem
+```
+
+**2. dim_lojas:**
+```
+- marketplace, loja, imposto (%)
+- 14 lojas cadastradas com alíquotas de imposto
+```
+
+**3. dim_skus:**
+```
+- sku, nome_produto, categoria, subcategoria, ativo, data_cadastro
+- codigo_fornecedor, observacoes
+- NÃO contém custos (custos estão em dim_produtos_custos)
+```
+
+**4. dim_produtos_custos:**
+```
+- sku, preco_compra, embalagem, mdo, custo_final, custo_ads, cod_fornecedor
+- Tabela separada para custos dos SKUs
+```
+
+**5. dim_config_marketplace:**
+```
+- id, marketplace, loja, modalidade, comissao_padrao, valor_fixo_padrao
+- sku, id_anuncio_plataforma, asin, logistica
+- tag, curva_calculada (colunas adicionadas recentemente)
+```
+
+**6. log_uploads:**
+```
+- id, data_upload, usuario, marketplace, loja, arquivo_nome, arquivo_caminho
+- periodo_inicio, periodo_fim, total_linhas, linhas_importadas, linhas_erro
+- tem_duplicatas, skus_sem_custo, status
