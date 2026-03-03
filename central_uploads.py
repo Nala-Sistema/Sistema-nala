@@ -71,6 +71,7 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
         if 'n.' in c and 'venda' in c: rename[col] = 'pedido'
         elif 'data' in c and 'venda' in c: rename[col] = 'data'
         elif c == 'sku': rename[col] = 'sku'
+        elif 'estado' in c: rename[col] = 'status'
         elif 'unidades' in c: rename[col] = 'qtd'
         elif 'receita' in c and 'produtos' in c: rename[col] = 'receita'
         elif 'tarifa' in c and 'venda' in c: rename[col] = 'tarifa'
@@ -92,16 +93,24 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     
     vendas = []
     skus_sem_custo = set()
+    linhas_descartadas = 0
     
     for idx, row in df.iterrows():
         try:
             if pd.isna(row['sku']):
                 continue
             
+            if 'status' in df.columns:
+                status = str(row['status']).lower()
+                if 'cancelad' in status or 'devolv' in status or 'reembolso' in status:
+                    linhas_descartadas += 1
+                    continue
+            
             sku = str(row['sku']).strip()
             receita = limpar_numero(row['receita'])
             
             if receita == 0:
+                linhas_descartadas += 1
                 continue
             
             tarifa = abs(limpar_numero(row['tarifa']))
@@ -138,11 +147,11 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
                 'tem_custo': custo_unit > 0,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
-        except:
+        except Exception as e:
             continue
     
     if not vendas:
-        return None, "❌ Nenhuma venda processada"
+        return None, f"❌ Nenhuma venda válida ({linhas_descartadas} linhas descartadas)"
     
     df_result = pd.DataFrame(vendas)
     
@@ -152,6 +161,7 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
     
     info = {
         'total_linhas': len(df_result),
+        'linhas_descartadas': linhas_descartadas,
         'periodo_inicio': periodo_inicio,
         'periodo_fim': periodo_fim,
         'skus_sem_custo': len(skus_sem_custo),
@@ -330,6 +340,9 @@ def main():
                         col_b.info(f"**Marketplace:** {mktp}")
                         col_b.info(f"**Loja:** {loja}")
                         
+                        if info.get('linhas_descartadas', 0) > 0:
+                            st.info(f"ℹ️ {info['linhas_descartadas']} linhas descartadas (cancelamentos/devoluções/trocas)")
+                        
                         if info['skus_sem_custo'] > 0:
                             st.warning(f"⚠️ {info['skus_sem_custo']} SKUs sem custo")
                         
@@ -346,48 +359,53 @@ def main():
                         if st.button("✅ Confirmar e Gravar no Banco", type="primary"):
                             try:
                                 with st.spinner("Gravando vendas no banco..."):
-                                    with engine.connect() as conn:
+                                    erros_gravacao = []
+                                    
+                                    with engine.begin() as conn:
                                         registros_inseridos = 0
                                         
-                                        for _, row in df_proc.iterrows():
-                                            data_venda_obj = datetime.strptime(row['data'], "%d/%m/%Y")
-                                            
-                                            query_insert = text("""
-                                                INSERT INTO fact_vendas_snapshot (
-                                                    marketplace_origem, loja_origem, numero_pedido,
-                                                    data_venda, sku, codigo_anuncio, quantidade,
-                                                    preco_venda, valor_venda_efetivo, custo_unitario,
-                                                    custo_total, imposto, comissao, total_tarifas,
-                                                    margem_total, margem_percentual, data_processamento
-                                                ) VALUES (
-                                                    :mktp, :loja, :pedido, :data, :sku, :mlb, :qtd,
-                                                    :preco, :receita, :custo_unit, :custo_total,
-                                                    :imposto, :tarifa, :tarifa, :margem, :margem_pct,
-                                                    NOW()
-                                                )
-                                                ON CONFLICT (numero_pedido, sku) DO NOTHING
-                                            """)
-                                            
-                                            result = conn.execute(query_insert, {
-                                                'mktp': mktp,
-                                                'loja': loja,
-                                                'pedido': row['pedido'],
-                                                'data': data_venda_obj.date(),
-                                                'sku': row['sku'],
-                                                'mlb': row['mlb'],
-                                                'qtd': row['qtd'],
-                                                'preco': row['receita'] / row['qtd'],
-                                                'receita': row['receita'],
-                                                'custo_unit': row['custo'] / row['qtd'] if row['qtd'] > 0 else 0,
-                                                'custo_total': row['custo'],
-                                                'imposto': row['imposto'],
-                                                'tarifa': row['tarifa'],
-                                                'margem': row['margem'],
-                                                'margem_pct': row['margem_%']
-                                            })
-                                            
-                                            if result.rowcount > 0:
-                                                registros_inseridos += 1
+                                        for idx_row, row in df_proc.iterrows():
+                                            try:
+                                                data_venda_obj = datetime.strptime(row['data'], "%d/%m/%Y")
+                                                
+                                                query_insert = text("""
+                                                    INSERT INTO fact_vendas_snapshot (
+                                                        marketplace_origem, loja_origem, numero_pedido,
+                                                        data_venda, sku, codigo_anuncio, quantidade,
+                                                        preco_venda, valor_venda_efetivo, custo_unitario,
+                                                        custo_total, imposto, comissao, total_tarifas,
+                                                        margem_total, margem_percentual, data_processamento
+                                                    ) VALUES (
+                                                        :mktp, :loja, :pedido, :data, :sku, :mlb, :qtd,
+                                                        :preco, :receita, :custo_unit, :custo_total,
+                                                        :imposto, :tarifa, :tarifa, :margem, :margem_pct,
+                                                        NOW()
+                                                    )
+                                                    ON CONFLICT (numero_pedido, sku) DO NOTHING
+                                                """)
+                                                
+                                                result = conn.execute(query_insert, {
+                                                    'mktp': mktp,
+                                                    'loja': loja,
+                                                    'pedido': row['pedido'],
+                                                    'data': data_venda_obj.date(),
+                                                    'sku': row['sku'],
+                                                    'mlb': row['mlb'] if row['mlb'] else None,
+                                                    'qtd': int(row['qtd']),
+                                                    'preco': float(row['receita']) / int(row['qtd']),
+                                                    'receita': float(row['receita']),
+                                                    'custo_unit': float(row['custo']) / int(row['qtd']) if int(row['qtd']) > 0 else 0,
+                                                    'custo_total': float(row['custo']),
+                                                    'imposto': float(row['imposto']),
+                                                    'tarifa': float(row['tarifa']),
+                                                    'margem': float(row['margem']),
+                                                    'margem_pct': float(row['margem_%'])
+                                                })
+                                                
+                                                if result.rowcount > 0:
+                                                    registros_inseridos += 1
+                                            except Exception as e_row:
+                                                erros_gravacao.append(f"Linha {idx_row}: {str(e_row)[:100]}")
                                         
                                         query_log = text("""
                                             INSERT INTO log_uploads (
@@ -410,15 +428,19 @@ def main():
                                             'importadas': registros_inseridos,
                                             'sem_custo': info['skus_sem_custo']
                                         })
-                                        
-                                        conn.commit()
                                     
                                     st.success(f"✅ {registros_inseridos} vendas gravadas com sucesso!")
+                                    
+                                    if erros_gravacao:
+                                        with st.expander(f"⚠️ {len(erros_gravacao)} erros na gravação"):
+                                            for erro in erros_gravacao[:10]:
+                                                st.warning(erro)
+                                    
                                     st.balloons()
                                     
                             except Exception as e:
                                 st.error(f"❌ Erro ao gravar: {str(e)}")
-                                st.exception(e)
+                                st.code(str(e))
                     else:
                         st.error(info)
                 else:
