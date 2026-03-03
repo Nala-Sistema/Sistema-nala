@@ -11,21 +11,18 @@ def get_engine():
     return create_engine(DB_URL)
 
 def formatar_valor(valor):
-    """R$ 1.234,56"""
     try:
         return f"R$ {float(valor):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
     except:
         return "R$ 0,00"
 
 def formatar_percentual(valor):
-    """18,50%"""
     try:
         return f"{float(valor):.2f}%".replace('.', ',')
     except:
         return "0,00%"
 
 def formatar_quantidade(valor):
-    """1.245"""
     try:
         return f"{int(valor):,}".replace(',', '.')
     except:
@@ -147,7 +144,7 @@ def processar_mercado_livre(arquivo, loja_sel, imposto, engine):
                 'tem_custo': custo_unit > 0,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
-        except Exception as e:
+        except:
             continue
     
     if not vendas:
@@ -294,7 +291,7 @@ def tab_uploads_historico(engine):
         else:
             st.info("Nenhuma importação registrada")
     except:
-        st.info("Histórico não disponível. Execute os scripts SQL.")
+        st.info("Histórico não disponível")
 
 def main():
     st.header("💰 Central de Vendas")
@@ -325,155 +322,67 @@ def main():
         arquivo = st.file_uploader("📁 Upload XLSX", type=['xlsx'])
         
         if arquivo and st.button("🔍 Analisar"):
-            with st.spinner("Processando..."):
-                if 'MERCADO' in mktp.upper() and 'LIVRE' in mktp.upper():
-                    df_proc, info = processar_mercado_livre(arquivo, loja, imposto, engine)
-                    
-                    if df_proc is not None:
-                        st.success(f"✅ {info['total_linhas']} vendas processadas!")
-                        
-                        st.markdown("### 📊 CONFIRMAÇÃO DE IMPORTAÇÃO")
-                        
-                        col_a, col_b = st.columns(2)
-                        col_a.info(f"**Arquivo:** {info['arquivo_nome']}")
-                        col_a.info(f"**Período:** {info['periodo_inicio']} a {info['periodo_fim']}")
-                        col_b.info(f"**Marketplace:** {mktp}")
-                        col_b.info(f"**Loja:** {loja}")
-                        
-                        if info.get('linhas_descartadas', 0) > 0:
-                            st.info(f"ℹ️ {info['linhas_descartadas']} linhas descartadas (cancelamentos/devoluções/trocas)")
-                        
-                        if info['skus_sem_custo'] > 0:
-                            st.warning(f"⚠️ {info['skus_sem_custo']} SKUs sem custo")
-                        
-                        df_preview = df_proc.copy()
-                        df_preview['receita'] = df_preview['receita'].apply(formatar_valor)
-                        df_preview['tarifa'] = df_preview['tarifa'].apply(formatar_valor)
-                        df_preview['imposto'] = df_preview['imposto'].apply(formatar_valor)
-                        df_preview['custo'] = df_preview['custo'].apply(formatar_valor)
-                        df_preview['margem'] = df_preview['margem'].apply(formatar_valor)
-                        df_preview['margem_%'] = df_preview['margem_%'].apply(formatar_percentual)
-                        
-                        st.dataframe(df_preview.head(20), use_container_width=True)
-                        
-                        if st.button("✅ Confirmar e Gravar no Banco", type="primary"):
+            if 'MERCADO' in mktp.upper() and 'LIVRE' in mktp.upper():
+                df_proc, info = processar_mercado_livre(arquivo, loja, imposto, engine)
+                
+                if df_proc is not None:
+                    st.session_state['df_proc'] = df_proc
+                    st.session_state['info'] = info
+                    st.session_state['mktp'] = mktp
+                    st.session_state['loja'] = loja
+                    st.rerun()
+        
+        if 'df_proc' in st.session_state:
+            df_proc = st.session_state['df_proc']
+            info = st.session_state['info']
+            mktp = st.session_state['mktp']
+            loja = st.session_state['loja']
+            
+            st.success(f"✅ {info['total_linhas']} vendas processadas!")
+            
+            col_a, col_b = st.columns(2)
+            col_a.info(f"**Período:** {info['periodo_inicio']} a {info['periodo_fim']}")
+            col_b.info(f"**Loja:** {loja}")
+            
+            if info.get('linhas_descartadas', 0) > 0:
+                st.info(f"ℹ️ {info['linhas_descartadas']} linhas descartadas")
+            
+            df_preview = df_proc.copy()
+            df_preview['receita'] = df_preview['receita'].apply(formatar_valor)
+            df_preview['tarifa'] = df_preview['tarifa'].apply(formatar_valor)
+            df_preview['custo'] = df_preview['custo'].apply(formatar_valor)
+            df_preview['margem'] = df_preview['margem'].apply(formatar_valor)
+            df_preview['margem_%'] = df_preview['margem_%'].apply(formatar_percentual)
+            
+            st.dataframe(df_preview.head(20), use_container_width=True)
+            
+            if st.button("✅ GRAVAR NO BANCO", type="primary"):
+                try:
+                    with engine.begin() as conn:
+                        registros = 0
+                        for _, row in df_proc.iterrows():
                             try:
-                                with st.spinner("Gravando vendas no banco..."):
-                                    st.write("🔍 Iniciando gravação...")
-                                    
-                                    erros_gravacao = []
-                                    registros_inseridos = 0
-                                    registros_duplicados = 0
-                                    
-                                    try:
-                                        with engine.connect() as test_conn:
-                                            result = test_conn.execute(text("SELECT 1"))
-                                            st.write("✅ Conexão com banco OK")
-                                    except Exception as e_conn:
-                                        st.error(f"❌ Erro de conexão: {e_conn}")
-                                        raise
-                                    
-                                    with engine.begin() as conn:
-                                        for idx_row, row in df_proc.iterrows():
-                                            try:
-                                                data_venda_obj = datetime.strptime(row['data'], "%d/%m/%Y")
-                                                
-                                                query_insert = text("""
-                                                    INSERT INTO fact_vendas_snapshot (
-                                                        marketplace_origem, loja_origem, numero_pedido,
-                                                        data_venda, sku, codigo_anuncio, quantidade,
-                                                        preco_venda, valor_venda_efetivo, custo_unitario,
-                                                        custo_total, imposto, comissao, total_tarifas,
-                                                        margem_total, margem_percentual, data_processamento
-                                                    ) VALUES (
-                                                        :mktp, :loja, :pedido, :data, :sku, :mlb, :qtd,
-                                                        :preco, :receita, :custo_unit, :custo_total,
-                                                        :imposto, :tarifa, :tarifa, :margem, :margem_pct,
-                                                        NOW()
-                                                    )
-                                                """)
-                                                
-                                                params = {
-                                                    'mktp': mktp,
-                                                    'loja': loja,
-                                                    'pedido': row['pedido'],
-                                                    'data': data_venda_obj.date(),
-                                                    'sku': row['sku'],
-                                                    'mlb': row['mlb'] if row['mlb'] else None,
-                                                    'qtd': int(row['qtd']),
-                                                    'preco': float(row['receita']) / int(row['qtd']),
-                                                    'receita': float(row['receita']),
-                                                    'custo_unit': float(row['custo']) / int(row['qtd']) if int(row['qtd']) > 0 else 0,
-                                                    'custo_total': float(row['custo']),
-                                                    'imposto': float(row['imposto']),
-                                                    'tarifa': float(row['tarifa']),
-                                                    'margem': float(row['margem']),
-                                                    'margem_pct': float(row['margem_%'])
-                                                }
-                                                
-                                                result = conn.execute(query_insert, params)
-                                                
-                                                if result.rowcount > 0:
-                                                    registros_inseridos += 1
-                                                    if idx_row < 3:
-                                                        st.write(f"✅ Linha {idx_row}: {row['pedido']} - {row['sku']}")
-                                                        
-                                            except Exception as e_row:
-                                                erro_msg = str(e_row)
-                                                if 'duplicate key' in erro_msg.lower() or 'unique constraint' in erro_msg.lower():
-                                                    registros_duplicados += 1
-                                                else:
-                                                    erros_gravacao.append(f"Linha {idx_row} ({row['pedido']}-{row['sku']}): {erro_msg[:200]}")
-                                                    if idx_row < 3:
-                                                        st.warning(f"⚠️ Linha {idx_row}: {erro_msg[:100]}")
-                                        
-                                        try:
-                                            query_log = text("""
-                                                INSERT INTO log_uploads (
-                                                    usuario, marketplace, loja, arquivo_nome,
-                                                    periodo_inicio, periodo_fim, total_linhas,
-                                                    linhas_importadas, skus_sem_custo
-                                                ) VALUES (
-                                                    'Admin', :mktp, :loja, :arq, :inicio, :fim,
-                                                    :total, :importadas, :sem_custo
-                                                )
-                                            """)
-                                            
-                                            conn.execute(query_log, {
-                                                'mktp': mktp,
-                                                'loja': loja,
-                                                'arq': info['arquivo_nome'],
-                                                'inicio': datetime.strptime(info['periodo_inicio'], "%d/%m/%Y").date(),
-                                                'fim': datetime.strptime(info['periodo_fim'], "%d/%m/%Y").date(),
-                                                'total': info['total_linhas'],
-                                                'importadas': registros_inseridos,
-                                                'sem_custo': info['skus_sem_custo']
-                                            })
-                                        except Exception as e_log:
-                                            st.warning(f"Log não gravado: {e_log}")
-                                    
-                                    st.success(f"✅ {registros_inseridos} vendas NOVAS gravadas!")
-                                    
-                                    if registros_duplicados > 0:
-                                        st.info(f"ℹ️ {registros_duplicados} registros já existiam")
-                                    
-                                    if erros_gravacao:
-                                        with st.expander(f"⚠️ {len(erros_gravacao)} erros"):
-                                            for erro in erros_gravacao[:10]:
-                                                st.error(erro)
-                                    
-                                    if registros_inseridos > 0:
-                                        st.balloons()
-                                    
+                                conn.execute(text("""
+                                    INSERT INTO fact_vendas_snapshot (
+                                        marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
+                                        quantidade, valor_venda_efetivo, custo_total, margem_total, margem_percentual
+                                    ) VALUES (:m, :l, :p, :d, :s, :q, :r, :c, :mg, :mp)
+                                """), {
+                                    'm': mktp, 'l': loja, 'p': row['pedido'],
+                                    'd': datetime.strptime(row['data'], "%d/%m/%Y").date(),
+                                    's': row['sku'], 'q': int(row['qtd']),
+                                    'r': float(row['receita']), 'c': float(row['custo']),
+                                    'mg': float(row['margem']), 'mp': float(row['margem_%'])
+                                })
+                                registros += 1
                             except Exception as e:
-                                st.error(f"❌ ERRO GERAL: {str(e)}")
-                                st.code(str(e))
-                                import traceback
-                                st.code(traceback.format_exc())
-                    else:
-                        st.error(info)
-                else:
-                    st.error(f"{mktp} não implementado")
+                                st.warning(f"Erro linha: {str(e)[:50]}")
+                    
+                    st.success(f"✅ {registros} vendas gravadas!")
+                    del st.session_state['df_proc']
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"Erro: {e}")
     
     with tab2:
         tab_vendas_consolidadas(engine)
