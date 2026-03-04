@@ -4,7 +4,7 @@ Processa arquivos de vendas do Mercado Livre
 - Detecta header automaticamente
 - Filtra vendas canceladas/devolvidas
 - Valida SKUs antes de gravar
-- Calcula margem
+- Calcula margem CORRETA (com frete e FLEX)
 - Grava no banco com barra de progresso
 """
 
@@ -41,6 +41,7 @@ def renomear_colunas_ml(df):
     for col in df.columns:
         col_lower = str(col).lower().strip()
         
+        # Colunas principais
         if 'n.' in col_lower and 'venda' in col_lower:
             rename_map[col] = 'pedido'
         elif 'data' in col_lower and 'venda' in col_lower:
@@ -51,10 +52,22 @@ def renomear_colunas_ml(df):
             rename_map[col] = 'status'
         elif 'unidades' in col_lower and 'unidades.' not in col_lower:
             rename_map[col] = 'qtd'
+        
+        # Receitas e tarifas
         elif 'receita' in col_lower and 'produtos' in col_lower:
             rename_map[col] = 'receita'
         elif 'tarifa' in col_lower and 'venda' in col_lower:
             rename_map[col] = 'tarifa'
+        elif 'receita' in col_lower and 'envio' in col_lower:
+            rename_map[col] = 'receita_envio'
+        elif 'tarifas' in col_lower and 'envio' in col_lower:
+            rename_map[col] = 'tarifa_envio'
+        
+        # Total e forma de entrega
+        elif col_lower == 'total (brl)':
+            rename_map[col] = 'total_brl'
+        elif 'forma' in col_lower and 'entrega' in col_lower:
+            rename_map[col] = 'forma_entrega'
     
     return df.rename(columns=rename_map)
 
@@ -91,6 +104,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     vendas = []
     skus_sem_custo = set()
     linhas_descartadas = 0
+    avisos_divergencia = []
     
     for idx, row in df.iterrows():
         try:
@@ -125,16 +139,47 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             except:
                 qtd = 1
             
-            # Buscar custo
+            # FRETE - Colunas opcionais
+            receita_envio = abs(limpar_numero(row.get('receita_envio', 0)))
+            tarifa_envio = abs(limpar_numero(row.get('tarifa_envio', 0)))
+            forma_entrega = str(row.get('forma_entrega', '')).lower()
+            total_brl = limpar_numero(row.get('total_brl', 0))
+            
+            # DETECTAR FLEX
+            is_flex = 'flex' in forma_entrega
+            
+            # CALCULAR FRETE E IMPOSTO
+            if is_flex:
+                custo_frete = 12.90  # Custo fixo transportadora
+                imposto_val = 0.0    # SEM imposto no FLEX
+            else:
+                custo_frete = tarifa_envio - receita_envio  # Frete líquido
+                imposto_val = receita * (imposto / 100)     # Imposto normal
+            
+            # Buscar custo produto
             custo_unit = custos_dict.get(sku, 0)
             if custo_unit == 0:
                 skus_sem_custo.add(sku)
             
-            # Calcular valores
+            # Calcular custo total
             custo_total = custo_unit * qtd
-            imposto_val = receita * (imposto / 100)
-            margem = receita - tarifa - imposto_val - custo_total
+            
+            # MARGEM = receita - tarifa - imposto - frete - custo
+            margem = receita - tarifa - imposto_val - custo_frete - custo_total
             margem_pct = (margem / receita * 100) if receita > 0 else 0
+            
+            # VALIDAÇÃO contra Total (BRL)
+            if total_brl > 0:
+                valor_calculado = receita - tarifa - imposto_val - custo_frete
+                divergencia = abs(valor_calculado - total_brl)
+                
+                if divergencia > 5.00:
+                    avisos_divergencia.append({
+                        'pedido': str(row.get('pedido', '')),
+                        'calculado': valor_calculado,
+                        'total_brl': total_brl,
+                        'diferenca': divergencia
+                    })
             
             # Data
             data_venda = converter_data_ml(row.get('data'))
@@ -148,10 +193,12 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 'receita': receita,
                 'tarifa': tarifa,
                 'imposto': imposto_val,
+                'frete': custo_frete,
                 'custo': custo_total,
                 'margem': margem,
                 'margem_pct': margem_pct,
                 'tem_custo': custo_unit > 0,
+                'is_flex': is_flex,
                 '_custo_unit': custo_unit,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
@@ -179,7 +226,8 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         'periodo_inicio': periodo_inicio,
         'periodo_fim': periodo_fim,
         'skus_sem_custo': len(skus_sem_custo),
-        'arquivo_nome': arquivo.name
+        'arquivo_nome': arquivo.name,
+        'divergencias': avisos_divergencia
     }
     
     # 11. LIMPAR COLUNAS TEMPORÁRIAS
@@ -238,13 +286,15 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             custo_total = float(row['custo'])
             tarifa = float(row['tarifa'])
             imposto = float(row['imposto'])
+            frete = float(row['frete'])
             margem = float(row['margem'])
             margem_pct = float(row['margem_pct'])
             
             # Calcular valores derivados
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
-            valor_liquido = receita - tarifa - imposto
+            total_tarifas = tarifa + frete
+            valor_liquido = receita - total_tarifas - imposto
             
             # SQL INSERT
             sql = """
@@ -265,7 +315,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
                 marketplace, loja, row['pedido'], data_venda, sku,
                 '', qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto, tarifa,
-                0, 0, 0, tarifa, valor_liquido,
+                frete, 0, 0, total_tarifas, valor_liquido,
                 margem, margem_pct, arquivo_nome
             ))
             
