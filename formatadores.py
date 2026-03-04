@@ -95,7 +95,7 @@ def converter_data_ml(data_str):
 def limpar_numero(valor):
     """
     Remove formatação de número e converte para float.
-    Entrada: "R$ 1.234,56" ou "1.234,56"
+    Entrada: "R$ 1.234,56" ou "1.234,56" ou 1234.56 (já numérico)
     Saída: 1234.56
     """
     import pandas as pd
@@ -104,12 +104,19 @@ def limpar_numero(valor):
         return 0.0
     
     try:
-        # Remove R$, espaços
+        # Se já for número (int ou float), retorna direto
+        if isinstance(valor, (int, float)):
+            return float(valor)
+        
+        # Se for string, limpa formatação brasileira
         valor_str = str(valor).replace('R$', '').strip()
-        # Remove pontos de milhares
-        valor_str = valor_str.replace('.', '')
-        # Troca vírgula decimal por ponto
-        valor_str = valor_str.replace(',', '.')
+        
+        # Se tiver vírgula, é formato BR: 1.234,56
+        if ',' in valor_str:
+            valor_str = valor_str.replace('.', '')  # Remove ponto de milhares
+            valor_str = valor_str.replace(',', '.')  # Troca vírgula decimal
+        # Senão, assume que ponto é decimal (formato do Excel)
+        
         return float(valor_str)
     except:
         return 0.0
