@@ -6,7 +6,7 @@ Processa arquivos de vendas do Mercado Livre
 - Valida SKUs antes de gravar
 - Calcula margem CORRETA (com frete e FLEX)
 - Grava no banco com barra de progresso
-- VERSÃO SEGURA: Apenas correções essenciais
+- VERSÃO FINAL: Todos bugs corrigidos
 """
 
 import pandas as pd
@@ -72,6 +72,10 @@ def renomear_colunas_ml(df):
             rename_map[col] = 'total_brl'
         elif 'forma' in col_lower and 'entrega' in col_lower:
             rename_map[col] = 'forma_entrega'
+        
+        # CORRIGIDO: Mapear código do anúncio
+        elif '#' in col_lower and 'anuncio' in col_lower:
+            rename_map[col] = 'codigo_anuncio'
     
     return df.rename(columns=rename_map)
 
@@ -101,8 +105,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     if not all(col in df.columns for col in colunas_obrigatorias):
         return None, f"Colunas obrigatórias não encontradas: {colunas_obrigatorias}"
     
-    # 5. BUSCAR CUSTOS DO BANCO
-    custos_dict = buscar_custos_skus(engine)
+    # 5. CORRIGIDO: FORÇAR REFRESH DE CUSTOS (evitar cache antigo)
+    # Adiciona timestamp para forçar nova query
+    timestamp = datetime.now().timestamp()
+    custos_dict = buscar_custos_skus(engine, force_refresh=timestamp)
     
     # 6. PROCESSAR VENDAS
     vendas = []
@@ -119,10 +125,19 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             
             sku = str(row['sku']).strip()
             
-            # CORRIGIDO: Filtrar por status (incluindo mediação)
+            # CORRIGIDO: Filtrar por status (normalizar string, remover acentos)
             if 'status' in df.columns:
-                status = str(row['status']).lower()
-                if any(palavra in status for palavra in ['cancelad', 'devolv', 'reembolso', 'mediação', 'mediacao']):
+                status = str(row['status']).lower().strip()
+                # Remove acentos e espaços extras
+                status_normalizado = status.replace('ç', 'c').replace('ã', 'a').replace('õ', 'o')
+                
+                # Lista de palavras que indicam venda inválida
+                palavras_bloqueio = [
+                    'cancelad', 'devolv', 'devoluç', 'devoluc',
+                    'reembolso', 'mediacao', 'mediação', 'mediaçao'
+                ]
+                
+                if any(palavra in status_normalizado for palavra in palavras_bloqueio):
                     linhas_descartadas += 1
                     continue
             
@@ -149,10 +164,13 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             forma_entrega = str(row.get('forma_entrega', '')).lower()
             total_brl = limpar_numero(row.get('total_brl', 0))
             
+            # CORRIGIDO: Capturar código anúncio
+            codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
+            
             # DETECTAR FLEX
             is_flex = 'flex' in forma_entrega
             
-            # CORRIGIDO: CALCULAR FRETE E IMPOSTO
+            # CALCULAR FRETE E IMPOSTO
             if is_flex:
                 # FLEX: Custo líquido (transportadora - cliente pagou)
                 custo_frete = CUSTO_FLEX_ML - receita_envio
@@ -162,7 +180,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 custo_frete = tarifa_envio - receita_envio
                 imposto_val = receita * (imposto / 100)
             
-            # Buscar custo produto
+            # Buscar custo produto (agora com refresh forçado)
             custo_unit = custos_dict.get(sku, 0)
             if custo_unit == 0:
                 skus_sem_custo.add(sku)
@@ -190,11 +208,12 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # Data
             data_venda = converter_data_ml(row.get('data'))
             
-            # Montar registro (MANTÉM ESTRUTURA ORIGINAL - compatível com central_uploads.py)
+            # Montar registro
             vendas.append({
                 'pedido': str(row.get('pedido', '')),
                 'data': data_venda,
                 'sku': sku,
+                'codigo_anuncio': codigo_anuncio,  # NOVO
                 'qtd': qtd,
                 'receita': receita,
                 'tarifa': tarifa,
@@ -296,6 +315,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             margem = float(row['margem'])
             margem_pct = float(row['margem_pct'])
             
+            # CORRIGIDO: Pegar código anúncio do row
+            codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
+            
             # Calcular valores derivados
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
@@ -319,7 +341,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             
             cursor.execute(sql, (
                 marketplace, loja, row['pedido'], data_venda, sku,
-                '',  # codigo_anuncio vazio por enquanto (evita erros)
+                codigo_anuncio,  # CORRIGIDO: agora pega do row
                 qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto, tarifa,
                 frete, 0, 0, total_tarifas, valor_liquido,
