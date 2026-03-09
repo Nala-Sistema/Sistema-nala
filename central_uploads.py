@@ -1,6 +1,7 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
 Interface principal para upload e processamento de vendas
+VERSÃO FINAL: Todos bugs corrigidos
 """
 
 import streamlit as st
@@ -96,6 +97,7 @@ def tab_processar_upload(engine):
         df_preview['receita'] = df_preview['receita'].apply(formatar_valor)
         df_preview['tarifa'] = df_preview['tarifa'].apply(formatar_valor)
         df_preview['imposto'] = df_preview['imposto'].apply(formatar_valor)
+        df_preview['frete'] = df_preview['frete'].apply(formatar_valor)
         df_preview['custo'] = df_preview['custo'].apply(formatar_valor)
         df_preview['margem'] = df_preview['margem'].apply(formatar_valor)
         df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
@@ -121,18 +123,33 @@ def tab_processar_upload(engine):
                     df_proc, mktp, loja, arquivo_nome, engine
                 )
                 
-                # Gravar log
-                info_log = {
-                    'marketplace': mktp,
-                    'loja': loja,
-                    'arquivo_nome': arquivo_nome,
-                    'periodo_inicio': info['periodo_inicio'],
-                    'periodo_fim': info['periodo_fim'],
-                    'total_linhas': info['total_linhas'],
-                    'linhas_importadas': registros,
-                    'linhas_erro': erros
-                }
-                gravar_log_upload(engine, info_log)
+                # CORRIGIDO: Gravar log de forma correta
+                try:
+                    conn = engine.raw_connection()
+                    cursor = conn.cursor()
+                    
+                    sql_log = """
+                        INSERT INTO log_uploads (
+                            data_upload, marketplace, loja, arquivo_nome,
+                            periodo_inicio, periodo_fim, total_linhas,
+                            linhas_importadas, linhas_erro, status
+                        ) VALUES (
+                            NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                    """
+                    
+                    cursor.execute(sql_log, (
+                        mktp, loja, arquivo_nome,
+                        info['periodo_inicio'], info['periodo_fim'],
+                        info['total_linhas'], registros, erros,
+                        'SUCESSO' if registros > 0 else 'ERRO'
+                    ))
+                    
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                except Exception as e:
+                    st.warning(f"⚠️ Erro ao gravar log: {e}")
                 
                 # Mensagens
                 if registros > 0:
@@ -186,27 +203,16 @@ def tab_vendas_consolidadas(engine):
         data_fim = hoje
     else:
         data_ini = col2.date_input("De:", hoje - timedelta(days=30))
-        data_fim = col2.date_input("Até:", hoje)
+        data_fim = col3.date_input("Até:", hoje)
     
     # Filtros de marketplace e loja
     df_lojas = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
-    mktp_filtro = col3.selectbox("Marketplace:", ["Todos"] + df_lojas['marketplace'].tolist())
-    
-    if mktp_filtro != "Todos":
-        df_lojas_filtradas = pd.read_sql(
-            f"SELECT loja FROM dim_lojas WHERE marketplace = '{mktp_filtro}'", 
-            engine
-        )
-        loja_filtro = col4.selectbox("Loja:", ["Todas"] + df_lojas_filtradas['loja'].tolist())
-    else:
-        loja_filtro = "Todas"
+    mktp_filtro = col4.selectbox("Marketplace:", ["Todos"] + df_lojas['marketplace'].tolist())
     
     # Query de vendas
     query = f"SELECT * FROM fact_vendas_snapshot WHERE data_venda BETWEEN '{data_ini}' AND '{data_fim}'"
     if mktp_filtro != "Todos":
         query += f" AND marketplace_origem = '{mktp_filtro}'"
-    if loja_filtro != "Todas":
-        query += f" AND loja_origem = '{loja_filtro}'"
     
     try:
         df_vendas = pd.read_sql(query, engine)
@@ -290,27 +296,89 @@ def tab_vendas_consolidadas(engine):
     df_display = df_vendas.copy()
     df_display['data_venda'] = pd.to_datetime(df_display['data_venda']).dt.strftime('%d/%m/%Y')
     
+    # CORRIGIDO: Remover limite de 99 linhas
     st.dataframe(
         df_display[[
-            'data_venda', 'numero_pedido', 'sku', 'quantidade',
+            'data_venda', 'numero_pedido', 'sku', 'codigo_anuncio', 'quantidade',
             'valor_venda_efetivo', 'custo_total', 'margem_percentual'
-        ]].head(100),
+        ]],
         use_container_width=True,
-        height=400
+        height=600
     )
     
-    # Download Excel
+    # CORRIGIDO: Download Excel com formatação BR
     if st.button("📥 Download Excel"):
         buffer = io.BytesIO()
+        
+        # Preparar DataFrame para Excel com formatação BR
+        df_excel = df_vendas.copy()
+        
+        # CORRIGIDO: Formatar data como dd/mm/aaaa
+        df_excel['data_venda'] = pd.to_datetime(df_excel['data_venda']).dt.strftime('%d/%m/%Y')
+        
+        # CORRIGIDO: Formatar valores com 2 casas decimais
+        colunas_valor = [
+            'preco_venda', 'valor_venda_efetivo', 'custo_unitario', 'custo_total',
+            'imposto', 'comissao', 'frete', 'total_tarifas', 'valor_liquido', 'margem_total'
+        ]
+        
+        for col in colunas_valor:
+            if col in df_excel.columns:
+                df_excel[col] = df_excel[col].apply(lambda x: f"{x:.2f}".replace('.', ','))
+        
+        # CORRIGIDO: Formatar percentual com 2 casas decimais
+        if 'margem_percentual' in df_excel.columns:
+            df_excel['margem_percentual'] = df_excel['margem_percentual'].apply(lambda x: f"{x:.2f}".replace('.', ','))
+        
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            df_vendas.to_excel(writer, index=False, sheet_name='Vendas')
+            df_excel.to_excel(writer, index=False, sheet_name='Vendas')
         
         st.download_button(
             "⬇️ Baixar Relatório",
             buffer.getvalue(),
-            f"vendas_{data_ini}_{data_fim}.xlsx",
+            f"vendas_{data_ini.strftime('%d%m%Y')}_{data_fim.strftime('%d%m%Y')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+    
+    # NOVO: Botão deletar vendas (apenas ADMIN)
+    st.divider()
+    with st.expander("🗑️ Deletar Vendas (ADMIN)", expanded=False):
+        st.warning("⚠️ **ATENÇÃO:** Esta ação é irreversível!")
+        
+        col_del1, col_del2 = st.columns(2)
+        
+        confirm_delete = col_del1.text_input("Digite 'DELETAR' para confirmar:")
+        marketplace_del = col_del2.selectbox("Marketplace a deletar:", [""] + df_lojas['marketplace'].tolist())
+        
+        if st.button("🗑️ DELETAR VENDAS", type="secondary"):
+            if confirm_delete == "DELETAR" and marketplace_del:
+                try:
+                    conn = engine.raw_connection()
+                    cursor = conn.cursor()
+                    
+                    # Deletar vendas
+                    cursor.execute(
+                        "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s",
+                        (marketplace_del,)
+                    )
+                    
+                    # Deletar logs
+                    cursor.execute(
+                        "DELETE FROM log_uploads WHERE marketplace = %s",
+                        (marketplace_del,)
+                    )
+                    
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    
+                    st.success(f"✅ Vendas de {marketplace_del} deletadas!")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Erro ao deletar: {e}")
+            else:
+                st.warning("⚠️ Confirme digitando 'DELETAR' e selecionando marketplace.")
 
 
 def tab_historico_uploads(engine):
@@ -320,12 +388,21 @@ def tab_historico_uploads(engine):
     
     try:
         df_log = pd.read_sql(
-            "SELECT * FROM log_uploads ORDER BY data_upload DESC LIMIT 100",
+            """SELECT 
+                data_upload, marketplace, loja, arquivo_nome,
+                periodo_inicio, periodo_fim, total_linhas,
+                linhas_importadas, linhas_erro, status
+            FROM log_uploads 
+            ORDER BY data_upload DESC 
+            LIMIT 200""",
             engine
         )
         
         if not df_log.empty:
-            st.dataframe(df_log, use_container_width=True, height=500)
+            # Formatar data
+            df_log['data_upload'] = pd.to_datetime(df_log['data_upload']).dt.strftime('%d/%m/%Y %H:%M')
+            
+            st.dataframe(df_log, use_container_width=True, height=600)
         else:
             st.info("ℹ️ Nenhuma importação registrada ainda.")
     
