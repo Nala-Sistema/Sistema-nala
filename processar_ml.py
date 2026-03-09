@@ -2,10 +2,11 @@
 PROCESSADOR MERCADO LIVRE - Sistema Nala
 Processa arquivos de vendas do Mercado Livre
 - Detecta header automaticamente
-- Filtra vendas canceladas/devolvidas
+- Filtra vendas canceladas/devolvidas/mediações
 - Valida SKUs antes de gravar
 - Calcula margem CORRETA (com frete e FLEX)
 - Grava no banco com barra de progresso
+- VERSÃO SEGURA: Apenas correções essenciais
 """
 
 import pandas as pd
@@ -13,6 +14,9 @@ import streamlit as st
 from datetime import datetime
 from formatadores import converter_data_ml, limpar_numero
 from database_utils import buscar_custos_skus, buscar_skus_validos
+
+# CONFIGURAÇÃO FLEX (editável)
+CUSTO_FLEX_ML = 12.90  # Custo fixo transportadora FLEX
 
 
 def detectar_header_ml(arquivo):
@@ -115,10 +119,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             
             sku = str(row['sku']).strip()
             
-            # Filtrar por status
+            # CORRIGIDO: Filtrar por status (incluindo mediação)
             if 'status' in df.columns:
                 status = str(row['status']).lower()
-                if any(palavra in status for palavra in ['cancelad', 'devolv', 'reembolso']):
+                if any(palavra in status for palavra in ['cancelad', 'devolv', 'reembolso', 'mediação', 'mediacao']):
                     linhas_descartadas += 1
                     continue
             
@@ -148,13 +152,15 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # DETECTAR FLEX
             is_flex = 'flex' in forma_entrega
             
-            # CALCULAR FRETE E IMPOSTO
+            # CORRIGIDO: CALCULAR FRETE E IMPOSTO
             if is_flex:
-                custo_frete = 12.90  # Custo fixo transportadora
-                imposto_val = 0.0    # SEM imposto no FLEX
+                # FLEX: Custo líquido (transportadora - cliente pagou)
+                custo_frete = CUSTO_FLEX_ML - receita_envio
+                imposto_val = 0.0  # SEM imposto no FLEX
             else:
-                custo_frete = tarifa_envio - receita_envio  # Frete líquido
-                imposto_val = receita * (imposto / 100)     # Imposto normal
+                # NORMAL: Frete líquido
+                custo_frete = tarifa_envio - receita_envio
+                imposto_val = receita * (imposto / 100)
             
             # Buscar custo produto
             custo_unit = custos_dict.get(sku, 0)
@@ -184,7 +190,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # Data
             data_venda = converter_data_ml(row.get('data'))
             
-            # Montar registro
+            # Montar registro (MANTÉM ESTRUTURA ORIGINAL - compatível com central_uploads.py)
             vendas.append({
                 'pedido': str(row.get('pedido', '')),
                 'data': data_venda,
@@ -313,7 +319,8 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             
             cursor.execute(sql, (
                 marketplace, loja, row['pedido'], data_venda, sku,
-                '', qtd, preco_venda, 0, 0,
+                '',  # codigo_anuncio vazio por enquanto (evita erros)
+                qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto, tarifa,
                 frete, 0, 0, total_tarifas, valor_liquido,
                 margem, margem_pct, arquivo_nome
