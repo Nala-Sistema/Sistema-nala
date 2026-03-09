@@ -1,14 +1,14 @@
 """
 DATABASE UTILS - Sistema Nala
 Funções para conexão e queries no banco de dados
-VERSÃO CORRIGIDA: SEM coluna "ativo" (não existe!)
+VERSÃO FINAL: Com estrutura REAL do banco
 """
 
 from sqlalchemy import create_engine
 import pandas as pd
 import streamlit as st
 
-# URL do banco Neon (CORRIGIDA)
+# URL do banco Neon
 DB_URL = "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require"
 
 
@@ -26,30 +26,25 @@ def buscar_custos_skus(engine, force_refresh=None):
         force_refresh: Timestamp para forçar refresh (evita cache Streamlit)
     
     Retorna:
-        dict {sku: preco_a_ser_considerado}
+        dict {sku: custo_final}
     """
-    # CORRIGIDO: SEM filtro "ativo" (coluna não existe!)
+    # Query correta: dim_skus (master) + dim_produtos_custos (custos)
     query = """
         SELECT 
-            p.sku,
-            COALESCE(pc.preco_compra, 0) as preco_compra,
-            COALESCE(pc.embalagem, 0) as embalagem,
-            COALESCE(pc.mdo, 0) as mdo,
-            COALESCE(pc.custo_ads, 0) as custo_ads,
-            COALESCE(pc.custo_final, 0) as custo_final
-        FROM dim_produtos p
-        LEFT JOIN dim_produtos_custos pc ON p.sku = pc.sku
+            s.sku,
+            COALESCE(pc.custo_final, pc.preco_compra, 0) as custo
+        FROM dim_skus s
+        LEFT JOIN dim_produtos_custos pc ON s.sku = pc.sku
+        WHERE s.ativo = TRUE
     """
     
     try:
         df = pd.read_sql(query, engine)
         
-        # Retornar dict {sku: custo_final}
-        # Se custo_final = 0, usar preco_compra
+        # Retornar dict {sku: custo}
         custos_dict = {}
         for _, row in df.iterrows():
-            custo = row['custo_final'] if row['custo_final'] > 0 else row['preco_compra']
-            custos_dict[row['sku']] = custo
+            custos_dict[row['sku']] = row['custo']
         
         return custos_dict
         
@@ -63,10 +58,9 @@ def buscar_skus_validos(engine):
     Busca lista de SKUs válidos do banco.
     
     Retorna:
-        set de SKUs
+        set de SKUs ativos
     """
-    # CORRIGIDO: SEM filtro "ativo"
-    query = "SELECT sku FROM dim_produtos"
+    query = "SELECT sku FROM dim_skus WHERE ativo = TRUE"
     
     try:
         df = pd.read_sql(query, engine)
