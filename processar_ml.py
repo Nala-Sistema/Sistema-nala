@@ -2,11 +2,10 @@
 PROCESSADOR MERCADO LIVRE - Sistema Nala
 Processa arquivos de vendas do Mercado Livre
 - Detecta header automaticamente
-- Filtra vendas canceladas/devolvidas/mediações
+- Filtra vendas canceladas/devolvidas
 - Valida SKUs antes de gravar
 - Calcula margem CORRETA (com frete e FLEX)
 - Grava no banco com barra de progresso
-- VERSÃO CORRIGIDA: FLEX líquido, código anúncio, filtro mediação
 """
 
 import pandas as pd
@@ -14,10 +13,6 @@ import streamlit as st
 from datetime import datetime
 from formatadores import converter_data_ml, limpar_numero
 from database_utils import buscar_custos_skus, buscar_skus_validos
-
-# CONFIGURAÇÃO FLEX (editável)
-# TODO: Mover para configuracoes.py depois
-CUSTO_FLEX_ML = 12.90  # Custo fixo transportadora FLEX
 
 
 def detectar_header_ml(arquivo):
@@ -73,10 +68,6 @@ def renomear_colunas_ml(df):
             rename_map[col] = 'total_brl'
         elif 'forma' in col_lower and 'entrega' in col_lower:
             rename_map[col] = 'forma_entrega'
-        
-        # Código do anúncio (NOVO)
-        elif '#' in col_lower and 'anuncio' in col_lower:
-            rename_map[col] = 'codigo_anuncio'
     
     return df.rename(columns=rename_map)
 
@@ -106,8 +97,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     if not all(col in df.columns for col in colunas_obrigatorias):
         return None, f"Colunas obrigatórias não encontradas: {colunas_obrigatorias}"
     
-    # 5. BUSCAR CUSTOS DO BANCO (SEM CACHE)
-    # Força refresh para pegar custos atualizados
+    # 5. BUSCAR CUSTOS DO BANCO
     custos_dict = buscar_custos_skus(engine)
     
     # 6. PROCESSAR VENDAS
@@ -125,10 +115,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             
             sku = str(row['sku']).strip()
             
-            # Filtrar por status (CORRIGIDO: incluir mediação)
+            # Filtrar por status
             if 'status' in df.columns:
                 status = str(row['status']).lower()
-                if any(palavra in status for palavra in ['cancelad', 'devolv', 'reembolso', 'mediação', 'mediacao']):
+                if any(palavra in status for palavra in ['cancelad', 'devolv', 'reembolso']):
                     linhas_descartadas += 1
                     continue
             
@@ -155,21 +145,16 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             forma_entrega = str(row.get('forma_entrega', '')).lower()
             total_brl = limpar_numero(row.get('total_brl', 0))
             
-            # Código do anúncio (NOVO)
-            codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
-            
             # DETECTAR FLEX
             is_flex = 'flex' in forma_entrega
             
-            # CALCULAR FRETE E IMPOSTO (CORRIGIDO)
+            # CALCULAR FRETE E IMPOSTO
             if is_flex:
-                # FLEX: Custo líquido (transportadora - cliente pagou)
-                custo_frete = CUSTO_FLEX_ML - receita_envio
-                imposto_val = 0.0  # SEM imposto no FLEX
+                custo_frete = 12.90  # Custo fixo transportadora
+                imposto_val = 0.0    # SEM imposto no FLEX
             else:
-                # NORMAL: Frete líquido
-                custo_frete = tarifa_envio - receita_envio
-                imposto_val = receita * (imposto / 100)
+                custo_frete = tarifa_envio - receita_envio  # Frete líquido
+                imposto_val = receita * (imposto / 100)     # Imposto normal
             
             # Buscar custo produto
             custo_unit = custos_dict.get(sku, 0)
@@ -204,7 +189,6 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 'pedido': str(row.get('pedido', '')),
                 'data': data_venda,
                 'sku': sku,
-                'codigo_anuncio': codigo_anuncio,  # NOVO
                 'qtd': qtd,
                 'receita': receita,
                 'tarifa': tarifa,
@@ -215,7 +199,6 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 'margem_pct': margem_pct,
                 'tem_custo': custo_unit > 0,
                 'is_flex': is_flex,
-                'forma_entrega': 'FLEX' if is_flex else ('Full' if 'full' in forma_entrega else 'Envios'),  # NOVO
                 '_custo_unit': custo_unit,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None
             })
@@ -261,7 +244,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
         registros_gravados, erros, skus_invalidos
     """
     
-    # 1. BUSCAR SKUs VÁLIDOS (SEM CACHE)
+    # 1. BUSCAR SKUs VÁLIDOS
     skus_validos = buscar_skus_validos(engine)
     
     # 2. PREPARAR GRAVAÇÃO
@@ -307,9 +290,6 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             margem = float(row['margem'])
             margem_pct = float(row['margem_pct'])
             
-            # Código anúncio (CORRIGIDO)
-            codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
-            
             # Calcular valores derivados
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
@@ -333,8 +313,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             
             cursor.execute(sql, (
                 marketplace, loja, row['pedido'], data_venda, sku,
-                codigo_anuncio,  # CORRIGIDO: agora pega do row
-                qtd, preco_venda, 0, 0,
+                '', qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto, tarifa,
                 frete, 0, 0, total_tarifas, valor_liquido,
                 margem, margem_pct, arquivo_nome
