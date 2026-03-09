@@ -1,14 +1,14 @@
 """
 DATABASE UTILS - Sistema Nala
 Funções para conexão e queries no banco de dados
-VERSÃO ATUALIZADA: Com force_refresh para evitar cache
+VERSÃO CORRIGIDA: SEM coluna "ativo" (não existe!)
 """
 
 from sqlalchemy import create_engine
 import pandas as pd
 import streamlit as st
 
-# URL do banco Neon
+# URL do banco Neon (CORRIGIDA)
 DB_URL = "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require"
 
 
@@ -28,7 +28,7 @@ def buscar_custos_skus(engine, force_refresh=None):
     Retorna:
         dict {sku: preco_a_ser_considerado}
     """
-    # O parâmetro force_refresh força query nova (evita cache)
+    # CORRIGIDO: SEM filtro "ativo" (coluna não existe!)
     query = """
         SELECT 
             p.sku,
@@ -39,7 +39,6 @@ def buscar_custos_skus(engine, force_refresh=None):
             COALESCE(pc.custo_final, 0) as custo_final
         FROM dim_produtos p
         LEFT JOIN dim_produtos_custos pc ON p.sku = pc.sku
-        WHERE p.ativo = TRUE
     """
     
     try:
@@ -64,9 +63,10 @@ def buscar_skus_validos(engine):
     Busca lista de SKUs válidos do banco.
     
     Retorna:
-        set de SKUs ativos
+        set de SKUs
     """
-    query = "SELECT sku FROM dim_produtos WHERE ativo = TRUE"
+    # CORRIGIDO: SEM filtro "ativo"
+    query = "SELECT sku FROM dim_produtos"
     
     try:
         df = pd.read_sql(query, engine)
