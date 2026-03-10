@@ -8,6 +8,7 @@ Processa arquivos de vendas do Mercado Livre
 - Grava no banco com barra de progresso
 - VERSÃO FINAL: Todos bugs corrigidos
 - CORREÇÃO 09/03/2026: codigo_anuncio agora mapeia com e sem acento
+- CORREÇÃO 10/03/2026: rollback individual com SAVEPOINT (não perde vendas já gravadas)
 """
 
 import pandas as pd
@@ -286,6 +287,8 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
 def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
     """
     Grava vendas do ML no banco com validação de SKU e barra de progresso.
+    CORREÇÃO 10/03/2026: Usa SAVEPOINT para rollback individual.
+    Um erro em uma venda NÃO apaga as vendas já gravadas.
 
     Retorna:
         registros_gravados, erros, skus_invalidos
@@ -346,6 +349,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             total_tarifas = tarifa + frete
             valor_liquido = receita - total_tarifas - imposto
 
+            # SAVEPOINT: se der erro nessa venda, só desfaz ela
+            cursor.execute(f"SAVEPOINT venda_{idx}")
+
             # SQL INSERT
             sql = """
                 INSERT INTO fact_vendas_snapshot (
@@ -370,15 +376,18 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
                 margem, margem_pct, arquivo_nome
             ))
 
+            # Liberar SAVEPOINT (sucesso)
+            cursor.execute(f"RELEASE SAVEPOINT venda_{idx}")
             registros += 1
 
         except Exception as e:
-            conn.rollback()
+            # ROLLBACK só desta venda, não de todas
+            cursor.execute(f"ROLLBACK TO SAVEPOINT venda_{idx}")
             erros += 1
             if erros == 1:
                 st.warning(f"Primeiro erro: {str(e)[:200]}")
 
-    # 5. COMMIT FINAL
+    # 5. COMMIT FINAL (todas as vendas que deram certo)
     try:
         conn.commit()
     except Exception as e:
