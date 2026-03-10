@@ -2,6 +2,10 @@
 CENTRAL DE UPLOADS - Sistema Nala
 Interface principal para upload e processamento de vendas
 VERSÃO: Mercado Livre + Shopee
+CORREÇÕES 09/03/2026:
+  - Histórico: datas convertidas para formato banco antes de gravar log
+  - Deletar vendas: agora permite selecionar vendas individuais
+  - Download Excel: datas garantidas em dd/mm/aaaa
 """
 
 import streamlit as st
@@ -16,6 +20,10 @@ from processar_ml import processar_arquivo_ml, gravar_vendas_ml
 from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 
 
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
 def _detectar_marketplace(mktp: str) -> str:
     """
     Normaliza o nome do marketplace para roteamento interno.
@@ -27,6 +35,21 @@ def _detectar_marketplace(mktp: str) -> str:
     if 'SHOPEE' in mktp_upper:
         return 'SHOPEE'
     return 'DESCONHECIDO'
+
+
+def _converter_data_br_para_banco(data_str):
+    """
+    Converte data do formato brasileiro (dd/mm/aaaa) para formato banco (aaaa-mm-dd).
+    Necessário porque PostgreSQL espera ISO 8601 em colunas DATE.
+    Se receber None ou string vazia, retorna None.
+    """
+    if not data_str or str(data_str).strip() == '':
+        return None
+    try:
+        return datetime.strptime(str(data_str).strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
+    except:
+        # Se já estiver em formato ISO ou outro formato, tenta retornar como está
+        return str(data_str).strip()
 
 
 def _exibir_alertas_comissao(alertas: list):
@@ -63,6 +86,10 @@ def _exibir_alertas_comissao(alertas: list):
             "R$200-499,99 → 14%+R$26 | acima R$500 → 14%+R$26"
         )
 
+
+# ============================================================
+# TAB 1: PROCESSAR UPLOAD
+# ============================================================
 
 def tab_processar_upload(engine):
     """Tab 1: Upload e processamento de arquivos"""
@@ -198,10 +225,14 @@ def tab_processar_upload(engine):
                     st.error("⚠️ Processador não identificado para gravação.")
                     return
 
-                # Gravar log de importação
+                # CORREÇÃO: Gravar log de importação com datas no formato do banco
                 try:
                     conn   = engine.raw_connection()
                     cursor = conn.cursor()
+
+                    # Converter datas de dd/mm/aaaa para aaaa-mm-dd
+                    periodo_ini_banco = _converter_data_br_para_banco(info['periodo_inicio'])
+                    periodo_fim_banco = _converter_data_br_para_banco(info['periodo_fim'])
 
                     sql_log = """
                         INSERT INTO log_uploads (
@@ -214,7 +245,7 @@ def tab_processar_upload(engine):
                     """
                     cursor.execute(sql_log, (
                         mktp, loja, arquivo_nome,
-                        info['periodo_inicio'], info['periodo_fim'],
+                        periodo_ini_banco, periodo_fim_banco,
                         info['total_linhas'], registros, erros,
                         'SUCESSO' if registros > 0 else 'ERRO'
                     ))
@@ -222,7 +253,7 @@ def tab_processar_upload(engine):
                     cursor.close()
                     conn.close()
                 except Exception as e:
-                    st.warning(f"⚠️ Erro ao gravar log: {e}")
+                    st.error(f"⚠️ Erro ao gravar log de importação: {e}")
 
                 # Mensagens de resultado
                 if registros > 0:
@@ -242,6 +273,10 @@ def tab_processar_upload(engine):
                 for key in ['df_proc', 'info', 'mktp', 'mp_key', 'loja', 'arquivo_nome']:
                     st.session_state.pop(key, None)
 
+
+# ============================================================
+# TAB 2: VENDAS CONSOLIDADAS
+# ============================================================
 
 def tab_vendas_consolidadas(engine):
     """Tab 2: Visualização de vendas consolidadas"""
@@ -274,6 +309,11 @@ def tab_vendas_consolidadas(engine):
     else:
         data_ini = col2.date_input("De:", hoje - timedelta(days=30))
         data_fim = col3.date_input("Até:", hoje)
+        # NOTA: st.date_input não suporta formato customizado.
+        # As datas são exibidas no formato do sistema, mas funcionam corretamente.
+        # Exibir confirmação visual em formato BR:
+        col2.caption(f"Selecionado: {data_ini.strftime('%d/%m/%Y')}")
+        col3.caption(f"Selecionado: {data_fim.strftime('%d/%m/%Y')}")
 
     # Filtro de marketplace
     df_lojas     = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
@@ -335,7 +375,7 @@ def tab_vendas_consolidadas(engine):
     c2.metric("Pedidos", formatar_quantidade(pedidos_atual), formatar_percentual(var_pedidos))
 
     # Margem
-    margem_atual = df_com_custo['margem_percentual'].mean()
+    margem_atual = df_com_custo['margem_percentual'].mean() if not df_com_custo.empty else 0
     margem_ant   = df_ant_com_custo['margem_percentual'].mean() if not df_ant_com_custo.empty else 0
     var_margem   = margem_atual - margem_ant
     c3.metric("Margem Média", formatar_percentual(margem_atual), formatar_percentual(var_margem))
@@ -355,6 +395,11 @@ def tab_vendas_consolidadas(engine):
     df_display = df_vendas.copy()
     df_display['data_venda'] = pd.to_datetime(df_display['data_venda']).dt.strftime('%d/%m/%Y')
 
+    # Formatação BR para exibição
+    df_display['valor_venda_efetivo'] = df_display['valor_venda_efetivo'].apply(formatar_valor)
+    df_display['custo_total']         = df_display['custo_total'].apply(formatar_valor)
+    df_display['margem_percentual']   = df_display['margem_percentual'].apply(formatar_percentual)
+
     st.dataframe(
         df_display[[
             'data_venda', 'numero_pedido', 'sku', 'codigo_anuncio', 'quantidade',
@@ -369,19 +414,21 @@ def tab_vendas_consolidadas(engine):
         buffer   = io.BytesIO()
         df_excel = df_vendas.copy()
 
+        # CORREÇÃO: Garantir data em dd/mm/aaaa no Excel
         df_excel['data_venda'] = pd.to_datetime(df_excel['data_venda']).dt.strftime('%d/%m/%Y')
 
+        # Formatar valores monetários com vírgula decimal (padrão BR)
         colunas_valor = [
             'preco_venda', 'valor_venda_efetivo', 'custo_unitario', 'custo_total',
             'imposto', 'comissao', 'frete', 'total_tarifas', 'valor_liquido', 'margem_total'
         ]
         for col in colunas_valor:
             if col in df_excel.columns:
-                df_excel[col] = df_excel[col].apply(lambda x: f"{x:.2f}".replace('.', ','))
+                df_excel[col] = df_excel[col].apply(lambda x: f"{float(x):.2f}".replace('.', ','))
 
         if 'margem_percentual' in df_excel.columns:
             df_excel['margem_percentual'] = df_excel['margem_percentual'].apply(
-                lambda x: f"{x:.2f}".replace('.', ',')
+                lambda x: f"{float(x):.2f}".replace('.', ',')
             )
 
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -394,40 +441,139 @@ def tab_vendas_consolidadas(engine):
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
+    # ============================================================
     # DELETAR VENDAS (ADMIN)
+    # ============================================================
     st.divider()
     with st.expander("🗑️ Deletar Vendas (ADMIN)", expanded=False):
         st.warning("⚠️ **ATENÇÃO:** Esta ação é irreversível!")
 
-        col_del1, col_del2 = st.columns(2)
-        confirm_delete  = col_del1.text_input("Digite 'DELETAR' para confirmar:")
-        marketplace_del = col_del2.selectbox(
-            "Marketplace a deletar:", [""] + df_lojas['marketplace'].tolist()
+        modo_delete = st.radio(
+            "Modo de exclusão:",
+            ["Selecionar vendas individuais", "Deletar marketplace inteiro"],
+            horizontal=True
         )
 
-        if st.button("🗑️ DELETAR VENDAS", type="secondary"):
-            if confirm_delete == "DELETAR" and marketplace_del:
-                try:
-                    conn   = engine.raw_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s",
-                        (marketplace_del,)
-                    )
-                    cursor.execute(
-                        "DELETE FROM log_uploads WHERE marketplace = %s",
-                        (marketplace_del,)
-                    )
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
-                    st.success(f"✅ Vendas de {marketplace_del} deletadas!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Erro ao deletar: {e}")
-            else:
-                st.warning("⚠️ Confirme digitando 'DELETAR' e selecionando marketplace.")
+        # ----- MODO 1: DELETAR VENDAS INDIVIDUAIS -----
+        if modo_delete == "Selecionar vendas individuais":
+            st.markdown("Marque as vendas que deseja excluir:")
 
+            # Preparar dados para seleção (usar dados originais, não formatados)
+            df_delete = df_vendas[['id', 'data_venda', 'numero_pedido', 'sku',
+                                    'codigo_anuncio', 'quantidade', 'valor_venda_efetivo',
+                                    'margem_percentual']].copy()
+
+            df_delete['data_venda'] = pd.to_datetime(df_delete['data_venda']).dt.strftime('%d/%m/%Y')
+
+            # Adicionar coluna de seleção
+            df_delete.insert(0, '🗑️ Excluir', False)
+
+            # Exibir tabela editável
+            df_editado = st.data_editor(
+                df_delete,
+                column_config={
+                    '🗑️ Excluir': st.column_config.CheckboxColumn(
+                        "Excluir?",
+                        help="Marque para excluir esta venda",
+                        default=False,
+                    ),
+                    'id': st.column_config.NumberColumn("ID", disabled=True),
+                    'data_venda': st.column_config.TextColumn("Data", disabled=True),
+                    'numero_pedido': st.column_config.TextColumn("Pedido", disabled=True),
+                    'sku': st.column_config.TextColumn("SKU", disabled=True),
+                    'codigo_anuncio': st.column_config.TextColumn("Anúncio", disabled=True),
+                    'quantidade': st.column_config.NumberColumn("Qtd", disabled=True),
+                    'valor_venda_efetivo': st.column_config.NumberColumn(
+                        "Receita (R$)", format="%.2f", disabled=True
+                    ),
+                    'margem_percentual': st.column_config.NumberColumn(
+                        "Margem %", format="%.2f", disabled=True
+                    ),
+                },
+                use_container_width=True,
+                height=400,
+                hide_index=True,
+                key="delete_editor"
+            )
+
+            # Contar selecionadas
+            ids_selecionados = df_editado[df_editado['🗑️ Excluir'] == True]['id'].tolist()
+            qtd_selecionadas = len(ids_selecionados)
+
+            if qtd_selecionadas > 0:
+                st.info(f"📌 {qtd_selecionadas} venda(s) selecionada(s) para exclusão.")
+
+                # Confirmação em dois passos
+                confirmar = st.checkbox(
+                    f"✅ Confirmo que desejo excluir {qtd_selecionadas} venda(s) permanentemente"
+                )
+
+                if st.button("🗑️ EXCLUIR SELECIONADAS", type="secondary"):
+                    if confirmar:
+                        try:
+                            conn   = engine.raw_connection()
+                            cursor = conn.cursor()
+
+                            # Deletar por lista de IDs
+                            placeholders = ','.join(['%s'] * len(ids_selecionados))
+                            cursor.execute(
+                                f"DELETE FROM fact_vendas_snapshot WHERE id IN ({placeholders})",
+                                ids_selecionados
+                            )
+
+                            deletados = cursor.rowcount
+                            conn.commit()
+                            cursor.close()
+                            conn.close()
+
+                            st.success(f"✅ {deletados} venda(s) excluída(s) com sucesso!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Erro ao excluir vendas: {e}")
+                    else:
+                        st.warning("⚠️ Marque a confirmação antes de excluir.")
+
+        # ----- MODO 2: DELETAR MARKETPLACE INTEIRO -----
+        else:
+            st.error(
+                "⛔ Esta opção apaga TODAS as vendas de um marketplace. "
+                "Use apenas em casos extremos!"
+            )
+
+            col_del1, col_del2 = st.columns(2)
+            confirm_delete  = col_del1.text_input("Digite 'DELETAR' para confirmar:")
+            marketplace_del = col_del2.selectbox(
+                "Marketplace a deletar:", [""] + df_lojas['marketplace'].tolist()
+            )
+
+            if st.button("🗑️ DELETAR TODAS DO MARKETPLACE", type="secondary"):
+                if confirm_delete == "DELETAR" and marketplace_del:
+                    try:
+                        conn   = engine.raw_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s",
+                            (marketplace_del,)
+                        )
+                        deletados = cursor.rowcount
+                        cursor.execute(
+                            "DELETE FROM log_uploads WHERE marketplace = %s",
+                            (marketplace_del,)
+                        )
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        st.success(f"✅ {deletados} vendas de {marketplace_del} deletadas!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Erro ao deletar: {e}")
+                else:
+                    st.warning("⚠️ Confirme digitando 'DELETAR' e selecionando marketplace.")
+
+
+# ============================================================
+# TAB 3: HISTÓRICO DE UPLOADS
+# ============================================================
 
 def tab_historico_uploads(engine):
     """Tab 3: Histórico de importações"""
@@ -447,14 +593,50 @@ def tab_historico_uploads(engine):
         )
 
         if not df_log.empty:
+            # Formatar datas para exibição BR
             df_log['data_upload'] = pd.to_datetime(df_log['data_upload']).dt.strftime('%d/%m/%Y %H:%M')
+
+            # Converter periodo_inicio e periodo_fim para exibição BR (podem estar em formato ISO)
+            for col_data in ['periodo_inicio', 'periodo_fim']:
+                if col_data in df_log.columns:
+                    df_log[col_data] = pd.to_datetime(
+                        df_log[col_data], errors='coerce'
+                    ).dt.strftime('%d/%m/%Y').fillna('-')
+
             st.dataframe(df_log, use_container_width=True, height=600)
         else:
             st.info("ℹ️ Nenhuma importação registrada ainda.")
 
     except Exception as e:
-        st.warning(f"⚠️ Histórico não disponível: {str(e)}")
+        st.error(f"⚠️ Erro ao carregar histórico: {e}")
+        # Mostrar erro detalhado para diagnóstico
+        with st.expander("🔍 Detalhes do erro"):
+            st.code(str(e))
+            st.markdown(
+                "Se o erro mencionar 'relation log_uploads does not exist', "
+                "a tabela precisa ser criada no banco.\n\n"
+                "SQL para criar:\n"
+            )
+            st.code("""
+CREATE TABLE IF NOT EXISTS log_uploads (
+    id SERIAL PRIMARY KEY,
+    data_upload TIMESTAMP DEFAULT NOW(),
+    marketplace VARCHAR(100),
+    loja VARCHAR(100),
+    arquivo_nome VARCHAR(500),
+    periodo_inicio DATE,
+    periodo_fim DATE,
+    total_linhas INTEGER DEFAULT 0,
+    linhas_importadas INTEGER DEFAULT 0,
+    linhas_erro INTEGER DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'PENDENTE'
+);
+            """, language="sql")
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     """Função principal do módulo"""
