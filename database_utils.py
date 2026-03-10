@@ -3,6 +3,8 @@ DATABASE UTILS - Sistema Nala
 Funções para conexão e queries no banco de dados
 VERSÃO FINAL: Com estrutura REAL do banco
 CORREÇÃO 09/03/2026: gravar_log_upload converte datas dd/mm/aaaa para aaaa-mm-dd
+CORREÇÃO 10/03/2026: buscar_custos_skus agora lê de dim_produtos.preco_a_ser_considerado
+CORREÇÃO 10/03/2026: buscar_skus_validos agora lê de dim_produtos (onde gestao_skus cadastra)
 """
 
 from sqlalchemy import create_engine
@@ -35,31 +37,40 @@ def _converter_data_br_para_banco(data_str):
 def buscar_custos_skus(engine, force_refresh=None):
     """
     Busca custos de SKUs do banco.
+    
+    FONTE PRINCIPAL: dim_produtos.preco_a_ser_considerado
+    (atualizado pelo módulo de compras e gestão de SKUs)
+    
+    FALLBACK: dim_produtos_custos (soma dos componentes de custo)
+    Só usado se preco_a_ser_considerado estiver zerado ou nulo.
 
     Args:
         engine: SQLAlchemy engine
         force_refresh: Timestamp para forçar refresh (evita cache Streamlit)
 
     Retorna:
-        dict {sku: custo_final}
+        dict {sku: custo}
     """
-    # Query correta: dim_skus (master) + dim_produtos_custos (custos)
     query = """
         SELECT 
-            s.sku,
-            COALESCE(pc.custo_final, pc.preco_compra, 0) as custo
-        FROM dim_skus s
-        LEFT JOIN dim_produtos_custos pc ON s.sku = pc.sku
-        WHERE s.ativo = TRUE
+            p.sku,
+            COALESCE(
+                NULLIF(p.preco_a_ser_considerado, 0),
+                NULLIF(pc.preco_compra + pc.embalagem + pc.mdo + pc.custo_ads, 0),
+                pc.preco_compra,
+                0
+            ) as custo
+        FROM dim_produtos p
+        LEFT JOIN dim_produtos_custos pc ON p.sku = pc.sku
+        WHERE p.status = 'Ativo'
     """
 
     try:
         df = pd.read_sql(query, engine)
 
-        # Retornar dict {sku: custo}
         custos_dict = {}
         for _, row in df.iterrows():
-            custos_dict[row['sku']] = row['custo']
+            custos_dict[row['sku']] = float(row['custo'])
 
         return custos_dict
 
@@ -71,11 +82,13 @@ def buscar_custos_skus(engine, force_refresh=None):
 def buscar_skus_validos(engine):
     """
     Busca lista de SKUs válidos do banco.
+    CORREÇÃO: Busca de dim_produtos (onde gestao_skus.py cadastra)
+    em vez de dim_skus.
 
     Retorna:
         set de SKUs ativos
     """
-    query = "SELECT sku FROM dim_skus WHERE ativo = TRUE"
+    query = "SELECT sku FROM dim_produtos WHERE status = 'Ativo'"
 
     try:
         df = pd.read_sql(query, engine)
@@ -88,7 +101,7 @@ def buscar_skus_validos(engine):
 def gravar_log_upload(engine, info):
     """
     Grava log de upload no banco.
-    CORREÇÃO: Converte datas de dd/mm/aaaa para aaaa-mm-dd antes de gravar.
+    Converte datas de dd/mm/aaaa para aaaa-mm-dd antes de gravar.
 
     Args:
         engine: SQLAlchemy engine
