@@ -22,6 +22,10 @@ CARRINHOS COMPOSTOS:
 - Detectados quando o mesmo ID do pedido aparece em múltiplas linhas
 - O arquivo Shopee repete as comissões do pedido inteiro em cada linha (não divide)
 - Para carrinhos: comissão calculada pela tabela por item (não usa o valor do arquivo)
+
+CORREÇÃO 10/03/2026:
+- _buscar_custos_skus agora lê de dim_produtos.preco_a_ser_considerado (não dim_produtos_custos)
+- _buscar_skus_validos agora lê de dim_produtos (não dim_skus)
 """
 
 import pandas as pd
@@ -79,9 +83,12 @@ def _limpar_numero(valor) -> float:
 
 def _buscar_custos_skus(skus: list, engine) -> dict:
     """
-    Busca custo_final dos SKUs em dim_produtos_custos.
-    Retorna dict {sku: custo_final}.
-    Força query fresh (sem cache) para capturar custos atualizados.
+    Busca custo dos SKUs no banco.
+    CORREÇÃO: Fonte principal é dim_produtos.preco_a_ser_considerado
+    (onde gestao_skus.py e app_compras.py atualizam).
+    Fallback para soma dos componentes em dim_produtos_custos.
+
+    Retorna dict {sku: custo}.
     """
     if not skus:
         return {}
@@ -90,7 +97,18 @@ def _buscar_custos_skus(skus: list, engine) -> dict:
         conn = engine.raw_connection()
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT sku, custo_final FROM dim_produtos_custos WHERE sku IN ({placeholders})",
+            f"""SELECT 
+                    p.sku,
+                    COALESCE(
+                        NULLIF(p.preco_a_ser_considerado, 0),
+                        NULLIF(pc.preco_compra + pc.embalagem + pc.mdo + pc.custo_ads, 0),
+                        pc.preco_compra,
+                        0
+                    ) as custo
+                FROM dim_produtos p
+                LEFT JOIN dim_produtos_custos pc ON p.sku = pc.sku
+                WHERE p.sku IN ({placeholders})
+                  AND p.status = 'Ativo'""",
             skus
         )
         rows = cursor.fetchall()
@@ -103,7 +121,9 @@ def _buscar_custos_skus(skus: list, engine) -> dict:
 
 def _buscar_skus_validos(skus: list, engine) -> set:
     """
-    Retorna conjunto de SKUs cadastrados em dim_skus.
+    Retorna conjunto de SKUs cadastrados.
+    CORREÇÃO: Busca de dim_produtos (onde gestao_skus.py cadastra)
+    em vez de dim_skus.
     """
     if not skus:
         return set()
@@ -112,7 +132,7 @@ def _buscar_skus_validos(skus: list, engine) -> set:
         conn = engine.raw_connection()
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT sku FROM dim_skus WHERE sku IN ({placeholders})",
+            f"SELECT sku FROM dim_produtos WHERE sku IN ({placeholders}) AND status = 'Ativo'",
             skus
         )
         rows = cursor.fetchall()
@@ -460,7 +480,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     if df_vendas.empty:
         return 0, 0, set()
 
-    # Verificar SKUs cadastrados em dim_skus
+    # Verificar SKUs cadastrados em dim_produtos (CORRIGIDO)
     skus_todos   = df_vendas['sku'].unique().tolist()
     skus_validos = _buscar_skus_validos(skus_todos, engine)
 
@@ -500,7 +520,6 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             %s, %s, %s, %s, %s,
             %s, NOW(), %s
         )
-        ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING
     """
 
     conn   = engine.raw_connection()
@@ -534,7 +553,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             margem_pct      = float(row['margem_pct'])
 
             # Savepoint individual — rollback só desta linha em caso de erro
-            cursor.execute("SAVEPOINT sp_shopee")
+            cursor.execute(f"SAVEPOINT sp_shopee_{idx}")
             cursor.execute(sql_insert, (
                 marketplace,
                 loja,
@@ -560,11 +579,11 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 margem_pct,
                 arquivo_nome,
             ))
-            cursor.execute("RELEASE SAVEPOINT sp_shopee")
+            cursor.execute(f"RELEASE SAVEPOINT sp_shopee_{idx}")
             registros += 1
 
         except Exception:
-            cursor.execute("ROLLBACK TO SAVEPOINT sp_shopee")
+            cursor.execute(f"ROLLBACK TO SAVEPOINT sp_shopee_{idx}")
             erros += 1
 
         progress.progress(min((idx + 1) / total, 1.0))
