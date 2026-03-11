@@ -253,11 +253,11 @@ def tab_processar_upload(engine):
 
         if not data_ini or not data_fim:
             st.warning("⚠️ Selecione as datas de início e fim do período para continuar.")
-            st.stop()
+            return
 
         if data_ini > data_fim:
             st.error("❌ Data de início não pode ser maior que data de fim.")
-            st.stop()
+            return
 
         st.caption(f"Período selecionado: {data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}")
 
