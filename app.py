@@ -67,7 +67,7 @@ def main():
             st.markdown("---")
             
             # Construção Dinâmica do Menu baseada no Perfil
-            opcoes_menu = ["🏠 Início", "📦 SKUs", "💰 Vendas"]
+            opcoes_menu = ["🏠 Início", "📦 SKUs", "💰 Vendas", "🏷️ Tags"]
             
             # Somente Admin ou Controladoria enxergam o módulo de Compras
             if st.session_state.perfil in ["Admin", "Controladoria"]:
@@ -102,8 +102,10 @@ def main():
         elif aba == "💰 Vendas": 
             carregar_modulo("central_uploads")
             
+        elif aba == "🏷️ Tags":
+            carregar_modulo("gestao_tags")
+            
         elif aba == "🛒 Compras": 
-            # Apontando corretamente para o seu arquivo físico app_compras.py
             carregar_modulo("app_compras")
             
         elif aba == "⚙️ Config": 
