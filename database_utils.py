@@ -1,6 +1,12 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.0 (11/03/2026)
+Versão: 3.1 (11/03/2026)
+
+CHANGELOG v3.1:
+  - NOVO: buscar_mapeamento_skus() — carrega tabela de→para de SKUs
+  - NOVO: gravar_mapeamento_sku() — salva correção de SKU para imports futuros
+  - NOVO: buscar_pendentes_por_tipo() — filtra pendentes por SKU ou Divergência
+  - NOVO: reprocessar_pendentes_manual() — reprocessa pendentes editados manualmente
 
 CHANGELOG v3.0:
   - NOVO: gravar_venda_descartada() — grava em fact_vendas_descartadas
@@ -281,6 +287,205 @@ def deletar_venda_snapshot(cursor, pedido, sku, loja):
         return cursor.rowcount > 0
     except Exception:
         return False
+
+# ============================================================
+# MAPEAMENTO DE SKUs (NOVO v3.1)
+# ============================================================
+
+def buscar_mapeamento_skus(engine):
+    """
+    Carrega tabela de mapeamento de SKUs (de→para).
+    Usado no processamento para corrigir SKUs automaticamente.
+    Retorna dict: {sku_errado: sku_correto}
+    """
+    try:
+        df = pd.read_sql("SELECT sku_errado, sku_correto FROM dim_sku_mapeamento", engine)
+        return {row['sku_errado']: row['sku_correto'] for _, row in df.iterrows()}
+    except Exception:
+        # Tabela pode não existir ainda
+        return {}
+
+
+def gravar_mapeamento_sku(engine, sku_errado, sku_correto):
+    """
+    Salva mapeamento de SKU (de→para) para correção automática em imports futuros.
+    Usa UPSERT: se já existir, atualiza o correto.
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        sql = """
+            INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto)
+            VALUES (%s, %s)
+            ON CONFLICT (sku_errado) 
+            DO UPDATE SET sku_correto = EXCLUDED.sku_correto, data_criacao = NOW()
+        """
+        cursor.execute(sql, (sku_errado.strip(), sku_correto.strip()))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao gravar mapeamento de SKU: {e}")
+        return False
+
+
+def buscar_pendentes_por_tipo(engine, tipo='sku'):
+    """
+    Busca vendas pendentes filtradas por tipo de motivo.
+    
+    Args:
+        tipo: 'sku' → motivo = 'SKU não cadastrado'
+              'divergencia' → motivo LIKE 'Divergência%'
+              'todos' → sem filtro de motivo
+    """
+    query = "SELECT * FROM fact_vendas_pendentes WHERE status = 'Pendente'"
+    params = []
+
+    if tipo == 'sku':
+        query += " AND motivo = %s"
+        params.append('SKU não cadastrado')
+    elif tipo == 'divergencia':
+        query += " AND motivo LIKE %s"
+        params.append('Divergência%')
+
+    query += " ORDER BY data_processamento DESC"
+
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception as e:
+        st.error(f"Erro ao buscar pendentes por tipo: {e}")
+        return pd.DataFrame()
+
+
+def reprocessar_pendentes_manual(engine, ids_e_dados):
+    """
+    Reprocessa vendas pendentes com dados editados manualmente.
+    Cada item em ids_e_dados é um dict com:
+        id, sku (possivelmente corrigido), valor_venda_efetivo, comissao (tarifa),
+        imposto, frete, quantidade, sku_original (para mapeamento)
+    
+    Busca custo de dim_produtos.preco_a_ser_considerado.
+    Grava no fact_vendas_snapshot e marca pendente como 'Revisado manualmente'.
+    
+    Retorna: {'sucesso': int, 'erros': int, 'mapeados': int, 'mensagem': str}
+    """
+    skus_validos = buscar_skus_validos(engine)
+    custos_dict = buscar_custos_skus(engine)
+
+    conn = engine.raw_connection()
+    cursor = conn.cursor()
+    sucesso, erros, mapeados = 0, 0, 0
+    ids_processados = []
+
+    sql_ins = """
+        INSERT INTO fact_vendas_snapshot (
+            marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
+            codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
+            valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
+            frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
+            margem_total, margem_percentual, data_processamento, arquivo_origem
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, NOW(), %s
+        )
+    """
+
+    for item in ids_e_dados:
+        try:
+            id_pendente = int(item['id'])
+            sku = str(item['sku']).strip()
+            sku_original = str(item.get('sku_original', sku)).strip()
+
+            # Validar SKU (possivelmente corrigido)
+            if sku not in skus_validos:
+                erros += 1
+                continue
+
+            # Buscar custo
+            custo_unit = custos_dict.get(sku, 0)
+
+            # Dados financeiros (podem ter sido editados)
+            receita = float(item.get('valor_venda_efetivo', 0))
+            tarifa = float(item.get('comissao', 0))
+            imposto_val = float(item.get('imposto', 0))
+            frete = float(item.get('frete', 0))
+            qtd = int(item.get('quantidade', 1))
+
+            preco_venda = receita / qtd if qtd > 0 else receita
+            custo_total = custo_unit * qtd
+            total_tarifas = tarifa + frete
+            valor_liquido = receita - total_tarifas - imposto_val
+            margem_total = valor_liquido - custo_total
+            margem_pct = (margem_total / receita * 100) if receita > 0 else 0
+
+            cursor.execute(f"SAVEPOINT manual_{id_pendente}")
+
+            cursor.execute(sql_ins, (
+                item.get('marketplace_origem', ''),
+                item.get('loja_origem', ''),
+                item.get('numero_pedido', ''),
+                item.get('data_venda'),
+                sku,
+                item.get('codigo_anuncio', ''),
+                qtd, preco_venda, 0, 0,
+                receita, custo_unit, custo_total, imposto_val, tarifa,
+                frete, 0, 0, total_tarifas, valor_liquido,
+                margem_total, margem_pct,
+                item.get('arquivo_origem', '')
+            ))
+
+            cursor.execute(f"RELEASE SAVEPOINT manual_{id_pendente}")
+            ids_processados.append(id_pendente)
+            sucesso += 1
+
+            # Gravar mapeamento se SKU foi corrigido
+            if sku != sku_original and sku_original:
+                try:
+                    cursor.execute("""
+                        INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto)
+                        VALUES (%s, %s)
+                        ON CONFLICT (sku_errado) 
+                        DO UPDATE SET sku_correto = EXCLUDED.sku_correto, data_criacao = NOW()
+                    """, (sku_original, sku))
+                    mapeados += 1
+                except Exception:
+                    pass  # Não bloquear por falha no mapeamento
+
+        except Exception as e:
+            try:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT manual_{id_pendente}")
+            except:
+                pass
+            erros += 1
+
+    # Marcar como revisados
+    if ids_processados:
+        placeholders = ','.join(['%s'] * len(ids_processados))
+        cursor.execute(
+            f"UPDATE fact_vendas_pendentes SET status = 'Revisado manualmente' WHERE id IN ({placeholders})",
+            ids_processados
+        )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {
+        'sucesso': sucesso,
+        'erros': erros,
+        'mapeados': mapeados,
+        'mensagem': f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s), {mapeados} mapeamento(s) salvo(s)."
+    }
+
 
 # ============================================================
 # CURVA ABC (PARETO) - NOVO MODELO dim_tags_anuncio
