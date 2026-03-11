@@ -1,239 +1,131 @@
-"""
-GESTÃO DE TAGS DE ANÚNCIO - Sistema Nala
-Versão: 2.1 (Ajustada para a tabela dim_tags_anuncio)
-"""
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-
 from formatadores import formatar_valor, formatar_percentual, formatar_quantidade
 from database_utils import get_engine, recalcular_curva_abc
 
-
-# ============================================================
-# FUNÇÕES AUXILIARES (CONECTADAS À dim_tags_anuncio)
-# ============================================================
-
-def _buscar_tags(engine, marketplace=None, curva=None, status=None):
-    """Busca anúncios tagueados da dim_tags_anuncio."""
-    query = "SELECT * FROM dim_tags_anuncio WHERE 1=1"
-    params = []
-
-    if marketplace:
-        query += " AND marketplace = %s"
-        params.append(marketplace)
-    if curva:
-        query += " AND tag_curva = %s"
-        params.append(curva)
-    if status:
-        query += " AND tag_status = %s"
-        params.append(status)
-
-    query += " ORDER BY tag_curva ASC, marketplace, codigo_anuncio"
-
-    try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        colunas = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return pd.DataFrame(rows, columns=colunas)
-    except Exception as e:
-        st.error(f"Erro ao buscar tags: {e}")
-        return pd.DataFrame()
-
-
-def _buscar_anuncios_sem_status(engine, dias=30):
-    """Busca anúncios órfãos (sem status atribuído)."""
+def _buscar_tags_com_vendas(engine, dias=30, marketplace=None, curva=None):
+    """Busca tags da dim_tags_anuncio cruzando com volume de vendas real."""
     data_corte = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
-
-    query = """
-        SELECT
-            v.marketplace_origem as marketplace,
-            v.codigo_anuncio,
-            COALESCE(c.tag_curva, '-') as tag_curva,
-            COUNT(*) as total_vendas,
-            SUM(v.valor_venda_efetivo) as receita_total,
-            AVG(v.margem_percentual) as margem_media
-        FROM fact_vendas_snapshot v
-        LEFT JOIN dim_tags_anuncio c 
-            ON v.marketplace_origem = c.marketplace
-            AND v.codigo_anuncio = c.codigo_anuncio
-        WHERE v.data_venda >= %s
-          AND v.codigo_anuncio IS NOT NULL
-          AND (c.tag_status IS NULL OR c.tag_status = '')
-        GROUP BY v.marketplace_origem, v.codigo_anuncio, c.tag_curva
-        ORDER BY receita_total DESC
+    query = f"""
+        SELECT 
+            t.marketplace, t.codigo_anuncio, t.sku, t.tag_curva, t.tag_status,
+            COUNT(v.id) as total_vendas,
+            SUM(v.valor_venda_efetivo) as receita_total
+        FROM dim_tags_anuncio t
+        LEFT JOIN fact_vendas_snapshot v ON t.marketplace = v.marketplace_origem 
+            AND t.codigo_anuncio = v.codigo_anuncio
+            AND v.data_venda >= '{data_corte}'
+        WHERE 1=1
     """
+    if marketplace and marketplace != "Todos": query += f" AND t.marketplace = '{marketplace}'"
+    if curva and curva != "Todas": query += f" AND t.tag_curva = '{curva}'"
+    
+    query += " GROUP BY t.marketplace, t.codigo_anuncio, t.sku, t.tag_curva, t.tag_status"
+    return pd.read_sql(query, engine)
 
+def _atualizar_status(engine, mkt, cod, status, obs):
     try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute(query, (data_corte,))
-        colunas = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return pd.DataFrame(rows, columns=colunas)
-    except Exception as e:
-        st.error(f"Erro ao buscar anúncios sem status: {e}")
-        return pd.DataFrame()
-
-
-def _atualizar_status(engine, marketplace, codigo_anuncio, tag_status, observacoes=''):
-    """Faz o UPSERT do status na dim_tags_anuncio."""
-    try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO dim_tags_anuncio (marketplace, codigo_anuncio, tag_status, observacoes, data_atualizacao)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (marketplace, codigo_anuncio)
-            DO UPDATE SET tag_status = EXCLUDED.tag_status,
-                          observacoes = EXCLUDED.observacoes,
-                          data_atualizacao = NOW()
-        """, (marketplace, codigo_anuncio, tag_status, observacoes))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE dim_tags_anuncio SET tag_status = :s, observacoes = :o, data_atualizacao = NOW()
+                WHERE marketplace = :m AND codigo_anuncio = :c
+            """), {"s": status, "o": obs, "m": mkt, "c": cod})
+            conn.commit()
         return True
-    except Exception as e:
-        st.error(f"Erro ao atualizar status: {e}")
-        return False
-
-
-def _buscar_resumo_agregado(engine, dias=30):
-    """Resumo de performance cruzando vendas e tags."""
-    data_corte = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
-
-    query_curva = """
-        SELECT
-            COALESCE(c.tag_curva, 'Sem curva') as curva,
-            COUNT(DISTINCT v.codigo_anuncio) as total_anuncios,
-            COUNT(*) as total_vendas,
-            SUM(v.valor_venda_efetivo) as receita_total,
-            AVG(v.margem_percentual) as margem_media
-        FROM fact_vendas_snapshot v
-        LEFT JOIN dim_tags_anuncio c
-            ON v.marketplace_origem = c.marketplace
-            AND v.codigo_anuncio = c.codigo_anuncio
-        WHERE v.data_venda >= %s
-        GROUP BY c.tag_curva
-        ORDER BY receita_total DESC
-    """
-
-    query_status = """
-        SELECT
-            COALESCE(c.tag_status, 'Sem status') as status,
-            COUNT(DISTINCT v.codigo_anuncio) as total_anuncios,
-            COUNT(*) as total_vendas,
-            SUM(v.valor_venda_efetivo) as receita_total,
-            AVG(v.margem_percentual) as margem_media
-        FROM fact_vendas_snapshot v
-        LEFT JOIN dim_tags_anuncio c
-            ON v.marketplace_origem = c.marketplace
-            AND v.codigo_anuncio = c.codigo_anuncio
-        WHERE v.data_venda >= %s
-        GROUP BY c.tag_status
-        ORDER BY receita_total DESC
-    """
-
-    try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute(query_curva, (data_corte,))
-        df_curva = pd.DataFrame(cursor.fetchall(), columns=[d[0] for d in cursor.description])
-        cursor.execute(query_status, (data_corte,))
-        df_status = pd.DataFrame(cursor.fetchall(), columns=[d[0] for d in cursor.description])
-        cursor.close()
-        conn.close()
-        return df_curva, df_status
-    except Exception as e:
-        st.error(f"Erro no resumo agregado: {e}")
-        return pd.DataFrame(), pd.DataFrame()
-
-
-# ============================================================
-# INTERFACE (TABS)
-# ============================================================
+    except: return False
 
 def tab_lista_tags(engine):
-    st.subheader("📋 Catálogo de Anúncios Tagueados")
-    col1, col2, col3, col4 = st.columns(4)
+    st.subheader("📋 Catálogo e Edição de Tags")
+    
+    # --- FILTROS E EDIDOR NO TOPO ---
+    col1, col2, col3 = st.columns([1, 1, 1.5])
+    dias = col1.selectbox("Vendas (Período):", [30, 60, 90], key="dias_lista")
+    mkt = col2.selectbox("Marketplace:", ["Todos", "MERCADO LIVRE", "SHOPEE", "AMAZON"], key="mkt_lista")
+    
+    with col3.expander("✏️ Alterar Status Manual", expanded=False):
+        df_edit = _buscar_tags_com_vendas(engine, dias=dias, marketplace=mkt)
+        if not df_edit.empty:
+            sel = st.selectbox("Anúncio:", df_edit.apply(lambda r: f"{r['marketplace']} | {r['codigo_anuncio']}", axis=1))
+            st_novo = st.selectbox("Novo Status:", ["Novo", "Escalando", "Estável", "Descontinuado"])
+            if st.button("💾 Salvar Alteração"):
+                m, c = sel.split(" | ")
+                if _atualizar_status(engine, m, c, st_novo, ""):
+                    st.success("Atualizado!"); st.rerun()
 
-    mktp_filtro = col1.selectbox("Marketplace:", ["Todos", "Mercado Livre", "Shopee", "Amazon", "Shein", "Magalu"])
-    curva_filtro = col2.selectbox("Curva:", ["Todas", "A", "B", "C"])
-    status_filtro = col3.selectbox("Status:", ["Todos", "Novo", "Escalando", "Estável", "Descontinuado", "Sem status"])
-    periodo_abc = col4.selectbox("Período ABC:", ["30 dias", "60 dias", "90 dias"])
-
-    if st.button("🔄 Recalcular Curva ABC", use_container_width=True):
-        with st.spinner("Processando Pareto..."):
-            dias = int(periodo_abc.split()[0])
-            resultado = recalcular_curva_abc(engine, dias=dias)
-            st.success(f"✅ ABC Atualizado: {resultado.get('total_anuncios', 0)} anúncios processados.")
-            st.rerun()
-
-    mktp_param = mktp_filtro if mktp_filtro != "Todos" else None
-    curva_param = curva_filtro if curva_filtro != "Todas" else None
-    status_param = status_filtro if status_filtro not in ["Todos", "Sem status"] else None
-
-    df_tags = _buscar_tags(engine, mktp_param, curva_param, status_param)
-    if status_filtro == "Sem status" and not df_tags.empty:
-        df_tags = df_tags[df_tags['tag_status'].isna() | (df_tags['tag_status'] == '')]
-
-    if not df_tags.empty:
-        df_exibir = df_tags[['marketplace', 'codigo_anuncio', 'sku', 'tag_curva', 'tag_status', 'data_atualizacao']].copy()
-        df_exibir.columns = ['Marketplace', 'Cód. Anúncio', 'SKU', 'Curva', 'Status', 'Última Atualização']
-        st.dataframe(df_exibir, use_container_width=True, hide_index=True)
+    st.divider()
+    df = _buscar_tags_com_vendas(engine, dias=dias, marketplace=mkt)
+    
+    if not df.empty:
+        df_show = df.copy()
+        df_show['receita_total'] = df_show['receita_total'].apply(formatar_valor)
+        df_show['total_vendas'] = df_show['total_vendas'].apply(formatar_quantidade)
+        df_show.columns = ['Marketplace', 'Cód. Anúncio', 'SKU', 'Curva', 'Status', 'Qtd Vendas', 'Receita']
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
     else:
-        st.info("Nenhum anúncio encontrado.")
+        st.info("Nenhum dado encontrado para o período.")
 
 def tab_atribuir_status(engine):
-    st.subheader("🏷️ Atribuição Manual de Status")
-    df_sem = _buscar_anuncios_sem_status(engine)
+    st.subheader("🏷️ Anúncios sem Status Manual")
+    # Busca anúncios que têm curva (ABC calculado) mas o status está vazio
+    query = """
+        SELECT marketplace, codigo_anuncio, sku, tag_curva 
+        FROM dim_tags_anuncio 
+        WHERE tag_status IS NULL OR tag_status = '' OR tag_status = 'None'
+    """
+    df_sem = pd.read_sql(query, engine)
     
     if df_sem.empty:
-        st.success("✅ Tudo tagueado!")
-        return
+        st.success("✅ Todos os anúncios ativos já possuem status manual."); return
 
-    st.dataframe(df_sem.style.format({'receita_total': 'R$ {:,.2f}', 'margem_media': '{:.2%}'}), use_container_width=True)
+    st.warning(f"Existem {len(df_sem)} anúncios aguardando classificação manual.")
+    st.dataframe(df_sem, use_container_width=True, hide_index=True)
 
-    with st.form("atribuir_lote"):
-        col1, col2 = st.columns(2)
+    with st.form("atrib_manual"):
         anuncios = df_sem.apply(lambda r: f"{r['marketplace']} | {r['codigo_anuncio']}", axis=1).tolist()
-        selecionados = col1.multiselect("Selecionar Anúncios:", anuncios)
-        novo_status = col2.selectbox("Status:", ["Novo", "Escalando", "Estável", "Descontinuado"])
-        obs = st.text_input("Observações")
-        
-        if st.form_submit_button("Gravar Alterações"):
-            for sel in selecionados:
-                m, c = sel.split(" | ")
-                _atualizar_status(engine, m, c, novo_status, obs)
-            st.success("Atualizado!")
+        selecionados = st.multiselect("Selecionar Anúncios:", anuncios)
+        status = st.selectbox("Status:", ["Novo", "Escalando", "Estável", "Descontinuado"])
+        if st.form_submit_button("Gravar em Lote"):
+            for s in selecionados:
+                m, c = s.split(" | ")
+                _atualizar_status(engine, m, c, status, "Atribuição em lote")
             st.rerun()
 
 def tab_visao_geral(engine):
     st.subheader("📊 Performance por Classificação")
-    df_curva, df_status = _buscar_resumo_agregado(engine)
+    dias = st.selectbox("Análise de:", [30, 60, 90], key="dias_visao")
+    data_corte = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Resumo por Curva**")
-        st.dataframe(df_curva, hide_index=True)
-    with col2:
-        st.markdown("**Resumo por Status**")
-        st.dataframe(df_status, hide_index=True)
+    # Query robusta para Visão Geral
+    q = f"""
+        SELECT 
+            COALESCE(t.tag_curva, 'Sem Curva') as curva,
+            COALESCE(t.tag_status, 'Sem Status') as status,
+            SUM(v.valor_venda_efetivo) as receita,
+            COUNT(v.id) as vendas
+        FROM fact_vendas_snapshot v
+        LEFT JOIN dim_tags_anuncio t ON v.marketplace_origem = t.marketplace AND v.codigo_anuncio = t.codigo_anuncio
+        WHERE v.data_venda >= '{data_corte}'
+        GROUP BY t.tag_curva, t.tag_status
+    """
+    df = pd.read_sql(q, engine)
+    
+    if not df.empty:
+        c1, c2 = st.columns(2)
+        c1.markdown("**Resumo por Curva**")
+        c1.dataframe(df.groupby('curva')[['vendas', 'receita']].sum().sort_values('receita', ascending=False))
+        c2.markdown("**Resumo por Status**")
+        c2.dataframe(df.groupby('status')[['vendas', 'receita']].sum().sort_values('receita', ascending=False))
+    else:
+        st.warning("Sem dados de vendas no período selecionado.")
 
 def main():
     st.title("🏷️ Gestão de Tags Nala")
     engine = get_engine()
-    t1, t2, t3 = st.tabs(["📋 Lista", "🏷️ Atribuir Status", "📊 Visão Geral"])
+    t1, t2, t3 = st.tabs(["📋 Lista Tagueada", "🏷️ Atribuir Status", "📊 Visão Geral"])
     with t1: tab_lista_tags(engine)
     with t2: tab_atribuir_status(engine)
     with t3: tab_visao_geral(engine)
 
-if __name__ == "__main__":
-    main()
+from sqlalchemy import text
+if __name__ == "__main__": main()
