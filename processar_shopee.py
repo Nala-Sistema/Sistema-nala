@@ -26,6 +26,11 @@ CARRINHOS COMPOSTOS:
 CORREÇÃO 10/03/2026:
 - _buscar_custos_skus agora lê de dim_produtos.preco_a_ser_considerado (não dim_produtos_custos)
 - _buscar_skus_validos agora lê de dim_produtos (não dim_skus)
+
+VERSÃO 2.0 (10/03/2026):
+- Proteção contra duplicatas: pré-carrega (pedido, sku) existentes
+- Vendas pendentes: SKU não cadastrado vai para fact_vendas_pendentes (não descarta)
+- Retorno expandido: (registros, erros, skus_invalidos, duplicatas, pendentes)
 """
 
 import pandas as pd
@@ -34,7 +39,11 @@ import streamlit as st
 from datetime import datetime
 
 from formatadores import formatar_valor, formatar_percentual
-from database_utils import get_engine
+from database_utils import (
+    get_engine,
+    buscar_duplicatas_loja,
+    gravar_venda_pendente,
+)
 
 
 # ============================================================
@@ -463,6 +472,11 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     """
     Grava vendas da Shopee na tabela fact_vendas_snapshot.
 
+    VERSÃO 2.0:
+    - Proteção contra duplicatas: pré-carrega (pedido, sku) existentes da loja
+    - Vendas pendentes: SKU não cadastrado vai para fact_vendas_pendentes
+    - Retorno expandido com contadores de duplicatas e pendentes
+
     Parâmetros:
         df_vendas    : DataFrame processado por processar_arquivo_shopee
         marketplace  : nome do marketplace (ex: 'Shopee')
@@ -471,18 +485,23 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
         engine       : conexão SQLAlchemy
 
     Retorna:
-        (registros_gravados, erros, skus_invalidos)
+        (registros_gravados, erros, skus_invalidos, duplicatas_count, pendentes_count)
     """
     registros      = 0
     erros          = 0
     skus_invalidos = set()
+    duplicatas_count = 0
+    pendentes_count  = 0
 
     if df_vendas.empty:
-        return 0, 0, set()
+        return 0, 0, set(), 0, 0
 
     # Verificar SKUs cadastrados em dim_produtos (CORRIGIDO)
     skus_todos   = df_vendas['sku'].unique().tolist()
     skus_validos = _buscar_skus_validos(skus_todos, engine)
+
+    # CARREGAR DUPLICATAS EXISTENTES (proteção contra reimportação)
+    duplicatas_existentes = buscar_duplicatas_loja(engine, loja)
 
     total    = len(df_vendas)
     progress = st.progress(0)
@@ -527,19 +546,66 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
 
     for idx, (_, row) in enumerate(df_vendas.iterrows()):
         sku = row['sku']
+        pedido = str(row['pedido']).strip()
 
-        # SKU não cadastrado: registrar e pular
-        if sku not in skus_validos:
-            skus_invalidos.add(sku)
-            erros += 1
+        # ---- PROTEÇÃO DUPLICATA ----
+        chave = (pedido, sku)
+        if chave in duplicatas_existentes:
+            duplicatas_count += 1
             progress.progress(min((idx + 1) / total, 1.0))
             continue
 
+        # ---- SKU NÃO CADASTRADO → SALVAR COMO PENDENTE ----
+        if sku not in skus_validos:
+            skus_invalidos.add(sku)
+
+            # Preparar dados financeiros para pendente
+            receita         = float(row['receita'])
+            comissao        = float(row['tarifa'])
+            imposto_val     = float(row['imposto'])
+            cupom_vendedor  = float(row.get('cupom_vendedor', 0.0))
+            frete           = 0.0
+            tarifa_fixa     = 0.0
+            outros_custos   = cupom_vendedor
+            total_tarifas   = comissao + imposto_val + outros_custos
+            valor_liquido   = round(receita - total_tarifas, 2)
+
+            dados_pendente = {
+                'marketplace_origem': marketplace,
+                'loja_origem': loja,
+                'numero_pedido': pedido,
+                'data_venda': row['data'],
+                'sku': sku,
+                'codigo_anuncio': row.get('codigo_anuncio', ''),
+                'quantidade': int(row['qtd']),
+                'preco_venda': float(row.get('preco_unit', 0)),
+                'desconto_parceiro': 0,
+                'desconto_marketplace': 0,
+                'valor_venda_efetivo': receita,
+                'imposto': imposto_val,
+                'comissao': comissao,
+                'frete': frete,
+                'tarifa_fixa': tarifa_fixa,
+                'outros_custos': outros_custos,
+                'total_tarifas': total_tarifas,
+                'valor_liquido': valor_liquido,
+                'arquivo_origem': arquivo_nome,
+            }
+
+            if gravar_venda_pendente(cursor, dados_pendente):
+                pendentes_count += 1
+            else:
+                erros += 1
+
+            progress.progress(min((idx + 1) / total, 1.0))
+            continue
+
+        # ---- GRAVAÇÃO NORMAL ----
         try:
             # Valores financeiros
             receita         = float(row['receita'])
             comissao        = float(row['tarifa'])
-            imposto         = float(row['imposto'])
+            imposto_val     = float(row['imposto'])
             cupom_vendedor  = float(row.get('cupom_vendedor', 0.0))
             custo_unit      = float(row.get('custo_unit', 0.0))
             custo_total     = float(row['custo'])
@@ -547,7 +613,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             frete           = 0.0
             tarifa_fixa     = 0.0
             outros_custos   = cupom_vendedor          # cupom do vendedor sai do resultado
-            total_tarifas   = comissao + imposto + outros_custos
+            total_tarifas   = comissao + imposto_val + outros_custos
             valor_liquido   = round(receita - total_tarifas, 2)
             margem_total    = float(row['margem'])
             margem_pct      = float(row['margem_pct'])
@@ -557,7 +623,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             cursor.execute(sql_insert, (
                 marketplace,
                 loja,
-                row['pedido'],
+                pedido,
                 row['data'],
                 sku,
                 row['codigo_anuncio'],
@@ -568,7 +634,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 receita,
                 custo_unit,
                 custo_total,
-                imposto,
+                imposto_val,
                 comissao,
                 frete,
                 tarifa_fixa,
@@ -582,13 +648,19 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             cursor.execute(f"RELEASE SAVEPOINT sp_shopee_{idx}")
             registros += 1
 
+            # Adicionar ao set de duplicatas (evita duplicata intra-arquivo)
+            duplicatas_existentes.add(chave)
+
         except Exception:
-            cursor.execute(f"ROLLBACK TO SAVEPOINT sp_shopee_{idx}")
+            try:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT sp_shopee_{idx}")
+            except:
+                pass
             erros += 1
 
         progress.progress(min((idx + 1) / total, 1.0))
 
-    # Commit único no final
+    # Commit único no final (vendas + pendentes)
     try:
         conn.commit()
     except Exception as e:
@@ -599,4 +671,4 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     conn.close()
     progress.empty()
 
-    return registros, erros, skus_invalidos
+    return registros, erros, skus_invalidos, duplicatas_count, pendentes_count
