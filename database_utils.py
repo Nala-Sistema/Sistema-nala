@@ -208,4 +208,46 @@ def recalcular_curva_abc(engine, dias=30):
     """Recalcula Curva ABC dos anúncios na tabela dim_tags_anuncio"""
     data_corte = (datetime.now() - timedelta(days=dias)).strftime('%Y-%m-%d')
     query = """
-        SELECT marketplace_orig
+        SELECT marketplace_origem, codigo_anuncio, MAX(sku) as sku, SUM(valor_venda_efetivo) as receita_total
+        FROM fact_vendas_snapshot WHERE data_venda >= %s AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+        GROUP BY marketplace_origem, codigo_anuncio ORDER BY receita_total DESC
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, (data_corte,))
+        df = pd.DataFrame(cursor.fetchall(), columns=[d[0] for d in cursor.description])
+        if df.empty: return {'total_anuncios': 0}
+
+        receita_total = df['receita_total'].sum()
+        df['pct_acumulado'] = df['receita_total'].cumsum() / receita_total * 100
+        df['curva'] = 'C'
+        df.loc[df['pct_acumulado'] <= 80, 'curva'] = 'A'
+        df.loc[(df['pct_acumulado'] > 80) & (df['pct_acumulado'] <= 95), 'curva'] = 'B'
+
+        sql_upsert = """
+            INSERT INTO dim_tags_anuncio (marketplace, codigo_anuncio, sku, tag_curva, data_atualizacao)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (marketplace, codigo_anuncio)
+            DO UPDATE SET tag_curva = EXCLUDED.tag_curva, 
+                          sku = COALESCE(EXCLUDED.sku, dim_tags_anuncio.sku), data_atualizacao = NOW()
+        """
+        for _, row in df.iterrows():
+            cursor.execute(sql_upsert, (row['marketplace_origem'], row['codigo_anuncio'], row['sku'], row['curva']))
+        conn.commit()
+        cursor.close(); conn.close()
+        return {'total_anuncios': len(df)}
+    except Exception: return {'total_anuncios': 0}
+
+# ============================================================
+# CONFIGURAÇÃO FLEX
+# ============================================================
+
+def buscar_custo_flex(engine, loja):
+    """Busca custo_flex configurado na dim_lojas"""
+    try:
+        with engine.connect() as conn:
+            query = text("SELECT custo_flex FROM dim_lojas WHERE loja = :loja")
+            res = conn.execute(query, {"loja": loja}).fetchone()
+            return float(res[0]) if res and res[0] is not None else None
+    except Exception: return None
