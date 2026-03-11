@@ -437,7 +437,8 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
 
             if carrinho_grupo == '' and total_brl > 0:
                 # Venda simples: validar individualmente
-                valor_calculado = receita - tarifa - imposto_val - custo_frete
+                # Total (BRL) do ML = receita - tarifa - frete (NÃO inclui imposto)
+                valor_calculado = receita - tarifa - custo_frete
                 divergencia = abs(valor_calculado - total_brl)
 
                 if divergencia > TOLERANCIA_DIVERGENCIA:
@@ -494,8 +495,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         total_brl_mestra = dados_grupo['total_brl_mestra']
 
         # Somar valor líquido calculado de todas as filhas
+        # NOTA: Total (BRL) do ML = receita - tarifa - frete (NÃO inclui imposto)
+        # Imposto é cálculo interno nosso, não entra na comparação
         soma_liquido = sum(
-            v['receita'] - v['tarifa'] - v['imposto'] - v['frete']
+            v['receita'] - v['tarifa'] - v['frete']
             for v in vendas_grupo
         )
 
