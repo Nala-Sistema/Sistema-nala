@@ -34,6 +34,7 @@ from database_utils import (
     buscar_custo_flex,
     gravar_venda_descartada,
     deletar_venda_snapshot,
+    buscar_mapeamento_skus,
 )
 
 # CONFIGURAÇÃO FLEX (fallback caso dim_lojas.custo_flex esteja vazio)
@@ -337,6 +338,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     if custo_flex is None:
         custo_flex = CUSTO_FLEX_ML_PADRAO
 
+    # 6c. BUSCAR MAPEAMENTO DE SKUs (correções automáticas, NOVO v3.1)
+    mapeamento_skus = buscar_mapeamento_skus(engine)
+    skus_corrigidos = 0
+
     # 7. PROCESSAR VENDAS
     vendas = []
     descartes = []
@@ -379,6 +384,11 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 continue
 
             sku = str(row['sku']).strip()
+
+            # ---- APLICAR MAPEAMENTO DE SKU (correção automática, NOVO v3.1) ----
+            if sku in mapeamento_skus:
+                sku = mapeamento_skus[sku]
+                skus_corrigidos += 1
 
             # ---- VALIDAR RECEITA ----
             receita = limpar_numero(row['receita'])
@@ -544,6 +554,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         'arquivo_nome': arquivo.name,
         'divergencias': avisos_divergencia,
         'carrinhos_encontrados': carrinhos_encontrados,
+        'skus_corrigidos': skus_corrigidos,
         'descartes': descartes,
         'pendentes_carrinho': pendentes_carrinho,
     }
