@@ -2,6 +2,12 @@
 CENTRAL DE UPLOADS - Sistema Nala
 Interface principal para upload e processamento de vendas
 
+VERSÃO 3.0 (11/03/2026):
+  - AJUSTE: gravar_vendas_ml agora retorna 7 valores (v3.0 processar_ml)
+  - AJUSTE: passa descartes e pendentes_carrinho para gravar_vendas_ml
+  - NOVO: Exibe contadores de descartadas rastreadas e atualizações de status
+  - NOVO: Exibe info de carrinhos encontrados no preview (ML)
+
 VERSÃO 2.1 (11/03/2026):
   - Tab 2: CORREÇÃO filtro SKU — query parametrizada (Bug 4)
   - Tab 2: Busca inteligente por SKU ou Nome do Produto (Bug 5)
@@ -241,6 +247,7 @@ def tab_processar_upload(engine):
                 st.error(f"⚠️ Processador para '{mktp}' ainda não implementado.")
                 return
 
+            # v3.0: df_proc pode ser DataFrame vazio quando só há descartes/pendentes
             if df_proc is not None:
                 st.session_state['df_proc']       = df_proc
                 st.session_state['info']          = info
@@ -283,6 +290,27 @@ def tab_processar_upload(engine):
                 f"(margem calculada com custo = R$ 0,00)"
             )
 
+        # NOVO v3.0: Alerta ML — carrinhos encontrados
+        if mp_key == 'ML' and info.get('carrinhos_encontrados', 0) > 0:
+            st.info(
+                f"🛒 {info['carrinhos_encontrados']} carrinho(s) detectado(s) — "
+                f"receita e tarifas distribuídas proporcionalmente entre os itens."
+            )
+
+        # NOVO v3.0: Alerta ML — descartes rastreados
+        if mp_key == 'ML' and info.get('descartes'):
+            st.info(
+                f"🗑️ {len(info['descartes'])} venda(s) cancelada(s)/devolvida(s) serão rastreadas "
+                f"em fact_vendas_descartadas ao gravar."
+            )
+
+        # NOVO v3.0: Alerta ML — pendentes de carrinho (divergência financeira)
+        if mp_key == 'ML' and info.get('pendentes_carrinho'):
+            st.warning(
+                f"⚠️ {len(info['pendentes_carrinho'])} venda(s) de carrinho com divergência financeira "
+                f"> R$ 5,00 — serão salvas como pendentes para revisão manual."
+            )
+
         # Alerta Shopee: carrinhos compostos
         if mp_key == 'SHOPEE' and info.get('carrinhos', 0) > 0:
             st.info(
@@ -294,23 +322,26 @@ def tab_processar_upload(engine):
         if mp_key == 'SHOPEE':
             _exibir_alertas_comissao(info.get('alertas_comissao', []))
 
-        # PREVIEW COM FORMATAÇÃO BR
-        st.subheader("📋 Preview das Vendas (primeiras 20 linhas)")
+        # PREVIEW COM FORMATAÇÃO BR (somente se tem vendas normais)
+        if not df_proc.empty:
+            st.subheader("📋 Preview das Vendas (primeiras 20 linhas)")
 
-        df_preview = df_proc.copy()
-        df_preview['receita']    = df_preview['receita'].apply(formatar_valor)
-        df_preview['tarifa']     = df_preview['tarifa'].apply(formatar_valor)
-        df_preview['imposto']    = df_preview['imposto'].apply(formatar_valor)
-        df_preview['frete']      = df_preview['frete'].apply(formatar_valor)
-        df_preview['custo']      = df_preview['custo'].apply(formatar_valor)
-        df_preview['margem']     = df_preview['margem'].apply(formatar_valor)
-        df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
+            df_preview = df_proc.copy()
+            df_preview['receita']    = df_preview['receita'].apply(formatar_valor)
+            df_preview['tarifa']     = df_preview['tarifa'].apply(formatar_valor)
+            df_preview['imposto']    = df_preview['imposto'].apply(formatar_valor)
+            df_preview['frete']      = df_preview['frete'].apply(formatar_valor)
+            df_preview['custo']      = df_preview['custo'].apply(formatar_valor)
+            df_preview['margem']     = df_preview['margem'].apply(formatar_valor)
+            df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
 
-        st.dataframe(
-            df_preview.head(20),
-            use_container_width=True,
-            height=400
-        )
+            st.dataframe(
+                df_preview.head(20),
+                use_container_width=True,
+                height=400
+            )
+        else:
+            st.info("ℹ️ Nenhuma venda normal para preview (apenas descartes e/ou pendentes de carrinho).")
 
         # 6. BOTÃO GRAVAR
         st.divider()
@@ -321,15 +352,21 @@ def tab_processar_upload(engine):
 
             with st.spinner("Gravando vendas no banco..."):
 
-                # Gravar vendas no processador correto (RETORNO EXPANDIDO v2.0)
+                # Gravar vendas no processador correto
                 if mp_key == 'ML':
-                    registros, erros, skus_invalidos, duplicatas, pendentes = gravar_vendas_ml(
-                        df_proc, mktp, loja, arquivo_nome, engine
+                    # RETORNO EXPANDIDO v3.0 (7 valores)
+                    registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_ml(
+                        df_proc, mktp, loja, arquivo_nome, engine,
+                        descartes=info.get('descartes', []),
+                        pendentes_carrinho=info.get('pendentes_carrinho', [])
                     )
                 elif mp_key == 'SHOPEE':
+                    # Shopee mantém retorno v2.0 (5 valores)
                     registros, erros, skus_invalidos, duplicatas, pendentes = gravar_vendas_shopee(
                         df_proc, mktp, loja, arquivo_nome, engine
                     )
+                    descartadas = 0
+                    atualizados = 0
                 else:
                     st.error("⚠️ Processador não identificado para gravação.")
                     return
@@ -364,7 +401,7 @@ def tab_processar_upload(engine):
                 except Exception as e:
                     st.error(f"⚠️ Erro ao gravar log de importação: {e}")
 
-                # MENSAGENS DE RESULTADO (expandidas v2.0)
+                # MENSAGENS DE RESULTADO (expandidas v3.0)
                 if registros > 0:
                     st.success(f"✅ {registros} vendas gravadas com sucesso!")
                     st.balloons()
@@ -375,7 +412,22 @@ def tab_processar_upload(engine):
                 if pendentes > 0:
                     st.warning(
                         f"⏳ {pendentes} venda(s) salva(s) como **pendentes** "
-                        f"(SKU não cadastrado). Vá na tab 'Vendas Pendentes' para reprocessar."
+                        f"(SKU não cadastrado ou divergência financeira). "
+                        f"Vá na tab 'Vendas Pendentes' para revisar/reprocessar."
+                    )
+
+                # NOVO v3.0: Descartadas rastreadas
+                if descartadas > 0:
+                    st.info(
+                        f"🗑️ {descartadas} venda(s) cancelada(s)/devolvida(s) rastreada(s) "
+                        f"em fact_vendas_descartadas"
+                    )
+
+                # NOVO v3.0: Atualizações de status (reimportação)
+                if atualizados > 0:
+                    st.warning(
+                        f"🔄 {atualizados} venda(s) atualizada(s) — status mudou "
+                        f"(movida(s) de snapshot para descartadas)"
                     )
 
                 if erros > 0:
