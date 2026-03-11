@@ -2,6 +2,11 @@
 CENTRAL DE UPLOADS - Sistema Nala
 Interface principal para upload e processamento de vendas
 
+VERSÃO 2.1 (11/03/2026):
+  - Tab 2: CORREÇÃO filtro SKU — query parametrizada (Bug 4)
+  - Tab 2: Busca inteligente por SKU ou Nome do Produto (Bug 5)
+  - Tab 2: Todas as queries agora usam parâmetros seguros (sem f-string SQL)
+
 VERSÃO 2.0 (10/03/2026):
   - Tab 2: Filtros por loja e SKU adicionados
   - Tab 4: Vendas Pendentes (SKUs não cadastrados) com reprocessamento por SKU
@@ -99,6 +104,96 @@ def _exibir_alertas_comissao(alertas: list):
             "R$80-99,99 → 14%+R$16 | R$100-199,99 → 14%+R$20 | "
             "R$200-499,99 → 14%+R$26 | acima R$500 → 14%+R$26"
         )
+
+
+def _buscar_skus_para_filtro(engine, texto_busca):
+    """
+    Busca SKUs em dim_produtos que contenham o texto digitado
+    no campo sku OU no campo nome. Retorna lista para o multiselect.
+
+    Args:
+        engine: SQLAlchemy engine
+        texto_busca: texto digitado pelo usuário (ex: "321" ou "escova")
+
+    Retorna:
+        DataFrame com colunas: sku, nome (filtrados)
+    """
+    if not texto_busca or not texto_busca.strip():
+        return pd.DataFrame(columns=['sku', 'nome'])
+
+    query = """
+        SELECT sku, nome
+        FROM dim_produtos
+        WHERE status = 'Ativo'
+          AND (
+              sku ILIKE %s
+              OR nome ILIKE %s
+          )
+        ORDER BY sku
+        LIMIT 50
+    """
+    termo = f"%{texto_busca.strip()}%"
+
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, (termo, termo))
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception:
+        return pd.DataFrame(columns=['sku', 'nome'])
+
+
+def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, loja=None, skus=None):
+    """
+    Busca vendas no fact_vendas_snapshot com query 100% parametrizada.
+    Resolve o Bug 4: f-string com ILIKE causava falha no filtro SKU.
+
+    Args:
+        engine: SQLAlchemy engine
+        data_ini: data início (date)
+        data_fim: data fim (date)
+        marketplace: filtro marketplace (None = todos)
+        loja: filtro loja (None = todas)
+        skus: lista de SKUs para filtrar (None = todos)
+
+    Retorna:
+        DataFrame com as vendas
+    """
+    # Montar query com parâmetros seguros
+    query = "SELECT * FROM fact_vendas_snapshot WHERE data_venda BETWEEN %s AND %s"
+    params = [str(data_ini), str(data_fim)]
+
+    if marketplace:
+        query += " AND marketplace_origem = %s"
+        params.append(marketplace)
+
+    if loja:
+        query += " AND loja_origem = %s"
+        params.append(loja)
+
+    if skus and len(skus) > 0:
+        # Filtro por lista de SKUs selecionados
+        placeholders = ','.join(['%s'] * len(skus))
+        query += f" AND sku IN ({placeholders})"
+        params.extend(skus)
+
+    query += " ORDER BY data_venda DESC"
+
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception:
+        return pd.DataFrame()
 
 
 # ============================================================
@@ -313,7 +408,8 @@ def tab_processar_upload(engine):
 
 
 # ============================================================
-# TAB 2: VENDAS CONSOLIDADAS (com filtros loja e SKU)
+# TAB 2: VENDAS CONSOLIDADAS
+# v2.1: Query parametrizada + Busca inteligente de SKU
 # ============================================================
 
 def tab_vendas_consolidadas(engine):
@@ -350,8 +446,8 @@ def tab_vendas_consolidadas(engine):
         col2.caption(f"Selecionado: {data_ini.strftime('%d/%m/%Y')}")
         col3.caption(f"Selecionado: {data_fim.strftime('%d/%m/%Y')}")
 
-    # FILTROS: MARKETPLACE, LOJA, SKU
-    col_f1, col_f2, col_f3 = st.columns(3)
+    # FILTROS: MARKETPLACE, LOJA
+    col_f1, col_f2 = st.columns(2)
 
     # Marketplace
     df_lojas     = pd.read_sql("SELECT DISTINCT marketplace, loja FROM dim_lojas", engine)
@@ -364,26 +460,68 @@ def tab_vendas_consolidadas(engine):
         lojas_disponiveis = df_lojas['loja'].tolist()
     loja_filtro = col_f2.selectbox("Loja:", ["Todas"] + sorted(lojas_disponiveis))
 
-    # SKU (campo de texto para busca)
-    sku_filtro = col_f3.text_input("Filtrar por SKU:", placeholder="Ex: L-0321")
+    # ============================================================
+    # BUSCA INTELIGENTE DE SKU (v2.1 — igual ao Gestão de SKUs)
+    # Passo 1: Digitar parte do SKU ou nome do produto
+    # Passo 2: Selecionar um ou mais SKUs encontrados
+    # ============================================================
+    st.markdown("**🔍 Filtrar por SKU ou Nome do Produto**")
 
-    # QUERY PRINCIPAL
-    query = (
-        f"SELECT * FROM fact_vendas_snapshot "
-        f"WHERE data_venda BETWEEN '{data_ini}' AND '{data_fim}'"
+    texto_busca_sku = st.text_input(
+        "Buscar por SKU ou Nome do Produto:",
+        placeholder="Ex: 321, escova, kit jogo",
+        key="busca_sku_consolidadas"
     )
-    if mktp_filtro != "Todos":
-        query += f" AND marketplace_origem = '{mktp_filtro}'"
-    if loja_filtro != "Todas":
-        query += f" AND loja_origem = '{loja_filtro}'"
-    if sku_filtro.strip():
-        # Busca parcial (contém)
-        query += f" AND sku ILIKE '%{sku_filtro.strip()}%'"
 
-    try:
-        df_vendas = pd.read_sql(query, engine)
-    except Exception:
-        df_vendas = pd.DataFrame()
+    # Lista de SKUs selecionados para filtrar as vendas
+    skus_selecionados = []
+
+    if texto_busca_sku.strip():
+        # Buscar SKUs que combinam com o texto digitado
+        df_skus_encontrados = _buscar_skus_para_filtro(engine, texto_busca_sku)
+
+        if not df_skus_encontrados.empty:
+            # Montar opções para o multiselect: "SKU — Nome do Produto"
+            opcoes_sku = []
+            mapa_opcao_para_sku = {}
+            for _, row_sku in df_skus_encontrados.iterrows():
+                nome_curto = str(row_sku['nome'])[:60] if row_sku['nome'] else ''
+                opcao = f"{row_sku['sku']} — {nome_curto}"
+                opcoes_sku.append(opcao)
+                mapa_opcao_para_sku[opcao] = row_sku['sku']
+
+            st.caption(f"Encontrados {len(opcoes_sku)} SKU(s) correspondentes:")
+
+            # Multiselect para escolher um ou mais SKUs
+            selecionados = st.multiselect(
+                "Selecionar SKU(s):",
+                options=opcoes_sku,
+                default=opcoes_sku if len(opcoes_sku) <= 5 else [],
+                key="multiselect_sku_consolidadas"
+            )
+
+            # Extrair os SKUs puros das opções selecionadas
+            skus_selecionados = [mapa_opcao_para_sku[s] for s in selecionados]
+        else:
+            st.info(f"ℹ️ Nenhum SKU ativo encontrado com '{texto_busca_sku}'.")
+
+    # PREPARAR PARÂMETROS PARA A QUERY
+    mktp_param = mktp_filtro if mktp_filtro != "Todos" else None
+    loja_param = loja_filtro if loja_filtro != "Todas" else None
+    skus_param = skus_selecionados if skus_selecionados else None
+
+    # Se digitou texto mas não selecionou nenhum SKU, não buscar vendas
+    if texto_busca_sku.strip() and not skus_selecionados:
+        st.warning("⚠️ Nenhum SKU selecionado. Selecione pelo menos um SKU para filtrar as vendas.")
+        return
+
+    # QUERY PRINCIPAL (parametrizada — corrige Bug 4)
+    df_vendas = _buscar_vendas_parametrizada(
+        engine, data_ini, data_fim,
+        marketplace=mktp_param,
+        loja=loja_param,
+        skus=skus_param
+    )
 
     if df_vendas.empty:
         st.warning("⚠️ Nenhuma venda encontrada com os filtros selecionados.")
@@ -393,27 +531,18 @@ def tab_vendas_consolidadas(engine):
     df_com_custo = df_vendas[df_vendas['custo_total'] > 0]
     df_sem_custo = df_vendas[df_vendas['custo_total'] == 0]
 
-    # Período anterior para comparação
+    # Período anterior para comparação (mesma query parametrizada)
     dias_diff    = (data_fim - data_ini).days
     data_ini_ant = data_ini - timedelta(days=dias_diff + 1)
     data_fim_ant = data_fim - timedelta(days=dias_diff + 1)
 
-    query_ant = (
-        f"SELECT * FROM fact_vendas_snapshot "
-        f"WHERE data_venda BETWEEN '{data_ini_ant}' AND '{data_fim_ant}'"
+    df_ant = _buscar_vendas_parametrizada(
+        engine, data_ini_ant, data_fim_ant,
+        marketplace=mktp_param,
+        loja=loja_param,
+        skus=skus_param
     )
-    if mktp_filtro != "Todos":
-        query_ant += f" AND marketplace_origem = '{mktp_filtro}'"
-    if loja_filtro != "Todas":
-        query_ant += f" AND loja_origem = '{loja_filtro}'"
-    if sku_filtro.strip():
-        query_ant += f" AND sku ILIKE '%{sku_filtro.strip()}%'"
-
-    try:
-        df_ant           = pd.read_sql(query_ant, engine)
-        df_ant_com_custo = df_ant[df_ant['custo_total'] > 0]
-    except Exception:
-        df_ant_com_custo = pd.DataFrame()
+    df_ant_com_custo = df_ant[df_ant['custo_total'] > 0] if not df_ant.empty else pd.DataFrame()
 
     # INDICADORES
     st.markdown("### 📈 Indicadores do Período")
