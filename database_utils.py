@@ -1,6 +1,12 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 2.4 (11/03/2026) - FIX: Agregação de lojas em pendentes_resumo
+Versão: 3.0 (11/03/2026)
+
+CHANGELOG v3.0:
+  - NOVO: gravar_venda_descartada() — grava em fact_vendas_descartadas
+  - NOVO: deletar_venda_snapshot() — remove venda (para mudança de status na reimportação)
+  - AJUSTE: gravar_venda_pendente() — motivo agora é dinâmico (via dados['motivo'])
+  - Todas as funções anteriores mantidas intactas
 """
 
 from sqlalchemy import create_engine, text
@@ -104,14 +110,22 @@ def buscar_duplicatas_loja(engine, loja):
 # ============================================================
 
 def gravar_venda_pendente(cursor, dados):
-    """Grava venda com SKU não cadastrado na fact_vendas_pendentes"""
+    """
+    Grava venda com SKU não cadastrado ou divergência na fact_vendas_pendentes.
+
+    VERSÃO 3.0: motivo agora é dinâmico — lê de dados['motivo'].
+    Se não informado, usa 'SKU não cadastrado' (compatível com chamadas existentes).
+    """
+    # Motivo dinâmico: permite 'SKU não cadastrado', 'Divergência financeira', etc.
+    motivo = dados.get('motivo', 'SKU não cadastrado')
+
     sql = """
         INSERT INTO fact_vendas_pendentes (
             marketplace_origem, loja_origem, numero_pedido, data_venda, sku, 
             codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo,
             imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas,
             valor_liquido, arquivo_origem, data_processamento, status, motivo
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', 'SKU não cadastrado')
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', %s)
         ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING
     """
     try:
@@ -121,7 +135,8 @@ def gravar_venda_pendente(cursor, dados):
             dados.get('quantidade', 1), dados.get('preco_venda', 0), dados.get('valor_venda_efetivo', 0),
             dados.get('imposto', 0), dados.get('comissao', 0), dados.get('frete', 0),
             dados.get('tarifa_fixa', 0), dados.get('outros_custos', 0), dados.get('total_tarifas', 0),
-            dados.get('valor_liquido', 0), dados.get('arquivo_origem', '')
+            dados.get('valor_liquido', 0), dados.get('arquivo_origem', ''),
+            motivo
         ))
         return True
     except Exception:
@@ -211,6 +226,61 @@ def reprocessar_pendentes_por_sku(engine, sku):
     conn.commit()
     cursor.close(); conn.close()
     return {'sucesso': sucesso, 'erros': erros, 'mensagem': f"Reprocessado: {sucesso} sucessos."}
+
+# ============================================================
+# VENDAS DESCARTADAS (NOVO v3.0)
+# ============================================================
+
+def gravar_venda_descartada(cursor, dados):
+    """
+    Grava venda descartada (cancelada/devolvida/mediação) em fact_vendas_descartadas.
+    Usa cursor já aberto (dentro da transação existente).
+    
+    Campos esperados em dados:
+        marketplace, loja, numero_pedido, status_original,
+        motivo_descarte, receita_estimada, tarifa_venda_estimada,
+        tarifa_envio_estimada, arquivo_origem
+    """
+    sql = """
+        INSERT INTO fact_vendas_descartadas (
+            marketplace, loja, numero_pedido, status_original,
+            motivo_descarte, receita_estimada, tarifa_venda_estimada,
+            tarifa_envio_estimada, arquivo_origem
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        cursor.execute(sql, (
+            dados.get('marketplace', ''),
+            dados.get('loja', ''),
+            dados.get('numero_pedido', ''),
+            dados.get('status_original', ''),
+            dados.get('motivo_descarte', ''),
+            dados.get('receita_estimada', 0),
+            dados.get('tarifa_venda_estimada', 0),
+            dados.get('tarifa_envio_estimada', 0),
+            dados.get('arquivo_origem', '')
+        ))
+        return True
+    except Exception:
+        return False
+
+
+def deletar_venda_snapshot(cursor, pedido, sku, loja):
+    """
+    Remove venda de fact_vendas_snapshot.
+    Usado quando status muda na reimportação (ex: 'Entregue' → 'Devolvido').
+    Usa cursor já aberto (dentro da transação existente).
+    
+    Retorna True se encontrou e deletou, False caso contrário.
+    """
+    try:
+        cursor.execute(
+            "DELETE FROM fact_vendas_snapshot WHERE numero_pedido = %s AND sku = %s AND loja_origem = %s",
+            (pedido, sku, loja)
+        )
+        return cursor.rowcount > 0
+    except Exception:
+        return False
 
 # ============================================================
 # CURVA ABC (PARETO) - NOVO MODELO dim_tags_anuncio
