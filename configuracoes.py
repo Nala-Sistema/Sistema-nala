@@ -69,13 +69,14 @@ def _tab_amazon(engine):
 
     with s1:
         try:
-            df_amz = pd.read_sql(
-                """SELECT id_plataforma as asin, sku, logistica, 
-                          comissao_percentual, taxa_fixa, frete_estimado 
-                   FROM dim_config_marketplace 
-                   WHERE marketplace = 'AMAZON'""",
-                engine
-            )
+            with engine.connect() as conn:
+                df_amz = pd.read_sql(
+                    """SELECT id_plataforma as asin, sku, logistica, 
+                              comissao_percentual, taxa_fixa, frete_estimado 
+                       FROM dim_config_marketplace 
+                       WHERE marketplace = 'AMAZON'""",
+                    conn
+                )
             if not df_amz.empty:
                 st.dataframe(df_amz, use_container_width=True, hide_index=True)
             else:
@@ -154,13 +155,14 @@ def _tab_frete_ml(engine):
 
     # Buscar lojas ML com custo_flex
     try:
-        df_ml = pd.read_sql(
-            """SELECT loja, imposto, custo_flex 
-               FROM dim_lojas 
-               WHERE UPPER(marketplace) LIKE '%MERCADO%LIVRE%'
-               ORDER BY loja""",
-            engine
-        )
+        with engine.connect() as conn:
+            df_ml = pd.read_sql(
+                """SELECT loja, imposto, custo_flex 
+                   FROM dim_lojas 
+                   WHERE UPPER(marketplace) LIKE '%MERCADO%LIVRE%'
+                   ORDER BY loja""",
+                conn
+            )
     except Exception as e:
         st.error(f"Erro ao carregar lojas ML: {e}")
         return
@@ -244,10 +246,11 @@ def _tab_impostos_lojas(engine):
     st.subheader("Gerenciamento das 14 Lojas")
 
     try:
-        df_lojas = pd.read_sql(
-            "SELECT marketplace, loja, imposto, custo_flex FROM dim_lojas ORDER BY marketplace ASC",
-            engine
-        )
+        with engine.connect() as conn:
+            df_lojas = pd.read_sql(
+                "SELECT marketplace, loja, imposto, custo_flex FROM dim_lojas ORDER BY marketplace ASC",
+                conn
+            )
     except Exception:
         df_lojas = pd.DataFrame()
 
@@ -347,12 +350,13 @@ def _tab_usuarios(engine):
     st.markdown("### Usuários Cadastrados")
 
     try:
-        df_users = pd.read_sql(
-            """SELECT username, role, ativo, created_at 
-               FROM dim_usuarios 
-               ORDER BY created_at DESC""",
-            engine
-        )
+        with engine.connect() as conn:
+            df_users = pd.read_sql(
+                """SELECT username, role, ativo, created_at 
+                   FROM dim_usuarios 
+                   ORDER BY created_at DESC""",
+                conn
+            )
     except Exception:
         df_users = pd.DataFrame()
 
