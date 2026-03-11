@@ -1,6 +1,10 @@
 """
 CONFIGURAÇÕES - Sistema Nala
-Versão: 2.0 (11/03/2026)
+Versão: 2.1 (11/03/2026)
+
+CHANGELOG v2.1:
+  - FIX: Todas queries usam raw_connection via _query_to_df (compatível SQLAlchemy 2.x)
+  - FIX: Tab Amazon Importar agora tem botão de processar com UPSERT
 
 Tabs:
   1. Amazon — Vincular ASINs, taxas, importação massiva
@@ -21,6 +25,28 @@ def get_engine():
     return create_engine(DB_URL)
 
 
+def _query_to_df(engine, query, params=None):
+    """
+    Executa query e retorna DataFrame.
+    Usa raw_connection para compatibilidade com SQLAlchemy 2.x.
+    Evita erro 'immutabledict is not a sequence'.
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception:
+        return pd.DataFrame()
+
+
 def main():
     st.header("⚙️ Configurações Nala")
     engine = get_engine()
@@ -32,27 +58,15 @@ def main():
         "👤 Gestão de Usuários"
     ])
 
-    # ============================================================
-    # TAB 1: AMAZON (mantida)
-    # ============================================================
     with t_amz:
         _tab_amazon(engine)
 
-    # ============================================================
-    # TAB 2: FRETE ML (FLEX)
-    # ============================================================
     with t_ml:
         _tab_frete_ml(engine)
 
-    # ============================================================
-    # TAB 3: IMPOSTOS & LOJAS
-    # ============================================================
     with t_fisc:
         _tab_impostos_lojas(engine)
 
-    # ============================================================
-    # TAB 4: GESTÃO DE USUÁRIOS
-    # ============================================================
     with t_users:
         _tab_usuarios(engine)
 
@@ -68,22 +82,16 @@ def _tab_amazon(engine):
     cols_amz = ["asin", "sku", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
 
     with s1:
-        try:
-            with engine.connect() as conn:
-                df_amz = pd.read_sql(
-                    """SELECT id_plataforma as asin, sku, logistica, 
-                              comissao_percentual, taxa_fixa, frete_estimado 
-                       FROM dim_config_marketplace 
-                       WHERE marketplace = 'AMAZON'""",
-                    conn
-                )
-            if not df_amz.empty:
-                st.dataframe(df_amz, use_container_width=True, hide_index=True)
-            else:
-                st.info("Nenhum anúncio Amazon cadastrado.")
-                st.dataframe(pd.DataFrame(columns=cols_amz), use_container_width=True, hide_index=True)
-        except Exception:
-            st.info("Nenhum anúncio Amazon no banco.")
+        df_amz = _query_to_df(engine,
+            """SELECT id_plataforma as asin, sku, logistica, 
+                      comissao_percentual, taxa_fixa, frete_estimado 
+               FROM dim_config_marketplace 
+               WHERE marketplace = 'AMAZON'"""
+        )
+        if not df_amz.empty:
+            st.dataframe(df_amz, use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum anúncio Amazon cadastrado.")
             st.dataframe(pd.DataFrame(columns=cols_amz), use_container_width=True, hide_index=True)
 
     with s2:
@@ -101,24 +109,28 @@ def _tab_amazon(engine):
 
             if st.form_submit_button("💾 Salvar Anúncio Amazon"):
                 try:
-                    with engine.connect() as conn:
-                        conn.execute(text("""
-                            INSERT INTO dim_config_marketplace 
-                                (id_plataforma, sku, marketplace, logistica, 
-                                 comissao_percentual, taxa_fixa, frete_estimado)
-                            VALUES (:id, :s, 'AMAZON', :l, :c, :t, :f)
-                            ON CONFLICT (id_plataforma) DO UPDATE SET 
-                                sku=EXCLUDED.sku, 
-                                comissao_percentual=EXCLUDED.comissao_percentual, 
-                                taxa_fixa=EXCLUDED.taxa_fixa, 
-                                frete_estimado=EXCLUDED.frete_estimado
-                        """), {
-                            "id": f_asin, "s": f_sku, "l": f_log,
-                            "c": float(f_com.replace(',', '.')),
-                            "t": float(f_tax.replace(',', '.')),
-                            "f": float(f_fre.replace(',', '.'))
-                        })
-                        conn.commit()
+                    conn = engine.raw_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO dim_config_marketplace 
+                            (id_plataforma, sku, marketplace, logistica, 
+                             comissao_percentual, taxa_fixa, frete_estimado)
+                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
+                        ON CONFLICT (id_plataforma) DO UPDATE SET 
+                            sku=EXCLUDED.sku, 
+                            logistica=EXCLUDED.logistica,
+                            comissao_percentual=EXCLUDED.comissao_percentual, 
+                            taxa_fixa=EXCLUDED.taxa_fixa, 
+                            frete_estimado=EXCLUDED.frete_estimado
+                    """, (
+                        f_asin, f_sku, f_log,
+                        float(f_com.replace(',', '.')),
+                        float(f_tax.replace(',', '.')),
+                        float(f_fre.replace(',', '.'))
+                    ))
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                     st.success("Vinculado com sucesso!")
                     st.rerun()
                 except Exception:
@@ -126,13 +138,76 @@ def _tab_amazon(engine):
 
     with s3:
         st.subheader("📥 Importação Massiva Amazon")
+
+        # Template para download
         tmpl_amz = pd.DataFrame(columns=cols_amz)
         buf_amz = io.BytesIO()
         with pd.ExcelWriter(buf_amz, engine='openpyxl') as wr:
             tmpl_amz.to_excel(wr, index=False)
         st.download_button("📄 Baixar Template Amazon", data=buf_amz.getvalue(),
                            file_name="template_amazon.xlsx")
-        st.file_uploader("Subir arquivo preenchido (.xlsx)", type=["xlsx"], key="up_amz_file")
+
+        # Upload
+        arquivo_amz = st.file_uploader("Subir arquivo preenchido (.xlsx)",
+                                       type=["xlsx"], key="up_amz_file")
+
+        # Botão processar (NOVO v2.1)
+        if arquivo_amz and st.button("📥 Processar Importação Amazon", type="primary"):
+            try:
+                df_import = pd.read_excel(arquivo_amz)
+
+                # Validar colunas mínimas
+                colunas_esperadas = {'asin', 'sku'}
+                if not colunas_esperadas.issubset(set(df_import.columns)):
+                    st.error(f"❌ Colunas obrigatórias não encontradas: {colunas_esperadas}")
+                else:
+                    conn = engine.raw_connection()
+                    cursor = conn.cursor()
+                    importados = 0
+                    erros_imp = 0
+
+                    for _, row in df_import.iterrows():
+                        try:
+                            asin = str(row.get('asin', '')).strip()
+                            sku = str(row.get('sku', '')).strip()
+
+                            if not asin or not sku:
+                                erros_imp += 1
+                                continue
+
+                            logistica = str(row.get('logistica', 'FBA')).strip()
+                            comissao = float(str(row.get('comissao_percentual', 0)).replace(',', '.'))
+                            taxa = float(str(row.get('taxa_fixa', 0)).replace(',', '.'))
+                            frete = float(str(row.get('frete_estimado', 0)).replace(',', '.'))
+
+                            cursor.execute("""
+                                INSERT INTO dim_config_marketplace 
+                                    (id_plataforma, sku, marketplace, logistica, 
+                                     comissao_percentual, taxa_fixa, frete_estimado)
+                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
+                                ON CONFLICT (id_plataforma) DO UPDATE SET 
+                                    sku=EXCLUDED.sku,
+                                    logistica=EXCLUDED.logistica,
+                                    comissao_percentual=EXCLUDED.comissao_percentual, 
+                                    taxa_fixa=EXCLUDED.taxa_fixa, 
+                                    frete_estimado=EXCLUDED.frete_estimado
+                            """, (asin, sku, logistica, comissao, taxa, frete))
+                            importados += 1
+                        except Exception:
+                            erros_imp += 1
+
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+
+                    if importados > 0:
+                        st.success(f"✅ {importados} anúncio(s) importado(s) com sucesso!")
+                    if erros_imp > 0:
+                        st.warning(f"⚠️ {erros_imp} linha(s) com erro (ASIN ou SKU vazio)")
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"❌ Erro ao processar arquivo: {e}")
 
 
 # ============================================================
@@ -140,10 +215,7 @@ def _tab_amazon(engine):
 # ============================================================
 
 def _tab_frete_ml(engine):
-    """
-    Configuração do custo FLEX por loja do Mercado Livre.
-    Lê e grava no campo custo_flex da tabela dim_lojas.
-    """
+    """Configuração do custo FLEX por loja do Mercado Livre."""
 
     st.subheader("🚚 Custo FLEX por Loja (Mercado Livre)")
 
@@ -153,30 +225,21 @@ def _tab_frete_ml(engine):
         "O valor padrão é **R$ 12,90**."
     )
 
-    # Buscar lojas ML com custo_flex
-    try:
-        with engine.connect() as conn:
-            df_ml = pd.read_sql(
-                """SELECT loja, imposto, custo_flex 
-                   FROM dim_lojas 
-                   WHERE UPPER(marketplace) LIKE '%MERCADO%LIVRE%'
-                   ORDER BY loja""",
-                conn
-            )
-    except Exception as e:
-        st.error(f"Erro ao carregar lojas ML: {e}")
-        return
+    df_ml = _query_to_df(engine,
+        """SELECT loja, imposto, custo_flex 
+           FROM dim_lojas 
+           WHERE UPPER(marketplace) LIKE '%%MERCADO%%LIVRE%%'
+           ORDER BY loja"""
+    )
 
     if df_ml.empty:
         st.warning("Nenhuma loja Mercado Livre cadastrada. Cadastre na tab 'Impostos & Lojas'.")
         return
 
-    # Garantir que custo_flex tem valor (fallback 12.90)
     df_ml['custo_flex'] = df_ml['custo_flex'].fillna(12.90)
 
     st.info(f"📍 {len(df_ml)} loja(s) Mercado Livre encontrada(s)")
 
-    # Tabela editável
     df_editado = st.data_editor(
         df_ml,
         column_config={
@@ -195,7 +258,6 @@ def _tab_frete_ml(engine):
         key="editor_flex_ml"
     )
 
-    # Botão salvar
     if st.button("💾 Salvar Custos FLEX", key="btn_salvar_flex", type="primary"):
         try:
             conn = engine.raw_connection()
@@ -219,7 +281,6 @@ def _tab_frete_ml(engine):
         except Exception as e:
             st.error(f"Erro ao salvar: {e}")
 
-    # Referência
     with st.expander("ℹ️ Como funciona o frete FLEX", expanded=False):
         st.markdown("""
 **Frete FLEX (Mercado Livre):**
@@ -245,17 +306,11 @@ def _tab_impostos_lojas(engine):
 
     st.subheader("Gerenciamento das 14 Lojas")
 
-    try:
-        with engine.connect() as conn:
-            df_lojas = pd.read_sql(
-                "SELECT marketplace, loja, imposto, custo_flex FROM dim_lojas ORDER BY marketplace ASC",
-                conn
-            )
-    except Exception:
-        df_lojas = pd.DataFrame()
+    df_lojas = _query_to_df(engine,
+        "SELECT marketplace, loja, imposto, custo_flex FROM dim_lojas ORDER BY marketplace ASC"
+    )
 
     if df_lojas.empty:
-        # Lista definitiva do Grupo Nala
         data_nala = [
             ["MERCADO LIVRE", "ML-Nala", 10.00, 12.90],
             ["MERCADO LIVRE", "ML-LPT", 10.00, 12.90],
@@ -274,7 +329,6 @@ def _tab_impostos_lojas(engine):
         ]
         df_lojas = pd.DataFrame(data_nala, columns=["marketplace", "loja", "imposto", "custo_flex"])
 
-    # Garantir que custo_flex existe
     if 'custo_flex' not in df_lojas.columns:
         df_lojas['custo_flex'] = 0.00
     df_lojas['custo_flex'] = df_lojas['custo_flex'].fillna(0.00)
@@ -303,7 +357,6 @@ def _tab_impostos_lojas(engine):
             conn = engine.raw_connection()
             cursor = conn.cursor()
 
-            # TRUNCATE e reinsert (mantém compatibilidade)
             cursor.execute("TRUNCATE TABLE dim_lojas")
 
             for _, row in df_editado.iterrows():
@@ -330,15 +383,10 @@ def _tab_impostos_lojas(engine):
 # ============================================================
 
 def _tab_usuarios(engine):
-    """
-    Gestão de usuários do sistema.
-    Adaptado do add_user.py para interface Streamlit.
-    RBAC: ADMIN, COMPRAS, GESTOR.
-    """
+    """Gestão de usuários do sistema (RBAC: ADMIN, COMPRAS, GESTOR)."""
 
     st.subheader("👤 Gestão de Usuários")
 
-    # Verificar permissão (só ADMIN pode gerenciar)
     usuario_logado = st.session_state.get('usuario', {})
     role_logado = usuario_logado.get('role', '')
 
@@ -349,29 +397,20 @@ def _tab_usuarios(engine):
     # ---- LISTAR USUÁRIOS ----
     st.markdown("### Usuários Cadastrados")
 
-    try:
-        with engine.connect() as conn:
-            df_users = pd.read_sql(
-                """SELECT username, role, ativo, created_at 
-                   FROM dim_usuarios 
-                   ORDER BY created_at DESC""",
-                conn
-            )
-    except Exception:
-        df_users = pd.DataFrame()
+    df_users = _query_to_df(engine,
+        """SELECT username, role, ativo, created_at 
+           FROM dim_usuarios 
+           ORDER BY created_at DESC"""
+    )
 
     if not df_users.empty:
         df_display = df_users.copy()
         df_display['created_at'] = pd.to_datetime(df_display['created_at']).dt.strftime('%d/%m/%Y %H:%M')
         df_display['ativo'] = df_display['ativo'].apply(lambda x: "✅ Ativo" if x else "❌ Inativo")
-
         df_display = df_display.rename(columns={
-            'username': 'Usuário',
-            'role': 'Perfil',
-            'ativo': 'Status',
-            'created_at': 'Criado em'
+            'username': 'Usuário', 'role': 'Perfil',
+            'ativo': 'Status', 'created_at': 'Criado em'
         })
-
         st.dataframe(df_display, use_container_width=True, hide_index=True)
     else:
         st.info("Nenhum usuário cadastrado.")
@@ -386,11 +425,9 @@ def _tab_usuarios(engine):
         novo_username = col1.text_input("Username")
         novo_role = col2.selectbox("Perfil", ["ADMIN", "COMPRAS", "GESTOR"])
         novo_senha = col3.text_input("Senha", type="password")
-
         novo_senha_confirm = st.text_input("Confirmar Senha", type="password")
 
         if st.form_submit_button("💾 Criar Usuário", type="primary"):
-            # Validações
             if not novo_username or not novo_username.strip():
                 st.error("❌ Username não pode ser vazio.")
             elif not novo_senha or len(novo_senha) < 6:
@@ -401,8 +438,7 @@ def _tab_usuarios(engine):
                 try:
                     import bcrypt
                     password_hash = bcrypt.hashpw(
-                        novo_senha.encode('utf-8'),
-                        bcrypt.gensalt()
+                        novo_senha.encode('utf-8'), bcrypt.gensalt()
                     ).decode('utf-8')
 
                     conn = engine.raw_connection()
@@ -414,7 +450,6 @@ def _tab_usuarios(engine):
                     conn.commit()
                     cursor.close()
                     conn.close()
-
                     st.success(f"✅ Usuário '{novo_username}' criado com perfil {novo_role}!")
                     st.rerun()
                 except Exception as e:
@@ -444,8 +479,7 @@ def _tab_usuarios(engine):
                     try:
                         import bcrypt
                         password_hash = bcrypt.hashpw(
-                            nova_senha.encode('utf-8'),
-                            bcrypt.gensalt()
+                            nova_senha.encode('utf-8'), bcrypt.gensalt()
                         ).decode('utf-8')
 
                         conn = engine.raw_connection()
@@ -457,24 +491,19 @@ def _tab_usuarios(engine):
                         conn.commit()
                         cursor.close()
                         conn.close()
-
                         st.success(f"✅ Senha alterada para '{user_senha}'!")
                     except Exception as e:
                         st.error(f"❌ Erro: {e}")
 
     st.divider()
 
-    # ---- ATIVAR / DESATIVAR USUÁRIO ----
+    # ---- ATIVAR / DESATIVAR ----
     st.markdown("### 🔄 Ativar / Desativar Usuário")
 
     if not df_users.empty:
         col1, col2 = st.columns(2)
 
-        # Excluir admin da lista de desativação
-        users_desativaveis = df_users[df_users['username'] != 'admin']['username'].tolist()
-
         with col1:
-            # Desativar
             users_ativos = df_users[(df_users['ativo'] == True) & (df_users['username'] != 'admin')]['username'].tolist()
             if users_ativos:
                 user_desativar = st.selectbox("Desativar:", users_ativos, key="sel_desativar")
@@ -482,10 +511,7 @@ def _tab_usuarios(engine):
                     try:
                         conn = engine.raw_connection()
                         cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE dim_usuarios SET ativo = FALSE WHERE username = %s",
-                            (user_desativar,)
-                        )
+                        cursor.execute("UPDATE dim_usuarios SET ativo = FALSE WHERE username = %s", (user_desativar,))
                         conn.commit()
                         cursor.close()
                         conn.close()
@@ -497,7 +523,6 @@ def _tab_usuarios(engine):
                 st.info("Nenhum usuário ativo para desativar (exceto admin).")
 
         with col2:
-            # Ativar
             users_inativos = df_users[df_users['ativo'] == False]['username'].tolist()
             if users_inativos:
                 user_ativar = st.selectbox("Ativar:", users_inativos, key="sel_ativar")
@@ -505,10 +530,7 @@ def _tab_usuarios(engine):
                     try:
                         conn = engine.raw_connection()
                         cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE dim_usuarios SET ativo = TRUE WHERE username = %s",
-                            (user_ativar,)
-                        )
+                        cursor.execute("UPDATE dim_usuarios SET ativo = TRUE WHERE username = %s", (user_ativar,))
                         conn.commit()
                         cursor.close()
                         conn.close()
