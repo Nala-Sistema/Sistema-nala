@@ -40,9 +40,15 @@ from database_utils import (
     buscar_pendentes_resumo,
     reprocessar_pendentes_por_sku,
     recalcular_curva_abc,
+    buscar_pendentes_por_tipo,
+    reprocessar_pendentes_manual,
+    gravar_mapeamento_sku,
+    buscar_custos_skus,
+    buscar_skus_validos,
 )
 from processar_ml import processar_arquivo_ml, gravar_vendas_ml
 from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
+from processar_amazon import processar_arquivo_amazon, gravar_vendas_amazon
 
 
 # ============================================================
@@ -52,13 +58,15 @@ from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 def _detectar_marketplace(mktp: str) -> str:
     """
     Normaliza o nome do marketplace para roteamento interno.
-    Retorna: 'ML', 'SHOPEE', ou 'DESCONHECIDO'
+    Retorna: 'ML', 'SHOPEE', 'AMAZON', ou 'DESCONHECIDO'
     """
     mktp_upper = mktp.upper()
     if 'MERCADO' in mktp_upper and 'LIVRE' in mktp_upper:
         return 'ML'
     if 'SHOPEE' in mktp_upper:
         return 'SHOPEE'
+    if 'AMAZON' in mktp_upper:
+        return 'AMAZON'
     return 'DESCONHECIDO'
 
 
@@ -230,19 +238,44 @@ def tab_processar_upload(engine):
 
     st.info(f"📍 {loja} | Imposto: {formatar_percentual(imposto)}")
 
+    # Detectar marketplace para lógica condicional
+    mp = _detectar_marketplace(mktp)
+
+    # 2b. SELEÇÃO DE PERÍODO (obrigatório para Amazon)
+    data_ini = None
+    data_fim = None
+
+    if mp == 'AMAZON':
+        st.markdown("**📅 Período do Relatório (obrigatório para Amazon)**")
+        col_d1, col_d2 = st.columns(2)
+        data_ini = col_d1.date_input("Data Início:", value=None, key="amz_data_ini")
+        data_fim = col_d2.date_input("Data Fim:", value=None, key="amz_data_fim")
+
+        if not data_ini or not data_fim:
+            st.warning("⚠️ Selecione as datas de início e fim do período para continuar.")
+            st.stop()
+
+        if data_ini > data_fim:
+            st.error("❌ Data de início não pode ser maior que data de fim.")
+            st.stop()
+
+        st.caption(f"Período selecionado: {data_ini.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}")
+
     # 3. UPLOAD DE ARQUIVO
-    arquivo = st.file_uploader("📂 Upload do arquivo de vendas (XLSX)", type=['xlsx'])
+    tipos_aceitos = ['csv'] if mp == 'AMAZON' else ['xlsx']
+    label_tipo = "CSV" if mp == 'AMAZON' else "XLSX"
+    arquivo = st.file_uploader(f"📂 Upload do arquivo de vendas ({label_tipo})", type=tipos_aceitos)
 
     # 4. BOTÃO ANALISAR
     if arquivo and st.button("🔍 ANALISAR ARQUIVO", type="primary"):
         with st.spinner("Processando arquivo..."):
 
-            mp = _detectar_marketplace(mktp)
-
             if mp == 'ML':
                 df_proc, info = processar_arquivo_ml(arquivo, loja, imposto, engine)
             elif mp == 'SHOPEE':
                 df_proc, info = processar_arquivo_shopee(arquivo, loja, imposto, engine)
+            elif mp == 'AMAZON':
+                df_proc, info = processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
             else:
                 st.error(f"⚠️ Processador para '{mktp}' ainda não implementado.")
                 return
@@ -255,6 +288,8 @@ def tab_processar_upload(engine):
                 st.session_state['mp_key']        = mp
                 st.session_state['loja']          = loja
                 st.session_state['arquivo_nome']  = arquivo.name
+                st.session_state['data_ini']      = data_ini
+                st.session_state['data_fim']      = data_fim
                 st.rerun()
             else:
                 st.error(f"❌ {info}")
@@ -297,10 +332,17 @@ def tab_processar_upload(engine):
                 f"receita e tarifas distribuídas proporcionalmente entre os itens."
             )
 
-        # NOVO v3.0: Alerta ML — descartes rastreados
-        if mp_key == 'ML' and info.get('descartes'):
+        # NOVO v3.1: Alerta — SKUs corrigidos automaticamente (ML e Amazon)
+        if info.get('skus_corrigidos', 0) > 0:
             st.info(
-                f"🗑️ {len(info['descartes'])} venda(s) cancelada(s)/devolvida(s) serão rastreadas "
+                f"🔧 {info['skus_corrigidos']} SKU(s) corrigido(s) automaticamente "
+                f"via mapeamento (dim_sku_mapeamento)."
+            )
+
+        # NOVO v3.0: Alerta — descartes rastreados (ML e Amazon)
+        if info.get('descartes'):
+            st.info(
+                f"🗑️ {len(info['descartes'])} linha(s) descartada(s) serão rastreadas "
                 f"em fact_vendas_descartadas ao gravar."
             )
 
@@ -327,13 +369,18 @@ def tab_processar_upload(engine):
             st.subheader("📋 Preview das Vendas (primeiras 20 linhas)")
 
             df_preview = df_proc.copy()
-            df_preview['receita']    = df_preview['receita'].apply(formatar_valor)
-            df_preview['tarifa']     = df_preview['tarifa'].apply(formatar_valor)
-            df_preview['imposto']    = df_preview['imposto'].apply(formatar_valor)
-            df_preview['frete']      = df_preview['frete'].apply(formatar_valor)
-            df_preview['custo']      = df_preview['custo'].apply(formatar_valor)
-            df_preview['margem']     = df_preview['margem'].apply(formatar_valor)
-            df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
+
+            # Formatação BR — apenas colunas que existem (varia por marketplace)
+            colunas_valor = ['receita', 'tarifa', 'imposto', 'frete', 'custo', 'margem',
+                             'comissao', 'taxa_fixa']
+            for col in colunas_valor:
+                if col in df_preview.columns:
+                    df_preview[col] = df_preview[col].apply(formatar_valor)
+
+            colunas_pct = ['margem_pct']
+            for col in colunas_pct:
+                if col in df_preview.columns:
+                    df_preview[col] = df_preview[col].apply(formatar_percentual)
 
             st.dataframe(
                 df_preview.head(20),
@@ -367,6 +414,16 @@ def tab_processar_upload(engine):
                     )
                     descartadas = 0
                     atualizados = 0
+                elif mp_key == 'AMAZON':
+                    # Amazon: retorno 7 valores, com Delete-Before-Insert
+                    data_ini_amz = st.session_state.get('data_ini')
+                    data_fim_amz = st.session_state.get('data_fim')
+
+                    registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_amazon(
+                        df_proc, mktp, loja, arquivo_nome, engine, data_ini_amz, data_fim_amz,
+                        descartes=info.get('descartes', []),
+                        pendentes_carrinho=info.get('pendentes_carrinho', [])
+                    )
                 else:
                     st.error("⚠️ Processador não identificado para gravação.")
                     return
@@ -423,12 +480,18 @@ def tab_processar_upload(engine):
                         f"em fact_vendas_descartadas"
                     )
 
-                # NOVO v3.0: Atualizações de status (reimportação)
+                # NOVO v3.0: Atualizações de status (reimportação ML / substituição Amazon)
                 if atualizados > 0:
-                    st.warning(
-                        f"🔄 {atualizados} venda(s) atualizada(s) — status mudou "
-                        f"(movida(s) de snapshot para descartadas)"
-                    )
+                    if mp_key == 'AMAZON':
+                        st.info(
+                            f"🔄 {atualizados} registro(s) do período anterior substituído(s) "
+                            f"pela versão atual do arquivo."
+                        )
+                    else:
+                        st.warning(
+                            f"🔄 {atualizados} venda(s) atualizada(s) — status mudou "
+                            f"(movida(s) de snapshot para descartadas)"
+                        )
 
                 if erros > 0:
                     st.warning(f"⚠️ {erros} linha(s) com erro")
@@ -455,7 +518,7 @@ def tab_processar_upload(engine):
                         pass  # Não bloquear gravação se ABC falhar
 
                 # Limpar session_state
-                for key in ['df_proc', 'info', 'mktp', 'mp_key', 'loja', 'arquivo_nome']:
+                for key in ['df_proc', 'info', 'mktp', 'mp_key', 'loja', 'arquivo_nome', 'data_ini', 'data_fim']:
                     st.session_state.pop(key, None)
 
 
@@ -875,32 +938,38 @@ CREATE TABLE IF NOT EXISTS log_uploads (
 
 
 # ============================================================
-# TAB 4: VENDAS PENDENTES (NOVO v2.0)
+# TAB 4: VENDAS PENDENTES (v3.1 — Seções SKU + Divergência)
 # ============================================================
 
 def tab_vendas_pendentes(engine):
     """
-    Tab 4: Vendas com SKU não cadastrado.
-    Permite visualizar e reprocessar após cadastro do SKU.
-    Reprocessamento por SKU individual.
+    Tab 4: Vendas pendentes de processamento.
+
+    VERSÃO 3.1:
+    - Seção 1: SKU não cadastrado — tabela editável com correção de SKU
+    - Seção 2: Divergência financeira — tabela editável com valores ajustáveis
+    - Checkbox por linha para reprocessamento individual
+    - Mapeamento automático de SKUs corrigidos (dim_sku_mapeamento)
+    - Histórico unificado de reprocessados e revisados
     """
 
-    st.subheader("⏳ Vendas Pendentes (SKU não cadastrado)")
+    st.subheader("⏳ Vendas Pendentes")
 
     st.markdown(
-        "Vendas que foram importadas mas cujo SKU não existia em **dim_produtos** "
-        "no momento do upload. Cadastre o SKU no módulo **Gestão de SKUs** e "
-        "clique em **Reprocessar** para gravá-las."
+        "Vendas importadas que precisam de revisão antes de serem gravadas. "
+        "Podem ser por **SKU não cadastrado** ou **divergência financeira** em carrinhos."
     )
 
-    # RESUMO POR SKU
+    # ============================================================
+    # INDICADORES GERAIS
+    # ============================================================
     df_resumo = buscar_pendentes_resumo(engine)
 
     if df_resumo.empty:
-        st.success("✅ Nenhuma venda pendente! Todos os SKUs estão cadastrados.")
+        st.success("✅ Nenhuma venda pendente!")
+        _exibir_historico_reprocessados(engine)
         return
 
-    # Indicadores
     col1, col2, col3 = st.columns(3)
     total_vendas = int(df_resumo['total_vendas'].sum())
     total_skus = len(df_resumo)
@@ -912,96 +981,304 @@ def tab_vendas_pendentes(engine):
 
     st.divider()
 
-    # TABELA DE SKUs PENDENTES COM BOTÃO REPROCESSAR
-    st.markdown("### SKUs aguardando cadastro")
+    # ============================================================
+    # SEÇÃO 1: SKU NÃO CADASTRADO
+    # ============================================================
+    _secao_pendentes_sku(engine)
 
-    for _, row_resumo in df_resumo.iterrows():
-        sku = row_resumo['sku']
-        qtd = int(row_resumo['total_vendas'])
-        receita = float(row_resumo['receita_total'])
-        mktps = row_resumo['marketplaces']
-        lojas = row_resumo['lojas']
+    st.divider()
 
-        # Formatar datas
-        try:
-            primeira = pd.to_datetime(row_resumo['primeira_venda']).strftime('%d/%m/%Y')
-            ultima = pd.to_datetime(row_resumo['ultima_venda']).strftime('%d/%m/%Y')
-            periodo_txt = f"{primeira} a {ultima}"
-        except:
-            periodo_txt = "-"
+    # ============================================================
+    # SEÇÃO 2: DIVERGÊNCIA FINANCEIRA
+    # ============================================================
+    _secao_pendentes_divergencia(engine)
 
-        # Card do SKU
-        with st.container():
-            col_info, col_btn = st.columns([4, 1])
+    st.divider()
 
-            col_info.markdown(
-                f"**{sku}** — {qtd} venda(s), {formatar_valor(receita)} receita | "
-                f"{mktps} | {lojas} | Período: {periodo_txt}"
+    # ============================================================
+    # HISTÓRICO
+    # ============================================================
+    _exibir_historico_reprocessados(engine)
+
+
+def _secao_pendentes_sku(engine):
+    """
+    Seção 1: Vendas com SKU não cadastrado.
+    Tabela editável — permite corrigir SKU antes de reprocessar.
+    Se SKU for corrigido, salva mapeamento em dim_sku_mapeamento.
+    """
+
+    st.markdown("### 🔧 Pendentes por SKU não cadastrado")
+    st.caption(
+        "Corrija o SKU na tabela (ex: erro de digitação) ou cadastre no módulo Gestão de SKUs. "
+        "SKUs corrigidos aqui serão lembrados para imports futuros."
+    )
+
+    df_sku = buscar_pendentes_por_tipo(engine, tipo='sku')
+
+    if df_sku.empty:
+        st.success("✅ Nenhuma venda pendente por SKU.")
+        return
+
+    # Buscar SKUs válidos para validação visual
+    skus_validos = buscar_skus_validos(engine)
+
+    # Preparar tabela editável
+    df_edit = df_sku[[
+        'id', 'sku', 'numero_pedido', 'data_venda', 'loja_origem',
+        'marketplace_origem', 'valor_venda_efetivo', 'codigo_anuncio',
+        'quantidade', 'comissao', 'imposto', 'frete', 'motivo'
+    ]].copy()
+
+    # Guardar SKU original para detectar correções
+    df_edit['sku_original'] = df_edit['sku'].copy()
+
+    # Formatar data para exibição
+    df_edit['data_venda'] = pd.to_datetime(
+        df_edit['data_venda'], errors='coerce'
+    ).dt.strftime('%d/%m/%Y').fillna('-')
+
+    # Checkbox de seleção
+    df_edit.insert(0, '✅', False)
+
+    # Exibir tabela editável
+    df_editado = st.data_editor(
+        df_edit,
+        column_config={
+            '✅': st.column_config.CheckboxColumn("Selecionar", default=False),
+            'id': st.column_config.NumberColumn("ID", disabled=True),
+            'sku': st.column_config.TextColumn("SKU (editável)", help="Corrija o SKU se necessário"),
+            'sku_original': None,  # Ocultar
+            'numero_pedido': st.column_config.TextColumn("Pedido", disabled=True),
+            'data_venda': st.column_config.TextColumn("Data", disabled=True),
+            'loja_origem': st.column_config.TextColumn("Loja", disabled=True),
+            'marketplace_origem': st.column_config.TextColumn("Marketplace", disabled=True),
+            'valor_venda_efetivo': st.column_config.NumberColumn("Receita (R$)", format="%.2f", disabled=True),
+            'codigo_anuncio': st.column_config.TextColumn("Anúncio", disabled=True),
+            'quantidade': st.column_config.NumberColumn("Qtd", disabled=True),
+            'comissao': st.column_config.NumberColumn("Tarifa (R$)", format="%.2f", disabled=True),
+            'imposto': st.column_config.NumberColumn("Imposto (R$)", format="%.2f", disabled=True),
+            'frete': st.column_config.NumberColumn("Frete (R$)", format="%.2f", disabled=True),
+            'motivo': st.column_config.TextColumn("Motivo", disabled=True),
+        },
+        use_container_width=True,
+        height=400,
+        hide_index=True,
+        key="editor_pendentes_sku"
+    )
+
+    # Selecionados
+    selecionados = df_editado[df_editado['✅'] == True]
+    qtd_sel = len(selecionados)
+
+    if qtd_sel > 0:
+        # Verificar se algum SKU foi corrigido
+        skus_modificados = selecionados[selecionados['sku'] != selecionados['sku_original']]
+
+        if len(skus_modificados) > 0:
+            st.info(
+                f"🔧 {len(skus_modificados)} SKU(s) corrigido(s). "
+                f"O mapeamento será salvo automaticamente para imports futuros."
             )
 
-            # Botão reprocessar com key única
-            if col_btn.button("🔄 Reprocessar", key=f"repro_{sku}", use_container_width=True):
-                with st.spinner(f"Reprocessando {sku}..."):
-                    resultado = reprocessar_pendentes_por_sku(engine, sku)
+        # Verificar se SKUs corrigidos existem em dim_produtos
+        skus_nao_encontrados = []
+        for _, row_sel in selecionados.iterrows():
+            sku_novo = str(row_sel['sku']).strip()
+            if sku_novo not in skus_validos:
+                skus_nao_encontrados.append(sku_novo)
 
-                    if resultado['sucesso'] > 0:
-                        st.success(f"✅ {resultado['mensagem']}")
+        if skus_nao_encontrados:
+            st.warning(
+                f"⚠️ SKU(s) ainda não cadastrado(s) em dim_produtos: "
+                f"{', '.join(skus_nao_encontrados)}. Cadastre antes de reprocessar."
+            )
 
-                        # Recalcular ABC após reprocessamento
-                        try:
-                            recalcular_curva_abc(engine, dias=30)
-                        except:
-                            pass
+        st.info(f"📌 {qtd_sel} venda(s) selecionada(s) para reprocessamento.")
 
-                        st.rerun()
-                    elif resultado['erros'] > 0:
-                        st.warning(f"⚠️ {resultado['mensagem']}")
-                    else:
-                        st.error(f"❌ {resultado['mensagem']}")
+        if st.button("🔄 Reprocessar SKUs Selecionados", key="btn_repro_sku", type="primary"):
+            with st.spinner("Reprocessando..."):
+                # Montar dados para reprocessamento
+                itens = []
+                for _, row_sel in selecionados.iterrows():
+                    itens.append({
+                        'id': row_sel['id'],
+                        'sku': str(row_sel['sku']).strip(),
+                        'sku_original': str(row_sel['sku_original']).strip(),
+                        'valor_venda_efetivo': row_sel['valor_venda_efetivo'],
+                        'comissao': row_sel['comissao'],
+                        'imposto': row_sel['imposto'],
+                        'frete': row_sel['frete'],
+                        'quantidade': row_sel['quantidade'],
+                        'marketplace_origem': row_sel['marketplace_origem'],
+                        'loja_origem': row_sel['loja_origem'],
+                        'numero_pedido': row_sel['numero_pedido'],
+                        'data_venda': pd.to_datetime(row_sel['data_venda'], format='%d/%m/%Y', errors='coerce'),
+                        'codigo_anuncio': row_sel.get('codigo_anuncio', ''),
+                        'arquivo_origem': '',
+                    })
 
-            st.markdown("---")
+                resultado = reprocessar_pendentes_manual(engine, itens)
 
-    # DETALHES EXPANDÍVEIS
-    with st.expander("📋 Ver todas as vendas pendentes em detalhe", expanded=False):
-        df_todas = buscar_pendentes(engine, status='Pendente')
+                if resultado['sucesso'] > 0:
+                    st.success(f"✅ {resultado['mensagem']}")
 
-        if not df_todas.empty:
-            df_exibir = df_todas[[
-                'sku', 'numero_pedido', 'data_venda', 'loja_origem',
-                'marketplace_origem', 'valor_venda_efetivo', 'codigo_anuncio'
-            ]].copy()
+                    if resultado['mapeados'] > 0:
+                        st.info(f"🔧 {resultado['mapeados']} mapeamento(s) de SKU salvo(s) para imports futuros.")
 
-            # Formatar
-            df_exibir['data_venda'] = pd.to_datetime(
-                df_exibir['data_venda'], errors='coerce'
-            ).dt.strftime('%d/%m/%Y').fillna('-')
+                    try:
+                        recalcular_curva_abc(engine, dias=30)
+                    except:
+                        pass
 
-            df_exibir['valor_venda_efetivo'] = df_exibir['valor_venda_efetivo'].apply(formatar_valor)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {resultado['mensagem']}")
 
-            st.dataframe(df_exibir, use_container_width=True, height=400, hide_index=True)
 
-    # HISTÓRICO DE REPROCESSADOS
-    with st.expander("✅ Ver vendas já reprocessadas", expanded=False):
+def _secao_pendentes_divergencia(engine):
+    """
+    Seção 2: Vendas com divergência financeira (carrinhos).
+    Tabela editável — permite ajustar receita, tarifa, imposto, frete.
+    """
+
+    st.markdown("### 💰 Pendentes por Divergência Financeira")
+    st.caption(
+        "Vendas de carrinho onde o valor calculado divergiu do Total (BRL) do ML em mais de R$ 5,00. "
+        "Ajuste os valores se necessário e reprocesse."
+    )
+
+    df_div = buscar_pendentes_por_tipo(engine, tipo='divergencia')
+
+    if df_div.empty:
+        st.success("✅ Nenhuma venda pendente por divergência financeira.")
+        return
+
+    # Preparar tabela editável
+    df_edit = df_div[[
+        'id', 'sku', 'numero_pedido', 'data_venda', 'loja_origem',
+        'marketplace_origem', 'valor_venda_efetivo', 'codigo_anuncio',
+        'quantidade', 'comissao', 'imposto', 'frete', 'motivo'
+    ]].copy()
+
+    # Guardar SKU original
+    df_edit['sku_original'] = df_edit['sku'].copy()
+
+    # Formatar data para exibição
+    df_edit['data_venda'] = pd.to_datetime(
+        df_edit['data_venda'], errors='coerce'
+    ).dt.strftime('%d/%m/%Y').fillna('-')
+
+    # Checkbox
+    df_edit.insert(0, '✅', False)
+
+    # Exibir tabela editável (valores financeiros editáveis)
+    df_editado = st.data_editor(
+        df_edit,
+        column_config={
+            '✅': st.column_config.CheckboxColumn("Selecionar", default=False),
+            'id': st.column_config.NumberColumn("ID", disabled=True),
+            'sku': st.column_config.TextColumn("SKU (editável)", help="Corrija se necessário"),
+            'sku_original': None,  # Ocultar
+            'numero_pedido': st.column_config.TextColumn("Pedido", disabled=True),
+            'data_venda': st.column_config.TextColumn("Data", disabled=True),
+            'loja_origem': st.column_config.TextColumn("Loja", disabled=True),
+            'marketplace_origem': st.column_config.TextColumn("Marketplace", disabled=True),
+            'valor_venda_efetivo': st.column_config.NumberColumn(
+                "Receita (R$)", format="%.2f",
+                help="Ajuste se necessário"
+            ),
+            'codigo_anuncio': st.column_config.TextColumn("Anúncio", disabled=True),
+            'quantidade': st.column_config.NumberColumn("Qtd", disabled=True),
+            'comissao': st.column_config.NumberColumn(
+                "Tarifa (R$)", format="%.2f",
+                help="Ajuste se necessário"
+            ),
+            'imposto': st.column_config.NumberColumn(
+                "Imposto (R$)", format="%.2f",
+                help="Ajuste se necessário"
+            ),
+            'frete': st.column_config.NumberColumn(
+                "Frete (R$)", format="%.2f",
+                help="Ajuste se necessário"
+            ),
+            'motivo': st.column_config.TextColumn("Motivo", disabled=True),
+        },
+        use_container_width=True,
+        height=400,
+        hide_index=True,
+        key="editor_pendentes_div"
+    )
+
+    # Selecionados
+    selecionados = df_editado[df_editado['✅'] == True]
+    qtd_sel = len(selecionados)
+
+    if qtd_sel > 0:
+        st.info(f"📌 {qtd_sel} venda(s) selecionada(s) para reprocessamento.")
+
+        if st.button("🔄 Reprocessar Divergências Selecionadas", key="btn_repro_div", type="primary"):
+            with st.spinner("Reprocessando com valores ajustados..."):
+                itens = []
+                for _, row_sel in selecionados.iterrows():
+                    itens.append({
+                        'id': row_sel['id'],
+                        'sku': str(row_sel['sku']).strip(),
+                        'sku_original': str(row_sel['sku_original']).strip(),
+                        'valor_venda_efetivo': row_sel['valor_venda_efetivo'],
+                        'comissao': row_sel['comissao'],
+                        'imposto': row_sel['imposto'],
+                        'frete': row_sel['frete'],
+                        'quantidade': row_sel['quantidade'],
+                        'marketplace_origem': row_sel['marketplace_origem'],
+                        'loja_origem': row_sel['loja_origem'],
+                        'numero_pedido': row_sel['numero_pedido'],
+                        'data_venda': pd.to_datetime(row_sel['data_venda'], format='%d/%m/%Y', errors='coerce'),
+                        'codigo_anuncio': row_sel.get('codigo_anuncio', ''),
+                        'arquivo_origem': '',
+                    })
+
+                resultado = reprocessar_pendentes_manual(engine, itens)
+
+                if resultado['sucesso'] > 0:
+                    st.success(f"✅ {resultado['mensagem']}")
+
+                    try:
+                        recalcular_curva_abc(engine, dias=30)
+                    except:
+                        pass
+
+                    st.rerun()
+                else:
+                    st.error(f"❌ {resultado['mensagem']}")
+
+
+def _exibir_historico_reprocessados(engine):
+    """Exibe histórico de vendas reprocessadas e revisadas manualmente."""
+
+    with st.expander("✅ Histórico de vendas reprocessadas / revisadas", expanded=False):
+        # Buscar reprocessados (por SKU) e revisados manualmente
         df_repro = buscar_pendentes(engine, status='Reprocessado')
+        df_revisado = buscar_pendentes(engine, status='Revisado manualmente')
 
-        if not df_repro.empty:
-            df_repro_exibir = df_repro[[
+        df_historico = pd.concat([df_repro, df_revisado], ignore_index=True)
+
+        if not df_historico.empty:
+            df_hist_exibir = df_historico[[
                 'sku', 'numero_pedido', 'data_venda', 'loja_origem',
-                'marketplace_origem', 'valor_venda_efetivo'
+                'marketplace_origem', 'valor_venda_efetivo', 'status', 'motivo'
             ]].copy()
 
-            df_repro_exibir['data_venda'] = pd.to_datetime(
-                df_repro_exibir['data_venda'], errors='coerce'
+            df_hist_exibir['data_venda'] = pd.to_datetime(
+                df_hist_exibir['data_venda'], errors='coerce'
             ).dt.strftime('%d/%m/%Y').fillna('-')
 
-            df_repro_exibir['valor_venda_efetivo'] = df_repro_exibir['valor_venda_efetivo'].apply(
-                formatar_valor
-            )
+            df_hist_exibir['valor_venda_efetivo'] = df_hist_exibir['valor_venda_efetivo'].apply(formatar_valor)
 
-            st.dataframe(df_repro_exibir, use_container_width=True, height=300, hide_index=True)
-            st.caption(f"Total: {len(df_repro)} venda(s) reprocessada(s)")
+            st.dataframe(df_hist_exibir, use_container_width=True, height=300, hide_index=True)
+            st.caption(f"Total: {len(df_historico)} venda(s) processada(s)")
         else:
-            st.info("Nenhuma venda reprocessada ainda.")
+            st.info("Nenhuma venda reprocessada ou revisada ainda.")
 
 
 # ============================================================
