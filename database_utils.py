@@ -1,6 +1,6 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 2.3 (11/03/2026) - RESTAURAÇÃO DE FUNÇÕES PENDENTES
+Versão: 2.4 (11/03/2026) - FIX: Agregação de lojas em pendentes_resumo
 """
 
 from sqlalchemy import create_engine, text
@@ -100,7 +100,7 @@ def buscar_duplicatas_loja(engine, loja):
         return set()
 
 # ============================================================
-# VENDAS PENDENTES (RESTAURADO)
+# VENDAS PENDENTES
 # ============================================================
 
 def gravar_venda_pendente(cursor, dados):
@@ -145,16 +145,28 @@ def buscar_pendentes(engine, sku=None, marketplace=None, status='Pendente'):
         return pd.DataFrame()
 
 def buscar_pendentes_resumo(engine):
-    """Retorna resumo de pendentes por SKU"""
-    query = """
-        SELECT sku, COUNT(*) as total_vendas, SUM(valor_venda_efetivo) as receita_total,
-               STRING_AGG(DISTINCT marketplace_origem, ', ') as marketplaces,
-               MIN(data_venda) as primeira_venda
-        FROM fact_vendas_pendentes WHERE status = 'Pendente'
-        GROUP BY sku ORDER BY total_vendas DESC
     """
-    try: return pd.read_sql(query, engine)
-    except Exception: return pd.DataFrame()
+    Retorna resumo de pendentes por SKU.
+    CORREÇÃO: Incluída a agregação de lojas para evitar KeyError.
+    """
+    query = """
+        SELECT 
+            sku, 
+            COUNT(*) as total_vendas, 
+            SUM(valor_venda_efetivo) as receita_total,
+            STRING_AGG(DISTINCT marketplace_origem, ', ') as marketplaces,
+            STRING_AGG(DISTINCT loja_origem, ', ') as lojas,
+            MIN(data_venda) as primeira_venda
+        FROM fact_vendas_pendentes 
+        WHERE status = 'Pendente'
+        GROUP BY sku 
+        ORDER BY total_vendas DESC
+    """
+    try: 
+        return pd.read_sql(query, engine)
+    except Exception as e:
+        st.error(f"Erro ao buscar resumo de pendentes: {e}")
+        return pd.DataFrame()
 
 def reprocessar_pendentes_por_sku(engine, sku):
     """Reprocessa vendas pendentes após cadastro de SKU"""
