@@ -1,8 +1,15 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
 Interface principal para upload e processamento de vendas
-VERSÃO: Mercado Livre + Shopee
-CORREÇÕES 09/03/2026:
+
+VERSÃO 2.0 (10/03/2026):
+  - Tab 2: Filtros por loja e SKU adicionados
+  - Tab 4: Vendas Pendentes (SKUs não cadastrados) com reprocessamento por SKU
+  - Proteção contra duplicatas: mensagem com contagem de ignoradas
+  - Recálculo automático da Curva ABC após gravação (30 dias)
+  - Mensagens de resultado expandidas (duplicatas, pendentes)
+
+VERSÃO anterior:
   - Histórico: datas convertidas para formato banco antes de gravar log
   - Deletar vendas: agora permite selecionar vendas individuais
   - Download Excel: datas garantidas em dd/mm/aaaa
@@ -15,7 +22,14 @@ import io
 
 # Imports dos módulos
 from formatadores import formatar_valor, formatar_percentual, formatar_quantidade
-from database_utils import get_engine, gravar_log_upload
+from database_utils import (
+    get_engine,
+    gravar_log_upload,
+    buscar_pendentes,
+    buscar_pendentes_resumo,
+    reprocessar_pendentes_por_sku,
+    recalcular_curva_abc,
+)
 from processar_ml import processar_arquivo_ml, gravar_vendas_ml
 from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 
@@ -212,20 +226,20 @@ def tab_processar_upload(engine):
 
             with st.spinner("Gravando vendas no banco..."):
 
-                # Gravar vendas no processador correto
+                # Gravar vendas no processador correto (RETORNO EXPANDIDO v2.0)
                 if mp_key == 'ML':
-                    registros, erros, skus_invalidos = gravar_vendas_ml(
+                    registros, erros, skus_invalidos, duplicatas, pendentes = gravar_vendas_ml(
                         df_proc, mktp, loja, arquivo_nome, engine
                     )
                 elif mp_key == 'SHOPEE':
-                    registros, erros, skus_invalidos = gravar_vendas_shopee(
+                    registros, erros, skus_invalidos, duplicatas, pendentes = gravar_vendas_shopee(
                         df_proc, mktp, loja, arquivo_nome, engine
                     )
                 else:
                     st.error("⚠️ Processador não identificado para gravação.")
                     return
 
-                # CORREÇÃO: Gravar log de importação com datas no formato do banco
+                # GRAVAR LOG DE IMPORTAÇÃO
                 try:
                     conn   = engine.raw_connection()
                     cursor = conn.cursor()
@@ -255,19 +269,43 @@ def tab_processar_upload(engine):
                 except Exception as e:
                     st.error(f"⚠️ Erro ao gravar log de importação: {e}")
 
-                # Mensagens de resultado
+                # MENSAGENS DE RESULTADO (expandidas v2.0)
                 if registros > 0:
                     st.success(f"✅ {registros} vendas gravadas com sucesso!")
                     st.balloons()
 
+                if duplicatas > 0:
+                    st.info(f"🔄 {duplicatas} venda(s) ignorada(s) — já existiam no banco (duplicatas)")
+
+                if pendentes > 0:
+                    st.warning(
+                        f"⏳ {pendentes} venda(s) salva(s) como **pendentes** "
+                        f"(SKU não cadastrado). Vá na tab 'Vendas Pendentes' para reprocessar."
+                    )
+
                 if erros > 0:
-                    st.warning(f"⚠️ {erros} linha(s) com erro (SKU inválido ou duplicata)")
+                    st.warning(f"⚠️ {erros} linha(s) com erro")
 
                 if skus_invalidos:
                     lista_skus = ', '.join(sorted(list(skus_invalidos))[:10])
                     if len(skus_invalidos) > 10:
                         lista_skus += f" ... (+{len(skus_invalidos) - 10} SKUs)"
-                    st.error(f"❌ SKUs não cadastrados no sistema: {lista_skus}")
+                    st.error(f"❌ SKUs não cadastrados: {lista_skus}")
+
+                # RECALCULAR CURVA ABC (automático, 30 dias)
+                if registros > 0:
+                    try:
+                        resultado_abc = recalcular_curva_abc(engine, dias=30)
+                        if resultado_abc['total_anuncios'] > 0:
+                            st.info(
+                                f"📊 Curva ABC atualizada: "
+                                f"{resultado_abc['a']} anúncio(s) A, "
+                                f"{resultado_abc['b']} B, "
+                                f"{resultado_abc['c']} C "
+                                f"(últimos 30 dias)"
+                            )
+                    except Exception:
+                        pass  # Não bloquear gravação se ABC falhar
 
                 # Limpar session_state
                 for key in ['df_proc', 'info', 'mktp', 'mp_key', 'loja', 'arquivo_nome']:
@@ -275,7 +313,7 @@ def tab_processar_upload(engine):
 
 
 # ============================================================
-# TAB 2: VENDAS CONSOLIDADAS
+# TAB 2: VENDAS CONSOLIDADAS (com filtros loja e SKU)
 # ============================================================
 
 def tab_vendas_consolidadas(engine):
@@ -283,8 +321,8 @@ def tab_vendas_consolidadas(engine):
 
     st.subheader("📊 Vendas Consolidadas")
 
-    # Filtros de período
-    col1, col2, col3, col4 = st.columns(4)
+    # FILTROS DE PERÍODO
+    col1, col2, col3 = st.columns(3)
 
     periodo = col1.selectbox(
         "Período:",
@@ -309,23 +347,38 @@ def tab_vendas_consolidadas(engine):
     else:
         data_ini = col2.date_input("De:", hoje - timedelta(days=30))
         data_fim = col3.date_input("Até:", hoje)
-        # NOTA: st.date_input não suporta formato customizado.
-        # As datas são exibidas no formato do sistema, mas funcionam corretamente.
-        # Exibir confirmação visual em formato BR:
         col2.caption(f"Selecionado: {data_ini.strftime('%d/%m/%Y')}")
         col3.caption(f"Selecionado: {data_fim.strftime('%d/%m/%Y')}")
 
-    # Filtro de marketplace
-    df_lojas     = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
-    mktp_filtro  = col4.selectbox("Marketplace:", ["Todos"] + df_lojas['marketplace'].tolist())
+    # FILTROS: MARKETPLACE, LOJA, SKU
+    col_f1, col_f2, col_f3 = st.columns(3)
 
-    # Query principal
+    # Marketplace
+    df_lojas     = pd.read_sql("SELECT DISTINCT marketplace, loja FROM dim_lojas", engine)
+    mktp_filtro  = col_f1.selectbox("Marketplace:", ["Todos"] + sorted(df_lojas['marketplace'].unique().tolist()))
+
+    # Loja (depende do marketplace selecionado)
+    if mktp_filtro != "Todos":
+        lojas_disponiveis = df_lojas[df_lojas['marketplace'] == mktp_filtro]['loja'].tolist()
+    else:
+        lojas_disponiveis = df_lojas['loja'].tolist()
+    loja_filtro = col_f2.selectbox("Loja:", ["Todas"] + sorted(lojas_disponiveis))
+
+    # SKU (campo de texto para busca)
+    sku_filtro = col_f3.text_input("Filtrar por SKU:", placeholder="Ex: L-0321")
+
+    # QUERY PRINCIPAL
     query = (
         f"SELECT * FROM fact_vendas_snapshot "
         f"WHERE data_venda BETWEEN '{data_ini}' AND '{data_fim}'"
     )
     if mktp_filtro != "Todos":
         query += f" AND marketplace_origem = '{mktp_filtro}'"
+    if loja_filtro != "Todas":
+        query += f" AND loja_origem = '{loja_filtro}'"
+    if sku_filtro.strip():
+        # Busca parcial (contém)
+        query += f" AND sku ILIKE '%{sku_filtro.strip()}%'"
 
     try:
         df_vendas = pd.read_sql(query, engine)
@@ -333,7 +386,7 @@ def tab_vendas_consolidadas(engine):
         df_vendas = pd.DataFrame()
 
     if df_vendas.empty:
-        st.warning("⚠️ Nenhuma venda encontrada no período selecionado.")
+        st.warning("⚠️ Nenhuma venda encontrada com os filtros selecionados.")
         return
 
     # Separar com/sem custo
@@ -351,6 +404,10 @@ def tab_vendas_consolidadas(engine):
     )
     if mktp_filtro != "Todos":
         query_ant += f" AND marketplace_origem = '{mktp_filtro}'"
+    if loja_filtro != "Todas":
+        query_ant += f" AND loja_origem = '{loja_filtro}'"
+    if sku_filtro.strip():
+        query_ant += f" AND sku ILIKE '%{sku_filtro.strip()}%'"
 
     try:
         df_ant           = pd.read_sql(query_ant, engine)
@@ -402,8 +459,8 @@ def tab_vendas_consolidadas(engine):
 
     st.dataframe(
         df_display[[
-            'data_venda', 'numero_pedido', 'sku', 'codigo_anuncio', 'quantidade',
-            'valor_venda_efetivo', 'custo_total', 'margem_percentual'
+            'data_venda', 'loja_origem', 'numero_pedido', 'sku', 'codigo_anuncio',
+            'quantidade', 'valor_venda_efetivo', 'custo_total', 'margem_percentual'
         ]],
         use_container_width=True,
         height=600
@@ -414,7 +471,7 @@ def tab_vendas_consolidadas(engine):
         buffer   = io.BytesIO()
         df_excel = df_vendas.copy()
 
-        # CORREÇÃO: Garantir data em dd/mm/aaaa no Excel
+        # Garantir data em dd/mm/aaaa no Excel
         df_excel['data_venda'] = pd.to_datetime(df_excel['data_venda']).dt.strftime('%d/%m/%Y')
 
         # Formatar valores monetários com vírgula decimal (padrão BR)
@@ -540,10 +597,12 @@ def tab_vendas_consolidadas(engine):
                 "Use apenas em casos extremos!"
             )
 
+            df_lojas_del = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
+
             col_del1, col_del2 = st.columns(2)
             confirm_delete  = col_del1.text_input("Digite 'DELETAR' para confirmar:")
             marketplace_del = col_del2.selectbox(
-                "Marketplace a deletar:", [""] + df_lojas['marketplace'].tolist()
+                "Marketplace a deletar:", [""] + df_lojas_del['marketplace'].tolist()
             )
 
             if st.button("🗑️ DELETAR TODAS DO MARKETPLACE", type="secondary"):
@@ -635,6 +694,136 @@ CREATE TABLE IF NOT EXISTS log_uploads (
 
 
 # ============================================================
+# TAB 4: VENDAS PENDENTES (NOVO v2.0)
+# ============================================================
+
+def tab_vendas_pendentes(engine):
+    """
+    Tab 4: Vendas com SKU não cadastrado.
+    Permite visualizar e reprocessar após cadastro do SKU.
+    Reprocessamento por SKU individual.
+    """
+
+    st.subheader("⏳ Vendas Pendentes (SKU não cadastrado)")
+
+    st.markdown(
+        "Vendas que foram importadas mas cujo SKU não existia em **dim_produtos** "
+        "no momento do upload. Cadastre o SKU no módulo **Gestão de SKUs** e "
+        "clique em **Reprocessar** para gravá-las."
+    )
+
+    # RESUMO POR SKU
+    df_resumo = buscar_pendentes_resumo(engine)
+
+    if df_resumo.empty:
+        st.success("✅ Nenhuma venda pendente! Todos os SKUs estão cadastrados.")
+        return
+
+    # Indicadores
+    col1, col2, col3 = st.columns(3)
+    total_vendas = int(df_resumo['total_vendas'].sum())
+    total_skus = len(df_resumo)
+    receita_total = df_resumo['receita_total'].sum()
+
+    col1.metric("SKUs Pendentes", formatar_quantidade(total_skus))
+    col2.metric("Vendas Pendentes", formatar_quantidade(total_vendas))
+    col3.metric("Receita Não Contabilizada", formatar_valor(receita_total))
+
+    st.divider()
+
+    # TABELA DE SKUs PENDENTES COM BOTÃO REPROCESSAR
+    st.markdown("### SKUs aguardando cadastro")
+
+    for _, row_resumo in df_resumo.iterrows():
+        sku = row_resumo['sku']
+        qtd = int(row_resumo['total_vendas'])
+        receita = float(row_resumo['receita_total'])
+        mktps = row_resumo['marketplaces']
+        lojas = row_resumo['lojas']
+
+        # Formatar datas
+        try:
+            primeira = pd.to_datetime(row_resumo['primeira_venda']).strftime('%d/%m/%Y')
+            ultima = pd.to_datetime(row_resumo['ultima_venda']).strftime('%d/%m/%Y')
+            periodo_txt = f"{primeira} a {ultima}"
+        except:
+            periodo_txt = "-"
+
+        # Card do SKU
+        with st.container():
+            col_info, col_btn = st.columns([4, 1])
+
+            col_info.markdown(
+                f"**{sku}** — {qtd} venda(s), {formatar_valor(receita)} receita | "
+                f"{mktps} | {lojas} | Período: {periodo_txt}"
+            )
+
+            # Botão reprocessar com key única
+            if col_btn.button("🔄 Reprocessar", key=f"repro_{sku}", use_container_width=True):
+                with st.spinner(f"Reprocessando {sku}..."):
+                    resultado = reprocessar_pendentes_por_sku(engine, sku)
+
+                    if resultado['sucesso'] > 0:
+                        st.success(f"✅ {resultado['mensagem']}")
+
+                        # Recalcular ABC após reprocessamento
+                        try:
+                            recalcular_curva_abc(engine, dias=30)
+                        except:
+                            pass
+
+                        st.rerun()
+                    elif resultado['erros'] > 0:
+                        st.warning(f"⚠️ {resultado['mensagem']}")
+                    else:
+                        st.error(f"❌ {resultado['mensagem']}")
+
+            st.markdown("---")
+
+    # DETALHES EXPANDÍVEIS
+    with st.expander("📋 Ver todas as vendas pendentes em detalhe", expanded=False):
+        df_todas = buscar_pendentes(engine, status='Pendente')
+
+        if not df_todas.empty:
+            df_exibir = df_todas[[
+                'sku', 'numero_pedido', 'data_venda', 'loja_origem',
+                'marketplace_origem', 'valor_venda_efetivo', 'codigo_anuncio'
+            ]].copy()
+
+            # Formatar
+            df_exibir['data_venda'] = pd.to_datetime(
+                df_exibir['data_venda'], errors='coerce'
+            ).dt.strftime('%d/%m/%Y').fillna('-')
+
+            df_exibir['valor_venda_efetivo'] = df_exibir['valor_venda_efetivo'].apply(formatar_valor)
+
+            st.dataframe(df_exibir, use_container_width=True, height=400, hide_index=True)
+
+    # HISTÓRICO DE REPROCESSADOS
+    with st.expander("✅ Ver vendas já reprocessadas", expanded=False):
+        df_repro = buscar_pendentes(engine, status='Reprocessado')
+
+        if not df_repro.empty:
+            df_repro_exibir = df_repro[[
+                'sku', 'numero_pedido', 'data_venda', 'loja_origem',
+                'marketplace_origem', 'valor_venda_efetivo'
+            ]].copy()
+
+            df_repro_exibir['data_venda'] = pd.to_datetime(
+                df_repro_exibir['data_venda'], errors='coerce'
+            ).dt.strftime('%d/%m/%Y').fillna('-')
+
+            df_repro_exibir['valor_venda_efetivo'] = df_repro_exibir['valor_venda_efetivo'].apply(
+                formatar_valor
+            )
+
+            st.dataframe(df_repro_exibir, use_container_width=True, height=300, hide_index=True)
+            st.caption(f"Total: {len(df_repro)} venda(s) reprocessada(s)")
+        else:
+            st.info("Nenhuma venda reprocessada ainda.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -645,10 +834,11 @@ def main():
 
     engine = get_engine()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📤 Processar Upload",
         "📊 Vendas Consolidadas",
-        "📚 Histórico"
+        "📚 Histórico",
+        "⏳ Vendas Pendentes"
     ])
 
     with tab1:
@@ -659,6 +849,9 @@ def main():
 
     with tab3:
         tab_historico_uploads(engine)
+
+    with tab4:
+        tab_vendas_pendentes(engine)
 
 
 if __name__ == "__main__":
