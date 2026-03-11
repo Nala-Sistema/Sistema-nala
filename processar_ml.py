@@ -9,16 +9,28 @@ Processa arquivos de vendas do Mercado Livre
 - VERSÃO FINAL: Todos bugs corrigidos
 - CORREÇÃO 09/03/2026: codigo_anuncio agora mapeia com e sem acento
 - CORREÇÃO 10/03/2026: rollback individual com SAVEPOINT (não perde vendas já gravadas)
+
+VERSÃO 2.0 (10/03/2026):
+  - Proteção contra duplicatas: pré-carrega (pedido, sku) existentes
+  - Vendas pendentes: SKU não cadastrado vai para fact_vendas_pendentes (não descarta)
+  - FLEX dinâmico: custo lido de dim_lojas.custo_flex (fallback R$ 12,90)
+  - Retorno expandido: (registros, erros, skus_invalidos, duplicatas, pendentes)
 """
 
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 from formatadores import converter_data_ml, limpar_numero
-from database_utils import buscar_custos_skus, buscar_skus_validos
+from database_utils import (
+    buscar_custos_skus,
+    buscar_skus_validos,
+    buscar_duplicatas_loja,
+    gravar_venda_pendente,
+    buscar_custo_flex,
+)
 
-# CONFIGURAÇÃO FLEX (editável)
-CUSTO_FLEX_ML = 12.90  # Custo fixo transportadora FLEX
+# CONFIGURAÇÃO FLEX (fallback caso dim_lojas.custo_flex esteja vazio)
+CUSTO_FLEX_ML_PADRAO = 12.90
 
 
 def detectar_header_ml(arquivo):
@@ -109,6 +121,8 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     """
     Processa arquivo Excel do Mercado Livre.
 
+    VERSÃO 2.0: custo FLEX lido de dim_lojas.custo_flex (fallback R$ 12,90).
+
     Retorna:
         df_processado, info_dict ou None, erro_msg
     """
@@ -131,9 +145,13 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         return None, f"Colunas obrigatórias não encontradas: {colunas_obrigatorias}"
 
     # 5. CORRIGIDO: FORÇAR REFRESH DE CUSTOS (evitar cache antigo)
-    # Adiciona timestamp para forçar nova query
     timestamp = datetime.now().timestamp()
     custos_dict = buscar_custos_skus(engine, force_refresh=timestamp)
+
+    # 5b. BUSCAR CUSTO FLEX DINÂMICO
+    custo_flex = buscar_custo_flex(engine, loja)
+    if custo_flex is None:
+        custo_flex = CUSTO_FLEX_ML_PADRAO
 
     # 6. PROCESSAR VENDAS
     vendas = []
@@ -196,7 +214,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # CALCULAR FRETE E IMPOSTO
             if is_flex:
                 # FLEX: Custo líquido (transportadora - cliente pagou)
-                custo_frete = CUSTO_FLEX_ML - receita_envio
+                custo_frete = custo_flex - receita_envio
                 imposto_val = 0.0  # SEM imposto no FLEX
             else:
                 # NORMAL: Frete líquido
@@ -287,30 +305,41 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
 def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
     """
     Grava vendas do ML no banco com validação de SKU e barra de progresso.
+
+    VERSÃO 2.0:
+    - Proteção contra duplicatas: pré-carrega (pedido, sku) existentes da loja
+    - Vendas pendentes: SKU não cadastrado vai para fact_vendas_pendentes
+    - Retorno expandido com contadores de duplicatas e pendentes
+
     CORREÇÃO 10/03/2026: Usa SAVEPOINT para rollback individual.
     Um erro em uma venda NÃO apaga as vendas já gravadas.
 
     Retorna:
-        registros_gravados, erros, skus_invalidos
+        (registros_gravados, erros, skus_invalidos, duplicatas_count, pendentes_count)
     """
 
     # 1. BUSCAR SKUs VÁLIDOS
     skus_validos = buscar_skus_validos(engine)
 
-    # 2. PREPARAR GRAVAÇÃO
+    # 2. CARREGAR DUPLICATAS EXISTENTES (proteção contra reimportação)
+    duplicatas_existentes = buscar_duplicatas_loja(engine, loja)
+
+    # 3. PREPARAR GRAVAÇÃO
     conn = engine.raw_connection()
     cursor = conn.cursor()
 
     registros = 0
     erros = 0
     skus_invalidos = set()
+    duplicatas_count = 0
+    pendentes_count = 0
 
-    # 3. BARRA DE PROGRESSO
+    # 4. BARRA DE PROGRESSO
     total = len(df_vendas)
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 4. PROCESSAR CADA VENDA
+    # 5. PROCESSAR CADA VENDA
     for idx, row in df_vendas.iterrows():
         try:
             # Atualizar progresso
@@ -324,10 +353,60 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
                 erros += 1
                 continue
 
+            pedido = str(row['pedido']).strip()
+
+            # ---- PROTEÇÃO DUPLICATA ----
+            chave = (pedido, sku)
+            if chave in duplicatas_existentes:
+                duplicatas_count += 1
+                continue
+
+            # ---- SKU NÃO CADASTRADO → SALVAR COMO PENDENTE ----
             if sku not in skus_validos:
                 skus_invalidos.add(sku)
-                erros += 1
+
+                # Preparar dados para venda pendente
+                data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
+                receita = float(row['receita'])
+                tarifa = float(row['tarifa'])
+                imposto_val = float(row['imposto'])
+                frete = float(row['frete'])
+                qtd = int(row['qtd'])
+                preco_venda = receita / qtd if qtd > 0 else receita
+                total_tarifas = tarifa + frete
+                valor_liquido = receita - total_tarifas - imposto_val
+                codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
+
+                dados_pendente = {
+                    'marketplace_origem': marketplace,
+                    'loja_origem': loja,
+                    'numero_pedido': pedido,
+                    'data_venda': data_venda,
+                    'sku': sku,
+                    'codigo_anuncio': codigo_anuncio,
+                    'quantidade': qtd,
+                    'preco_venda': preco_venda,
+                    'desconto_parceiro': 0,
+                    'desconto_marketplace': 0,
+                    'valor_venda_efetivo': receita,
+                    'imposto': imposto_val,
+                    'comissao': tarifa,
+                    'frete': frete,
+                    'tarifa_fixa': 0,
+                    'outros_custos': 0,
+                    'total_tarifas': total_tarifas,
+                    'valor_liquido': valor_liquido,
+                    'arquivo_origem': arquivo_nome,
+                }
+
+                if gravar_venda_pendente(cursor, dados_pendente):
+                    pendentes_count += 1
+                else:
+                    erros += 1
+
                 continue
+
+            # ---- GRAVAÇÃO NORMAL ----
 
             # Preparar dados
             data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
@@ -335,7 +414,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             receita = float(row['receita'])
             custo_total = float(row['custo'])
             tarifa = float(row['tarifa'])
-            imposto = float(row['imposto'])
+            imposto_val = float(row['imposto'])
             frete = float(row['frete'])
             margem = float(row['margem'])
             margem_pct = float(row['margem_pct'])
@@ -347,7 +426,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
             total_tarifas = tarifa + frete
-            valor_liquido = receita - total_tarifas - imposto
+            valor_liquido = receita - total_tarifas - imposto_val
 
             # SAVEPOINT: se der erro nessa venda, só desfaz ela
             cursor.execute(f"SAVEPOINT venda_{idx}")
@@ -368,10 +447,10 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             """
 
             cursor.execute(sql, (
-                marketplace, loja, row['pedido'], data_venda, sku,
+                marketplace, loja, pedido, data_venda, sku,
                 codigo_anuncio,
                 qtd, preco_venda, 0, 0,
-                receita, custo_unit, custo_total, imposto, tarifa,
+                receita, custo_unit, custo_total, imposto_val, tarifa,
                 frete, 0, 0, total_tarifas, valor_liquido,
                 margem, margem_pct, arquivo_nome
             ))
@@ -380,26 +459,32 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine):
             cursor.execute(f"RELEASE SAVEPOINT venda_{idx}")
             registros += 1
 
+            # Adicionar ao set de duplicatas (evita duplicata intra-arquivo)
+            duplicatas_existentes.add(chave)
+
         except Exception as e:
             # ROLLBACK só desta venda, não de todas
-            cursor.execute(f"ROLLBACK TO SAVEPOINT venda_{idx}")
+            try:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT venda_{idx}")
+            except:
+                pass
             erros += 1
             if erros == 1:
                 st.warning(f"Primeiro erro: {str(e)[:200]}")
 
-    # 5. COMMIT FINAL (todas as vendas que deram certo)
+    # 6. COMMIT FINAL (todas as vendas que deram certo + pendentes)
     try:
         conn.commit()
     except Exception as e:
         conn.rollback()
         st.error(f"Erro no commit final: {e}")
 
-    # 6. FECHAR CONEXÃO
+    # 7. FECHAR CONEXÃO
     cursor.close()
     conn.close()
 
-    # 7. LIMPAR BARRA
+    # 8. LIMPAR BARRA
     progress_bar.empty()
     status_text.empty()
 
-    return registros, erros, skus_invalidos
+    return registros, erros, skus_invalidos, duplicatas_count, pendentes_count
