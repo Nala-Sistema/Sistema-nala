@@ -156,29 +156,40 @@ def _tab_amazon(engine):
             try:
                 df_import = pd.read_excel(arquivo_amz)
 
+                # Mostrar preview do que foi lido
+                st.info(f"📄 Arquivo lido: {len(df_import)} linhas, colunas: {list(df_import.columns)}")
+
                 # Validar colunas mínimas
                 colunas_esperadas = {'asin', 'sku'}
                 if not colunas_esperadas.issubset(set(df_import.columns)):
-                    st.error(f"❌ Colunas obrigatórias não encontradas: {colunas_esperadas}")
+                    st.error(
+                        f"❌ Colunas obrigatórias não encontradas. "
+                        f"Esperado: {colunas_esperadas}. "
+                        f"Encontrado: {set(df_import.columns)}"
+                    )
                 else:
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
                     importados = 0
                     erros_imp = 0
+                    primeiro_erro = None
 
                     for _, row in df_import.iterrows():
                         try:
                             asin = str(row.get('asin', '')).strip()
                             sku = str(row.get('sku', '')).strip()
 
-                            if not asin or not sku:
+                            if not asin or not sku or asin == 'nan' or sku == 'nan':
                                 erros_imp += 1
                                 continue
 
                             logistica = str(row.get('logistica', 'FBA')).strip()
-                            comissao = float(str(row.get('comissao_percentual', 0)).replace(',', '.'))
-                            taxa = float(str(row.get('taxa_fixa', 0)).replace(',', '.'))
-                            frete = float(str(row.get('frete_estimado', 0)).replace(',', '.'))
+                            if logistica == 'nan':
+                                logistica = 'FBA'
+
+                            comissao = float(str(row.get('comissao_percentual', 0)).replace(',', '.') or 0)
+                            taxa = float(str(row.get('taxa_fixa', 0)).replace(',', '.') or 0)
+                            frete = float(str(row.get('frete_estimado', 0)).replace(',', '.') or 0)
 
                             cursor.execute("""
                                 INSERT INTO dim_config_marketplace 
@@ -193,8 +204,10 @@ def _tab_amazon(engine):
                                     frete_estimado=EXCLUDED.frete_estimado
                             """, (asin, sku, logistica, comissao, taxa, frete))
                             importados += 1
-                        except Exception:
+                        except Exception as e:
                             erros_imp += 1
+                            if primeiro_erro is None:
+                                primeiro_erro = str(e)[:300]
 
                     conn.commit()
                     cursor.close()
@@ -203,8 +216,11 @@ def _tab_amazon(engine):
                     if importados > 0:
                         st.success(f"✅ {importados} anúncio(s) importado(s) com sucesso!")
                     if erros_imp > 0:
-                        st.warning(f"⚠️ {erros_imp} linha(s) com erro (ASIN ou SKU vazio)")
-                    st.rerun()
+                        st.warning(f"⚠️ {erros_imp} linha(s) com erro")
+                        if primeiro_erro:
+                            st.error(f"Primeiro erro: {primeiro_erro}")
+                    if importados == 0 and erros_imp == 0:
+                        st.warning("⚠️ Nenhuma linha processada. Verifique se o arquivo tem dados.")
 
             except Exception as e:
                 st.error(f"❌ Erro ao processar arquivo: {e}")
