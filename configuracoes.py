@@ -79,84 +79,84 @@ def _tab_amazon(engine):
     """Configuração de anúncios Amazon (ASINs, taxas, De-Para)"""
 
     s1, s2, s3 = st.tabs(["📋 Lista de Anúncios", "➕ Vincular Manual", "📥 Importar"])
-    cols_amz = ["asin", "sku", "loja", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
+    cols_amz = ["asin", "sku", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
 
+    # ---- LISTA ----
     with s1:
-        df_amz = _query_to_df(engine,
-            """SELECT asin, sku, loja, logistica, 
-                      comissao_percentual, taxa_fixa, frete_estimado 
-               FROM dim_config_marketplace 
-               WHERE marketplace = 'AMAZON'
-               ORDER BY loja, asin"""
-        )
-        if not df_amz.empty:
-            st.dataframe(df_amz, use_container_width=True, hide_index=True)
-        else:
-            st.info("Nenhum anúncio Amazon cadastrado.")
-            st.dataframe(pd.DataFrame(columns=cols_amz), use_container_width=True, hide_index=True)
+        try:
+            conn = engine.raw_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT asin, sku, logistica, comissao_percentual, taxa_fixa, frete_estimado 
+                   FROM dim_config_marketplace 
+                   WHERE marketplace = 'AMAZON'
+                   ORDER BY asin"""
+            )
+            colunas = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            df_amz = pd.DataFrame(rows, columns=colunas)
 
+            if not df_amz.empty:
+                st.success(f"✅ {len(df_amz)} anúncio(s) Amazon cadastrado(s)")
+                st.dataframe(df_amz, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum anúncio Amazon cadastrado.")
+        except Exception as e:
+            st.error(f"Erro ao listar anúncios: {e}")
+
+    # ---- VINCULAR MANUAL ----
     with s2:
         st.subheader("Vincular Manualmente (Amazon)")
 
-        # Buscar lojas Amazon para o seletor
-        df_lojas_amz = _query_to_df(engine,
-            "SELECT loja FROM dim_lojas WHERE UPPER(marketplace) LIKE '%%AMAZON%%' ORDER BY loja"
-        )
-        lojas_amz = df_lojas_amz['loja'].tolist() if not df_lojas_amz.empty else ['AMZ-Nala']
-
         with st.form("f_amz_manual", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3 = st.columns(3)
             f_asin = c1.text_input("ASIN")
             f_sku = c2.text_input("SKU Nala")
-            f_loja = c3.selectbox("Loja", lojas_amz)
-            f_log = c4.selectbox("Logística", ["FBA", "DBA", "Crossdocking"])
+            f_log = c3.selectbox("Logística", ["FBA", "DBA", "Crossdocking"])
 
-            c5, c6, c7 = st.columns(3)
-            f_com = c5.text_input("Comissão %", value="0,00")
-            f_tax = c6.text_input("Taxa Fixa R$", value="0,00")
-            f_fre = c7.text_input("Frete Est. R$", value="0,00")
+            c4, c5, c6 = st.columns(3)
+            f_com = c4.text_input("Comissão %", value="0,00")
+            f_tax = c5.text_input("Taxa Fixa R$", value="0,00")
+            f_fre = c6.text_input("Frete Est. R$", value="0,00")
 
             if st.form_submit_button("💾 Salvar Anúncio Amazon"):
-                try:
-                    conn = engine.raw_connection()
-                    cursor = conn.cursor()
+                if not f_asin.strip() or not f_sku.strip():
+                    st.error("❌ ASIN e SKU são obrigatórios.")
+                else:
+                    try:
+                        conn = engine.raw_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND logistica = %s",
+                            (f_asin.strip(), f_log)
+                        )
+                        cursor.execute("""
+                            INSERT INTO dim_config_marketplace 
+                                (asin, sku, marketplace, loja, logistica, 
+                                 comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+                            VALUES (%s, %s, 'AMAZON', 'AMAZON', %s, %s, %s, %s, TRUE, CURRENT_DATE)
+                        """, (
+                            f_asin.strip(), f_sku.strip(), f_log,
+                            float(f_com.replace(',', '.')),
+                            float(f_tax.replace(',', '.')),
+                            float(f_fre.replace(',', '.'))
+                        ))
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        st.success("Vinculado com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
 
-                    cursor.execute(
-                        "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND loja = %s",
-                        (f_asin, f_loja)
-                    )
-                    cursor.execute("""
-                        INSERT INTO dim_config_marketplace 
-                            (asin, sku, marketplace, loja, logistica, 
-                             comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
-                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE, CURRENT_DATE)
-                    """, (
-                        f_asin, f_sku, f_loja, f_log,
-                        float(f_com.replace(',', '.')),
-                        float(f_tax.replace(',', '.')),
-                        float(f_fre.replace(',', '.'))
-                    ))
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
-                    st.success("Vinculado com sucesso!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao salvar: {e}")
-
+    # ---- IMPORTAÇÃO MASSIVA ----
     with s3:
         st.subheader("📥 Importação Massiva Amazon")
 
-        # Seletor de loja (aplica a todas as linhas importadas)
-        df_lojas_amz_imp = _query_to_df(engine,
-            "SELECT loja FROM dim_lojas WHERE UPPER(marketplace) LIKE '%%AMAZON%%' ORDER BY loja"
-        )
-        lojas_amz_imp = df_lojas_amz_imp['loja'].tolist() if not df_lojas_amz_imp.empty else ['AMZ-Nala']
-        loja_import = st.selectbox("Loja destino:", lojas_amz_imp, key="sel_loja_import_amz")
-
-        # Template para download
-        cols_template = ["asin", "sku", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
-        tmpl_amz = pd.DataFrame(columns=cols_template)
+        # Template
+        tmpl_amz = pd.DataFrame(columns=cols_amz)
         buf_amz = io.BytesIO()
         with pd.ExcelWriter(buf_amz, engine='openpyxl') as wr:
             tmpl_amz.to_excel(wr, index=False)
@@ -170,25 +170,25 @@ def _tab_amazon(engine):
         if arquivo_amz and st.button("📥 Processar Importação Amazon", type="primary"):
             try:
                 df_import = pd.read_excel(arquivo_amz)
-
                 st.info(f"📄 Arquivo lido: {len(df_import)} linhas, colunas: {list(df_import.columns)}")
 
                 colunas_esperadas = {'asin', 'sku'}
                 if not colunas_esperadas.issubset(set(df_import.columns)):
-                    st.error(
-                        f"❌ Colunas obrigatórias não encontradas. "
-                        f"Esperado: {colunas_esperadas}. "
-                        f"Encontrado: {set(df_import.columns)}"
-                    )
+                    st.error(f"❌ Colunas obrigatórias: {colunas_esperadas}. Encontrado: {set(df_import.columns)}")
                 else:
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
                     importados = 0
+                    atualizados = 0
                     erros_imp = 0
                     primeiro_erro = None
 
+                    # Barra de progresso
+                    total = len(df_import)
+                    progress = st.progress(0)
+                    status = st.empty()
+
                     def _safe_float(val, default=0.0):
-                        """Converte para float tratando NaN, None, vazio"""
                         try:
                             s = str(val).replace(',', '.').strip()
                             if s in ('nan', '', 'None', 'none'):
@@ -197,7 +197,10 @@ def _tab_amazon(engine):
                         except (ValueError, TypeError):
                             return default
 
-                    for _, row in df_import.iterrows():
+                    for i, (_, row) in enumerate(df_import.iterrows()):
+                        progress.progress(min((i + 1) / total, 1.0))
+                        status.text(f"Processando {i + 1} de {total}...")
+
                         try:
                             asin = str(row.get('asin', '')).strip()
                             sku = str(row.get('sku', '')).strip()
@@ -214,17 +217,23 @@ def _tab_amazon(engine):
                             taxa = _safe_float(row.get('taxa_fixa', 0))
                             frete = _safe_float(row.get('frete_estimado', 0))
 
+                            # DELETE por ASIN+logistica (permite mesmo ASIN com FBA e DBA)
                             cursor.execute(
-                                "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND loja = %s",
-                                (asin, loja_import)
+                                "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND logistica = %s",
+                                (asin, logistica)
                             )
+                            deletados = cursor.rowcount
+                            if deletados > 0:
+                                atualizados += deletados
+
                             cursor.execute("""
                                 INSERT INTO dim_config_marketplace 
                                     (asin, sku, marketplace, loja, logistica, 
                                      comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
-                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE, CURRENT_DATE)
-                            """, (asin, sku, loja_import, logistica, comissao, taxa, frete))
+                                VALUES (%s, %s, 'AMAZON', 'AMAZON', %s, %s, %s, %s, TRUE, CURRENT_DATE)
+                            """, (asin, sku, logistica, comissao, taxa, frete))
                             importados += 1
+
                         except Exception as e:
                             erros_imp += 1
                             if primeiro_erro is None:
@@ -233,9 +242,13 @@ def _tab_amazon(engine):
                     conn.commit()
                     cursor.close()
                     conn.close()
+                    progress.empty()
+                    status.empty()
 
                     if importados > 0:
-                        st.success(f"✅ {importados} anúncio(s) importado(s) para {loja_import}!")
+                        st.success(f"✅ {importados} anúncio(s) importado(s)!")
+                    if atualizados > 0:
+                        st.info(f"🔄 {atualizados} anúncio(s) atualizado(s) (já existiam)")
                     if erros_imp > 0:
                         st.warning(f"⚠️ {erros_imp} linha(s) com erro")
                         if primeiro_erro:
