@@ -79,15 +79,15 @@ def _tab_amazon(engine):
     """Configuração de anúncios Amazon (ASINs, taxas, De-Para)"""
 
     s1, s2, s3 = st.tabs(["📋 Lista de Anúncios", "➕ Vincular Manual", "📥 Importar"])
-    cols_amz = ["asin", "sku", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
+    cols_amz = ["asin", "sku", "loja", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
 
     with s1:
         df_amz = _query_to_df(engine,
-            """SELECT asin, sku, logistica, 
+            """SELECT asin, sku, loja, logistica, 
                       comissao_percentual, taxa_fixa, frete_estimado 
                FROM dim_config_marketplace 
                WHERE marketplace = 'AMAZON'
-               ORDER BY asin"""
+               ORDER BY loja, asin"""
         )
         if not df_amz.empty:
             st.dataframe(df_amz, use_container_width=True, hide_index=True)
@@ -97,34 +97,41 @@ def _tab_amazon(engine):
 
     with s2:
         st.subheader("Vincular Manualmente (Amazon)")
+
+        # Buscar lojas Amazon para o seletor
+        df_lojas_amz = _query_to_df(engine,
+            "SELECT loja FROM dim_lojas WHERE UPPER(marketplace) LIKE '%%AMAZON%%' ORDER BY loja"
+        )
+        lojas_amz = df_lojas_amz['loja'].tolist() if not df_lojas_amz.empty else ['AMZ-Nala']
+
         with st.form("f_amz_manual", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             f_asin = c1.text_input("ASIN")
             f_sku = c2.text_input("SKU Nala")
-            f_log = c3.selectbox("Logística", ["FBA", "DBA", "Crossdocking"])
+            f_loja = c3.selectbox("Loja", lojas_amz)
+            f_log = c4.selectbox("Logística", ["FBA", "DBA", "Crossdocking"])
 
-            c4, c5, c6 = st.columns(3)
-            f_com = c4.text_input("Comissão %", value="0,00")
-            f_tax = c5.text_input("Taxa Fixa R$", value="0,00")
-            f_fre = c6.text_input("Frete Est. R$", value="0,00")
+            c5, c6, c7 = st.columns(3)
+            f_com = c5.text_input("Comissão %", value="0,00")
+            f_tax = c6.text_input("Taxa Fixa R$", value="0,00")
+            f_fre = c7.text_input("Frete Est. R$", value="0,00")
 
             if st.form_submit_button("💾 Salvar Anúncio Amazon"):
                 try:
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
 
-                    # DELETE+INSERT (seguro sem depender de UNIQUE constraint)
                     cursor.execute(
-                        "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON'",
-                        (f_asin,)
+                        "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND loja = %s",
+                        (f_asin, f_loja)
                     )
                     cursor.execute("""
                         INSERT INTO dim_config_marketplace 
-                            (asin, sku, marketplace, logistica, 
-                             comissao_percentual, taxa_fixa, frete_estimado)
-                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
+                            (asin, sku, marketplace, loja, logistica, 
+                             comissao_percentual, taxa_fixa, frete_estimado, ativo)
+                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE)
                     """, (
-                        f_asin, f_sku, f_log,
+                        f_asin, f_sku, f_loja, f_log,
                         float(f_com.replace(',', '.')),
                         float(f_tax.replace(',', '.')),
                         float(f_fre.replace(',', '.'))
@@ -140,8 +147,16 @@ def _tab_amazon(engine):
     with s3:
         st.subheader("📥 Importação Massiva Amazon")
 
+        # Seletor de loja (aplica a todas as linhas importadas)
+        df_lojas_amz_imp = _query_to_df(engine,
+            "SELECT loja FROM dim_lojas WHERE UPPER(marketplace) LIKE '%%AMAZON%%' ORDER BY loja"
+        )
+        lojas_amz_imp = df_lojas_amz_imp['loja'].tolist() if not df_lojas_amz_imp.empty else ['AMZ-Nala']
+        loja_import = st.selectbox("Loja destino:", lojas_amz_imp, key="sel_loja_import_amz")
+
         # Template para download
-        tmpl_amz = pd.DataFrame(columns=cols_amz)
+        cols_template = ["asin", "sku", "logistica", "comissao_percentual", "taxa_fixa", "frete_estimado"]
+        tmpl_amz = pd.DataFrame(columns=cols_template)
         buf_amz = io.BytesIO()
         with pd.ExcelWriter(buf_amz, engine='openpyxl') as wr:
             tmpl_amz.to_excel(wr, index=False)
@@ -152,15 +167,12 @@ def _tab_amazon(engine):
         arquivo_amz = st.file_uploader("Subir arquivo preenchido (.xlsx)",
                                        type=["xlsx"], key="up_amz_file")
 
-        # Botão processar (NOVO v2.1)
         if arquivo_amz and st.button("📥 Processar Importação Amazon", type="primary"):
             try:
                 df_import = pd.read_excel(arquivo_amz)
 
-                # Mostrar preview do que foi lido
                 st.info(f"📄 Arquivo lido: {len(df_import)} linhas, colunas: {list(df_import.columns)}")
 
-                # Validar colunas mínimas
                 colunas_esperadas = {'asin', 'sku'}
                 if not colunas_esperadas.issubset(set(df_import.columns)):
                     st.error(
@@ -175,6 +187,16 @@ def _tab_amazon(engine):
                     erros_imp = 0
                     primeiro_erro = None
 
+                    def _safe_float(val, default=0.0):
+                        """Converte para float tratando NaN, None, vazio"""
+                        try:
+                            s = str(val).replace(',', '.').strip()
+                            if s in ('nan', '', 'None', 'none'):
+                                return default
+                            return float(s)
+                        except (ValueError, TypeError):
+                            return default
+
                     for _, row in df_import.iterrows():
                         try:
                             asin = str(row.get('asin', '')).strip()
@@ -185,24 +207,23 @@ def _tab_amazon(engine):
                                 continue
 
                             logistica = str(row.get('logistica', 'FBA')).strip()
-                            if logistica == 'nan':
+                            if logistica in ('nan', '', 'None'):
                                 logistica = 'FBA'
 
-                            comissao = float(str(row.get('comissao_percentual', 0)).replace(',', '.') or 0)
-                            taxa = float(str(row.get('taxa_fixa', 0)).replace(',', '.') or 0)
-                            frete = float(str(row.get('frete_estimado', 0)).replace(',', '.') or 0)
+                            comissao = _safe_float(row.get('comissao_percentual', 0))
+                            taxa = _safe_float(row.get('taxa_fixa', 0))
+                            frete = _safe_float(row.get('frete_estimado', 0))
 
-                            # DELETE+INSERT (seguro sem depender de UNIQUE constraint)
                             cursor.execute(
-                                "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON'",
-                                (asin,)
+                                "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND loja = %s",
+                                (asin, loja_import)
                             )
                             cursor.execute("""
                                 INSERT INTO dim_config_marketplace 
-                                    (asin, sku, marketplace, logistica, 
-                                     comissao_percentual, taxa_fixa, frete_estimado)
-                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
-                            """, (asin, sku, logistica, comissao, taxa, frete))
+                                    (asin, sku, marketplace, loja, logistica, 
+                                     comissao_percentual, taxa_fixa, frete_estimado, ativo)
+                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE)
+                            """, (asin, sku, loja_import, logistica, comissao, taxa, frete))
                             importados += 1
                         except Exception as e:
                             erros_imp += 1
@@ -214,13 +235,13 @@ def _tab_amazon(engine):
                     conn.close()
 
                     if importados > 0:
-                        st.success(f"✅ {importados} anúncio(s) importado(s) com sucesso!")
+                        st.success(f"✅ {importados} anúncio(s) importado(s) para {loja_import}!")
                     if erros_imp > 0:
                         st.warning(f"⚠️ {erros_imp} linha(s) com erro")
                         if primeiro_erro:
                             st.error(f"Primeiro erro: {primeiro_erro}")
                     if importados == 0 and erros_imp == 0:
-                        st.warning("⚠️ Nenhuma linha processada. Verifique se o arquivo tem dados.")
+                        st.warning("⚠️ Nenhuma linha processada.")
 
             except Exception as e:
                 st.error(f"❌ Erro ao processar arquivo: {e}")
