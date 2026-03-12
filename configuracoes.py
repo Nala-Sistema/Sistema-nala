@@ -83,10 +83,11 @@ def _tab_amazon(engine):
 
     with s1:
         df_amz = _query_to_df(engine,
-            """SELECT id_plataforma as asin, sku, logistica, 
+            """SELECT asin, sku, logistica, 
                       comissao_percentual, taxa_fixa, frete_estimado 
                FROM dim_config_marketplace 
-               WHERE marketplace = 'AMAZON'"""
+               WHERE marketplace = 'AMAZON'
+               ORDER BY asin"""
         )
         if not df_amz.empty:
             st.dataframe(df_amz, use_container_width=True, hide_index=True)
@@ -111,17 +112,17 @@ def _tab_amazon(engine):
                 try:
                     conn = engine.raw_connection()
                     cursor = conn.cursor()
+
+                    # DELETE+INSERT (seguro sem depender de UNIQUE constraint)
+                    cursor.execute(
+                        "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON'",
+                        (f_asin,)
+                    )
                     cursor.execute("""
                         INSERT INTO dim_config_marketplace 
-                            (id_plataforma, sku, marketplace, logistica, 
+                            (asin, sku, marketplace, logistica, 
                              comissao_percentual, taxa_fixa, frete_estimado)
                         VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
-                        ON CONFLICT (id_plataforma) DO UPDATE SET 
-                            sku=EXCLUDED.sku, 
-                            logistica=EXCLUDED.logistica,
-                            comissao_percentual=EXCLUDED.comissao_percentual, 
-                            taxa_fixa=EXCLUDED.taxa_fixa, 
-                            frete_estimado=EXCLUDED.frete_estimado
                     """, (
                         f_asin, f_sku, f_log,
                         float(f_com.replace(',', '.')),
@@ -133,8 +134,8 @@ def _tab_amazon(engine):
                     conn.close()
                     st.success("Vinculado com sucesso!")
                     st.rerun()
-                except Exception:
-                    st.error("Erro ao salvar. Verifique se os campos numéricos estão corretos.")
+                except Exception as e:
+                    st.error(f"Erro ao salvar: {e}")
 
     with s3:
         st.subheader("📥 Importação Massiva Amazon")
@@ -191,17 +192,16 @@ def _tab_amazon(engine):
                             taxa = float(str(row.get('taxa_fixa', 0)).replace(',', '.') or 0)
                             frete = float(str(row.get('frete_estimado', 0)).replace(',', '.') or 0)
 
+                            # DELETE+INSERT (seguro sem depender de UNIQUE constraint)
+                            cursor.execute(
+                                "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON'",
+                                (asin,)
+                            )
                             cursor.execute("""
                                 INSERT INTO dim_config_marketplace 
-                                    (id_plataforma, sku, marketplace, logistica, 
+                                    (asin, sku, marketplace, logistica, 
                                      comissao_percentual, taxa_fixa, frete_estimado)
                                 VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s)
-                                ON CONFLICT (id_plataforma) DO UPDATE SET 
-                                    sku=EXCLUDED.sku,
-                                    logistica=EXCLUDED.logistica,
-                                    comissao_percentual=EXCLUDED.comissao_percentual, 
-                                    taxa_fixa=EXCLUDED.taxa_fixa, 
-                                    frete_estimado=EXCLUDED.frete_estimado
                             """, (asin, sku, logistica, comissao, taxa, frete))
                             importados += 1
                         except Exception as e:
