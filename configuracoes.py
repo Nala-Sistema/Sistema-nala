@@ -128,8 +128,8 @@ def _tab_amazon(engine):
                     cursor.execute("""
                         INSERT INTO dim_config_marketplace 
                             (asin, sku, marketplace, loja, logistica, 
-                             comissao_percentual, taxa_fixa, frete_estimado, ativo)
-                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE)
+                             comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+                        VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE, CURRENT_DATE)
                     """, (
                         f_asin, f_sku, f_loja, f_log,
                         float(f_com.replace(',', '.')),
@@ -221,8 +221,8 @@ def _tab_amazon(engine):
                             cursor.execute("""
                                 INSERT INTO dim_config_marketplace 
                                     (asin, sku, marketplace, loja, logistica, 
-                                     comissao_percentual, taxa_fixa, frete_estimado, ativo)
-                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE)
+                                     comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+                                VALUES (%s, %s, 'AMAZON', %s, %s, %s, %s, %s, TRUE, CURRENT_DATE)
                             """, (asin, sku, loja_import, logistica, comissao, taxa, frete))
                             importados += 1
                         except Exception as e:
