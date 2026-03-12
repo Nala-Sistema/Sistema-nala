@@ -71,13 +71,19 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
 
     # 2. BUSCAR CONFIGURAÇÕES (Taxas e De-Para)
     try:
-        query_config = """
+        conn_cfg = engine.raw_connection()
+        cursor_cfg = conn_cfg.cursor()
+        cursor_cfg.execute("""
             SELECT asin, sku as sku_original, 
                    comissao_percentual, taxa_fixa, frete_estimado 
             FROM dim_config_marketplace 
             WHERE marketplace = 'AMAZON'
-        """
-        df_config = pd.read_sql(query_config, engine)
+        """)
+        colunas_cfg = [desc[0] for desc in cursor_cfg.description]
+        rows_cfg = cursor_cfg.fetchall()
+        cursor_cfg.close()
+        conn_cfg.close()
+        df_config = pd.DataFrame(rows_cfg, columns=colunas_cfg)
         config_dict = df_config.set_index('asin').to_dict('index')
     except Exception:
         config_dict = {}
