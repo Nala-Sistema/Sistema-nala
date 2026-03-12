@@ -72,7 +72,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
     # 2. BUSCAR CONFIGURAÇÕES (Taxas e De-Para)
     try:
         query_config = """
-            SELECT id_plataforma as asin, sku as sku_original, 
+            SELECT asin, sku as sku_original, 
                    comissao_percentual, taxa_fixa, frete_estimado 
             FROM dim_config_marketplace 
             WHERE marketplace = 'AMAZON'
