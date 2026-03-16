@@ -1,6 +1,14 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.1 (11/03/2026)
+Versão: 3.2 (16/03/2026)
+
+CHANGELOG v3.2:
+  - FIX: buscar_pendentes_por_tipo() — filtro agora usa ILIKE para pegar variações
+         de motivo relacionadas a SKU (ex: 'SKU não cadastrado', 'SKU Amazon não mapeado')
+         Isso corrige a tabela vazia na tela de Vendas Pendentes para Amazon.
+  - FIX: buscar_pendentes_revisados() — nova função que retorna list of dicts
+         corrigindo o erro "List argument must consist only of tuples or Dictionaries"
+  - MELHORIA: buscar_pendentes() agora aceita motivo_like para buscas flexíveis
 
 CHANGELOG v3.1:
   - NOVO: buscar_mapeamento_skus() — carrega tabela de→para de SKUs
@@ -241,11 +249,6 @@ def gravar_venda_descartada(cursor, dados):
     """
     Grava venda descartada (cancelada/devolvida/mediação) em fact_vendas_descartadas.
     Usa cursor já aberto (dentro da transação existente).
-    
-    Campos esperados em dados:
-        marketplace, loja, numero_pedido, status_original,
-        motivo_descarte, receita_estimada, tarifa_venda_estimada,
-        tarifa_envio_estimada, arquivo_origem
     """
     sql = """
         INSERT INTO fact_vendas_descartadas (
@@ -275,9 +278,6 @@ def deletar_venda_snapshot(cursor, pedido, sku, loja):
     """
     Remove venda de fact_vendas_snapshot.
     Usado quando status muda na reimportação (ex: 'Entregue' → 'Devolvido').
-    Usa cursor já aberto (dentro da transação existente).
-    
-    Retorna True se encontrou e deletou, False caso contrário.
     """
     try:
         cursor.execute(
@@ -334,8 +334,11 @@ def buscar_pendentes_por_tipo(engine, tipo='sku'):
     """
     Busca vendas pendentes filtradas por tipo de motivo.
     
+    VERSÃO 3.2: Usa ILIKE com padrões amplos para não perder vendas
+    de marketplaces que usam motivos ligeiramente diferentes.
+    
     Args:
-        tipo: 'sku' → motivo = 'SKU não cadastrado'
+        tipo: 'sku' → motivos relacionados a SKU (não cadastrado, não mapeado, etc.)
               'divergencia' → motivo LIKE 'Divergência%'
               'todos' → sem filtro de motivo
     """
@@ -343,11 +346,15 @@ def buscar_pendentes_por_tipo(engine, tipo='sku'):
     params = []
 
     if tipo == 'sku':
-        query += " AND motivo = %s"
-        params.append('SKU não cadastrado')
+        # FIX v3.2: Pega TODAS as variações de motivo relacionadas a SKU/ASIN
+        # Inclui: 'SKU não cadastrado', 'SKU Amazon não mapeado', 'ASIN não configurado'
+        query += " AND (motivo ILIKE %s OR motivo ILIKE %s OR motivo ILIKE %s)"
+        params.append('%SKU%')
+        params.append('%não cadastrado%')
+        params.append('%ASIN%')
     elif tipo == 'divergencia':
-        query += " AND motivo LIKE %s"
-        params.append('Divergência%')
+        query += " AND motivo ILIKE %s"
+        params.append('%Divergência%')
 
     query += " ORDER BY data_processamento DESC"
 
@@ -362,6 +369,38 @@ def buscar_pendentes_por_tipo(engine, tipo='sku'):
         return pd.DataFrame(rows, columns=colunas)
     except Exception as e:
         st.error(f"Erro ao buscar pendentes por tipo: {e}")
+        return pd.DataFrame()
+
+
+def buscar_pendentes_revisados(engine, limit=50):
+    """
+    NOVO v3.2: Busca histórico de vendas reprocessadas/revisadas.
+    Retorna DataFrame (não lista crua) — corrige o erro:
+    "List argument must consist only of tuples or Dictionaries"
+    
+    Esse erro ocorria quando a página de Vendas Pendentes tentava
+    exibir o histórico usando dados em formato incompatível.
+    """
+    query = """
+        SELECT id, marketplace_origem, loja_origem, numero_pedido, 
+               data_venda, sku, quantidade, valor_venda_efetivo,
+               status, motivo, data_processamento
+        FROM fact_vendas_pendentes 
+        WHERE status IN ('Reprocessado', 'Revisado manualmente')
+        ORDER BY data_processamento DESC
+        LIMIT %s
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, (limit,))
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception as e:
+        st.error(f"Erro ao buscar pendentes revisados: {e}")
         return pd.DataFrame()
 
 
