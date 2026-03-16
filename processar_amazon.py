@@ -2,23 +2,25 @@
 PROCESSADOR AMAZON - Sistema Nala
 Processa Business Report (CSV) com datas acumuladas
 
+VERSÃO 1.3 (16/03/2026):
+  - FIX CRÍTICO: Lookup de config agora usa (asin, logistica) como chave
+         Antes: set_index('asin') falhava com ASINs duplicados por logística,
+         caindo silenciosamente no fallback de 15% sem taxa_fixa e sem frete.
+  - FIX: Logística determinada pelo sufixo do SKU Amazon (-FBA → FBA, senão DBA)
+  - FIX: ASIN sem config vai para pendentes com motivo 'ASIN não configurado'
+         (antes usava fallback silencioso de 15% gerando margem errada)
+  - FIX: Motivo de pendente padronizado para 'SKU não cadastrado'
+  - FIX: Removido '-PR' da limpeza de sufixos (PR = cor preta, não é sufixo)
+  - NOVO: Consulta dim_sku_mapeamento ANTES de classificar como pendente
+  - NOVO: Rastreamento de ASINs sem config para relatório
+
 VERSÃO 1.1 (11/03/2026):
-  - FIX: INSERT com todas as colunas NOT NULL (desconto_parceiro, desconto_marketplace, outros_custos)
-  - FIX: SAVEPOINT por linha (não perde vendas já gravadas em caso de erro)
-  - FIX: skus_invalidos agora é populado corretamente
-  - FIX: info dict completo (periodo, skus_sem_custo, descartes, pendentes_carrinho)
-  - NOVO: Barra de progresso na gravação
-  - NOVO: Mapeamento automático de SKUs (dim_sku_mapeamento)
-  - NOVO: Rastreamento de linhas descartadas (qtd=0, receita=0)
-  - Lógica de ID Sintético mantida
-  - Taxas excludentes (Frete vs Taxa Fixa) mantidas
-  - De-Para de SKUs com limpeza de sufixos mantido
+  - FIX: INSERT com todas as colunas NOT NULL
+  - FIX: SAVEPOINT por linha
+  - NOVO: Barra de progresso, mapeamento SKUs, rastreamento descartes
 
 VERSÃO 1.0 (Gemini):
-  - Processa Business Report (CSV) com datas acumuladas
-  - Lógica de ID Sintético para evitar duplicatas por período
-  - Taxas excludentes (Frete vs Taxa Fixa)
-  - De-Para de SKUs automático com limpeza de sufixos
+  - Processamento inicial do Business Report
 """
 
 import pandas as pd
@@ -34,11 +36,80 @@ from database_utils import (
 )
 
 
+def _detectar_logistica(sku_amz):
+    """
+    Detecta o tipo de logística pelo sufixo do SKU Amazon.
+    - Contém '-FBA' ou termina com 'FBA' → 'FBA'
+    - Caso contrário → 'DBA' (inclui DBA PF que é tratado como DBA)
+    """
+    sku_upper = str(sku_amz).upper().strip()
+    if '-FBA' in sku_upper or sku_upper.endswith('FBA'):
+        return 'FBA'
+    return 'DBA'
+
+
+def _buscar_config_amazon(engine):
+    """
+    Busca configurações de anúncios Amazon (dim_config_marketplace).
+    
+    Retorna dois dicts:
+    - config_por_asin_logistica: {(asin, logistica_base): {comissao_percentual, taxa_fixa, frete_estimado, sku}}
+    - config_por_asin_geral: {asin: {comissao_percentual, taxa_fixa, frete_estimado, sku}}
+      (fallback: pega a primeira config do ASIN se não achar logística específica)
+    """
+    config_por_asin_logistica = {}
+    config_por_asin_geral = {}
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT asin, sku, logistica,
+                   comissao_percentual, taxa_fixa, frete_estimado 
+            FROM dim_config_marketplace 
+            WHERE marketplace = 'AMAZON' AND ativo = true
+            ORDER BY asin, logistica
+        """)
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        for row in rows:
+            r = dict(zip(colunas, row))
+            asin = str(r.get('asin', '')).strip()
+            logistica_raw = str(r.get('logistica', '')).strip().upper()
+            
+            # Normalizar logística: 'DBA PF', 'DBA' → 'DBA' | 'FBA' → 'FBA'
+            logistica_base = 'FBA' if 'FBA' in logistica_raw else 'DBA'
+            
+            config_data = {
+                'sku_original': str(r.get('sku', '')).strip(),
+                'comissao_percentual': float(r.get('comissao_percentual', 0) or 0),
+                'taxa_fixa': float(r.get('taxa_fixa', 0) or 0),
+                'frete_estimado': float(r.get('frete_estimado', 0) or 0),
+                'logistica': logistica_base,
+            }
+            
+            # Dict principal: (asin, logistica_base)
+            config_por_asin_logistica[(asin, logistica_base)] = config_data
+            
+            # Dict fallback: primeiro registro por ASIN
+            if asin not in config_por_asin_geral:
+                config_por_asin_geral[asin] = config_data
+
+        return config_por_asin_logistica, config_por_asin_geral
+
+    except Exception as e:
+        st.warning(f"⚠️ Erro ao buscar config Amazon: {e}")
+        return {}, {}
+
+
 def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim):
     """
     Lê o Business Report da Amazon e prepara os dados para gravação.
 
-    VERSÃO 1.1: info dict completo, mapeamento de SKU, rastreamento de descartes.
+    VERSÃO 1.3: Config por (asin, logistica), ASIN sem config → pendente.
 
     Args:
         arquivo: arquivo CSV (UploadedFile)
@@ -52,7 +123,6 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
         (df_processado, info_dict) ou (None, erro_msg)
     """
     try:
-        # Tenta ler o CSV (padrão Amazon Business Report)
         df = pd.read_csv(arquivo)
     except Exception as e:
         return None, f"Erro ao ler CSV: {e}"
@@ -69,35 +139,23 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
     if 'sku_amz' not in df.columns:
         return None, "Coluna 'Código SKU' não encontrada no arquivo."
 
-    # 2. BUSCAR CONFIGURAÇÕES (Taxas e De-Para)
-    try:
-        conn_cfg = engine.raw_connection()
-        cursor_cfg = conn_cfg.cursor()
-        cursor_cfg.execute("""
-            SELECT asin, sku as sku_original, 
-                   comissao_percentual, taxa_fixa, frete_estimado 
-            FROM dim_config_marketplace 
-            WHERE marketplace = 'AMAZON'
-        """)
-        colunas_cfg = [desc[0] for desc in cursor_cfg.description]
-        rows_cfg = cursor_cfg.fetchall()
-        cursor_cfg.close()
-        conn_cfg.close()
-        df_config = pd.DataFrame(rows_cfg, columns=colunas_cfg)
-        config_dict = df_config.set_index('asin').to_dict('index')
-    except Exception:
-        config_dict = {}
+    # 2. BUSCAR CONFIGURAÇÕES (v1.3: por asin + logística)
+    config_por_asin_logistica, config_por_asin_geral = _buscar_config_amazon(engine)
+
+    if not config_por_asin_logistica and not config_por_asin_geral:
+        st.warning("⚠️ Nenhuma configuração de anúncios Amazon encontrada. Todas as vendas irão para pendentes.")
 
     # 3. BUSCAR CUSTOS E MAPEAMENTO DE SKUs
     timestamp = datetime.now().timestamp()
     custos_dict = buscar_custos_skus(engine, force_refresh=timestamp)
+    skus_cadastrados = buscar_skus_validos(engine)
     mapeamento_skus = buscar_mapeamento_skus(engine)
 
     # 4. PROCESSAR LINHAS
     vendas = []
     descartes = []
     skus_sem_custo = set()
-    skus_sem_mapeamento = set()
+    asins_sem_config = set()
     skus_corrigidos = 0
     linhas_descartadas = 0
 
@@ -114,7 +172,6 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 qtd = 0
 
             if qtd <= 0 or receita <= 0:
-                # Rastrear descarte (não ignorar silenciosamente)
                 if sku_amz:
                     descartes.append({
                         'numero_pedido': f"AMZ_{loja}_{sku_amz}",
@@ -128,27 +185,78 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 linhas_descartadas += 1
                 continue
 
-            # Lógica De-Para: Busca por ASIN ou tenta limpar SKU
-            conf = config_dict.get(asin, {})
-            sku_original = conf.get('sku_original')
+            # ============================================================
+            # RESOLUÇÃO DE CONFIG POR (ASIN + LOGÍSTICA) — v1.3
+            # ============================================================
+            logistica_detectada = _detectar_logistica(sku_amz)
+            
+            # 1º: Tenta (asin, logistica) exata
+            conf = config_por_asin_logistica.get((asin, logistica_detectada))
+            
+            # 2º: Fallback — qualquer config desse ASIN
+            if not conf:
+                conf = config_por_asin_geral.get(asin)
+            
+            # 3º: ASIN sem config → vai para pendentes (NÃO usa fallback 15%)
+            if not conf:
+                asins_sem_config.add(asin)
+                
+                # Ainda assim tenta resolver o SKU para o registro pendente
+                sku_limpo = sku_amz.split('-FBA')[0].split('-DBA')[0].strip()
+                if sku_limpo in mapeamento_skus:
+                    sku_limpo = mapeamento_skus[sku_limpo]
+                elif sku_amz in mapeamento_skus:
+                    sku_limpo = mapeamento_skus[sku_amz]
 
+                vendas.append({
+                    'pedido': f"AMZ_{loja}_{data_ini.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}_{sku_amz}",
+                    'data': data_ini.strftime("%d/%m/%Y"),
+                    'sku': sku_limpo,
+                    'sku_amz': sku_amz,
+                    'asin': asin,
+                    'qtd': qtd,
+                    'receita': receita,
+                    'comissao': 0,
+                    'taxa_fixa': 0,
+                    'frete': 0,
+                    'imposto': 0,
+                    'custo': 0,
+                    'margem': 0,
+                    'margem_pct': 0,
+                    'tem_custo': False,
+                    '_custo_unit': 0,
+                    '_pendente_asin': True,
+                    '_motivo_pendente': 'ASIN não configurado',
+                })
+                continue
+
+            # ============================================================
+            # RESOLUÇÃO DE SKU
+            # ============================================================
+            sku_original = conf.get('sku_original', '')
+            
             if not sku_original:
-                # Tenta limpar sufixos (-FBA, -DBA, -PR)
-                sku_original = sku_amz.split('-FBA')[0].split('-DBA')[0].split('-PR')[0]
+                # Limpa sufixos conhecidos (FBA, DBA) — NÃO remove -PR (cor preta)
+                sku_original = sku_amz.split('-FBA')[0].split('-DBA')[0].strip()
 
-            # Aplicar mapeamento de SKU (dim_sku_mapeamento) — NOVO v1.1
+            # Consulta mapeamento (dim_sku_mapeamento) — correções manuais
             if sku_original in mapeamento_skus:
                 sku_original = mapeamento_skus[sku_original]
                 skus_corrigidos += 1
+            elif sku_amz in mapeamento_skus:
+                sku_original = mapeamento_skus[sku_amz]
+                skus_corrigidos += 1
 
-            # Cálculo de Taxas Excludentes
-            comissao_pct = float(conf.get('comissao_percentual', 15.0))
-            taxa_fixa = float(conf.get('taxa_fixa', 0.0))
-            frete_est = float(conf.get('frete_estimado', 0.0))
+            # ============================================================
+            # CÁLCULO DE TAXAS (da config real, não mais fallback 15%)
+            # ============================================================
+            comissao_pct = conf.get('comissao_percentual', 0)
+            taxa_fixa = conf.get('taxa_fixa', 0)
+            frete_est = conf.get('frete_estimado', 0)
 
             v_comissao = receita * (comissao_pct / 100)
 
-            # Se tem frete, zera a taxa fixa. Se não tem frete, usa taxa fixa.
+            # Taxas excludentes: se tem frete, zera taxa fixa e vice-versa
             if frete_est > 0:
                 v_frete = frete_est * qtd
                 v_taxa_fixa = 0.0
@@ -185,6 +293,8 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 'margem_pct': margem_pct,
                 'tem_custo': custo_un > 0,
                 '_custo_unit': custo_un,
+                '_pendente_asin': False,
+                '_motivo_pendente': None,
             })
 
         except Exception as e:
@@ -205,6 +315,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
         'periodo_inicio': data_ini.strftime("%d/%m/%Y"),
         'periodo_fim': data_fim.strftime("%d/%m/%Y"),
         'skus_sem_custo': len(skus_sem_custo),
+        'asins_sem_config': len(asins_sem_config),
         'arquivo_nome': arquivo.name,
         'divergencias': [],
         'carrinhos_encontrados': 0,
@@ -213,10 +324,10 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
         'pendentes_carrinho': [],
     }
 
-    # 8. LIMPAR COLUNAS TEMPORÁRIAS
+    # 8. LIMPAR COLUNAS TEMPORÁRIAS (preserva _pendente_asin para gravação)
     if not df_result.empty:
-        colunas_temp = ['_custo_unit']
-        colunas_existentes = [c for c in colunas_temp if c in df_result.columns]
+        colunas_remover = ['_custo_unit']
+        colunas_existentes = [c for c in colunas_remover if c in df_result.columns]
         if colunas_existentes:
             df_result = df_result.drop(columns=colunas_existentes)
 
@@ -228,12 +339,9 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
     """
     Grava vendas da Amazon com Delete-Before-Insert para evitar duplicatas de período.
 
-    VERSÃO 1.1:
-    - FIX: INSERT com todas as colunas NOT NULL
-    - FIX: SAVEPOINT por linha
-    - NOVO: Barra de progresso
-    - NOVO: skus_invalidos populado corretamente
-    - Novo param descartes e pendentes_carrinho (compatível com central_uploads v3.1)
+    VERSÃO 1.3:
+    - NOVO: Suporte a _pendente_asin (ASIN não configurado → pendente)
+    - FIX: Motivo padronizado para 'SKU não cadastrado'
 
     Retorna:
         (registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados)
@@ -272,7 +380,7 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
         )
         atualiz = cursor.rowcount
 
-        # 2. PROCESSAR DESCARTES (rastreamento em fact_vendas_descartadas)
+        # 2. PROCESSAR DESCARTES
         from database_utils import gravar_venda_descartada
 
         for descarte in descartes:
@@ -318,8 +426,53 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                 status_text.text(f"Gravando venda {item_atual} de {total_itens}...")
 
                 sku = str(row['sku']).strip()
+                is_pendente_asin = bool(row.get('_pendente_asin', False))
+                motivo_pendente = row.get('_motivo_pendente', None)
 
-                # SKU não cadastrado → pendente
+                # ============================================================
+                # CASO 1: ASIN não configurado → pendente
+                # ============================================================
+                if is_pendente_asin:
+                    data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
+                    receita = float(row['receita'])
+                    qtd = int(row['qtd'])
+
+                    dados_pendente = {
+                        'marketplace_origem': marketplace,
+                        'loja_origem': loja,
+                        'numero_pedido': str(row['pedido']),
+                        'data_venda': data_venda,
+                        'sku': sku,
+                        'codigo_anuncio': str(row.get('asin', '')),
+                        'quantidade': qtd,
+                        'preco_venda': receita / qtd if qtd > 0 else receita,
+                        'valor_venda_efetivo': receita,
+                        'imposto': 0,
+                        'comissao': 0,
+                        'frete': 0,
+                        'tarifa_fixa': 0,
+                        'outros_custos': 0,
+                        'total_tarifas': 0,
+                        'valor_liquido': receita,
+                        'arquivo_origem': arq_nome,
+                        'motivo': motivo_pendente or 'ASIN não configurado',
+                    }
+
+                    cursor.execute(f"SAVEPOINT pend_asin_{idx}")
+                    try:
+                        if gravar_venda_pendente(cursor, dados_pendente):
+                            pend += 1
+                        else:
+                            err += 1
+                        cursor.execute(f"RELEASE SAVEPOINT pend_asin_{idx}")
+                    except Exception:
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT pend_asin_{idx}")
+                        err += 1
+                    continue
+
+                # ============================================================
+                # CASO 2: SKU não cadastrado → pendente
+                # ============================================================
                 if sku not in skus_cadastrados:
                     skus_invalidos.add(sku)
 
@@ -352,7 +505,7 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                         'total_tarifas': total_tarifas,
                         'valor_liquido': valor_liquido,
                         'arquivo_origem': arq_nome,
-                        'motivo': 'SKU Amazon não mapeado',
+                        'motivo': 'SKU não cadastrado',
                     }
 
                     cursor.execute(f"SAVEPOINT pend_amz_{idx}")
@@ -367,7 +520,9 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                         err += 1
                     continue
 
-                # Gravação normal
+                # ============================================================
+                # CASO 3: Gravação normal
+                # ============================================================
                 data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
                 qtd = int(row['qtd'])
                 receita = float(row['receita'])
@@ -384,7 +539,6 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                 total_tarifas = comissao + frete + taxa_fixa_val
                 valor_liquido = receita - total_tarifas - imposto_val
 
-                # SAVEPOINT por linha
                 cursor.execute(f"SAVEPOINT venda_amz_{idx}")
 
                 cursor.execute(sql_ins, (
