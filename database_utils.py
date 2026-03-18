@@ -1,26 +1,31 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.2 (16/03/2026)
+Versão: 3.3 (17/03/2026)
+
+CHANGELOG v3.3:
+  - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
+         dim_config_marketplace em vez de copiar taxas zeradas do pendente.
+         Isso corrige vendas reprocessadas ficando com comissao=0, tarifa_fixa=0.
+  - FIX CRÍTICO: reprocessar_pendentes_manual() — mesma correção de recálculo de taxas.
+  - NOVO: buscar_produtos_autocomplete() — busca SKU ou nome em dim_produtos (para campo inteligente)
+  - NOVO: buscar_config_amazon_por_asin() — busca config por ASIN+logística (para reprocessamento)
+  - NOVO: deletar_config_amazon() — exclui anúncio da dim_config_marketplace
+  - NOVO: buscar_configs_amazon_lista() — lista configs Amazon para edição
+  - MELHORIA: Todas funções de gravação agora incluem coluna 'logistica' no INSERT
+  - MELHORIA: gravar_venda_pendente() aceita dados['logistica']
 
 CHANGELOG v3.2:
   - FIX: buscar_pendentes_por_tipo() — filtro agora usa ILIKE para pegar variações
-         de motivo relacionadas a SKU (ex: 'SKU não cadastrado', 'SKU Amazon não mapeado')
-         Isso corrige a tabela vazia na tela de Vendas Pendentes para Amazon.
-  - FIX: buscar_pendentes_revisados() — nova função que retorna list of dicts
-         corrigindo o erro "List argument must consist only of tuples or Dictionaries"
+  - FIX: buscar_pendentes_revisados() — retorna DataFrame corrigindo erro de tipo
   - MELHORIA: buscar_pendentes() agora aceita motivo_like para buscas flexíveis
 
 CHANGELOG v3.1:
-  - NOVO: buscar_mapeamento_skus() — carrega tabela de→para de SKUs
-  - NOVO: gravar_mapeamento_sku() — salva correção de SKU para imports futuros
-  - NOVO: buscar_pendentes_por_tipo() — filtra pendentes por SKU ou Divergência
-  - NOVO: reprocessar_pendentes_manual() — reprocessa pendentes editados manualmente
+  - NOVO: buscar_mapeamento_skus(), gravar_mapeamento_sku()
+  - NOVO: buscar_pendentes_por_tipo(), reprocessar_pendentes_manual()
 
 CHANGELOG v3.0:
-  - NOVO: gravar_venda_descartada() — grava em fact_vendas_descartadas
-  - NOVO: deletar_venda_snapshot() — remove venda (para mudança de status na reimportação)
-  - AJUSTE: gravar_venda_pendente() — motivo agora é dinâmico (via dados['motivo'])
-  - Todas as funções anteriores mantidas intactas
+  - NOVO: gravar_venda_descartada(), deletar_venda_snapshot()
+  - AJUSTE: gravar_venda_pendente() — motivo dinâmico
 """
 
 from sqlalchemy import create_engine, text
@@ -79,6 +84,210 @@ def buscar_skus_validos(engine):
         return set()
 
 # ============================================================
+# BUSCA DE PRODUTOS — AUTOCOMPLETE INTELIGENTE (NOVO v3.3)
+# ============================================================
+
+def buscar_produtos_autocomplete(engine, termo, limit=15):
+    """
+    Busca produtos em dim_produtos por SKU ou nome.
+    Usado no campo inteligente de Vincular Manual.
+    
+    O termo é buscado tanto no campo 'sku' quanto no campo 'nome'
+    usando ILIKE (case insensitive, match parcial).
+    
+    Retorna lista de dicts: [{'sku': '...', 'nome': '...'}, ...]
+    """
+    if not termo or len(termo.strip()) < 2:
+        return []
+    
+    query = """
+        SELECT sku, nome 
+        FROM dim_produtos 
+        WHERE status = 'Ativo' 
+          AND (sku ILIKE %s OR nome ILIKE %s)
+        ORDER BY sku ASC
+        LIMIT %s
+    """
+    padrao = f"%{termo.strip()}%"
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, (padrao, padrao, limit))
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return [dict(zip(colunas, row)) for row in rows]
+    except Exception:
+        return []
+
+
+# ============================================================
+# CONFIG AMAZON — BUSCA PARA REPROCESSAMENTO (NOVO v3.3)
+# ============================================================
+
+def buscar_config_amazon_por_asin(engine, asin, logistica=None):
+    """
+    Busca configuração de um ASIN na dim_config_marketplace.
+    
+    Usado pelo reprocessamento para recalcular taxas corretamente.
+    
+    Args:
+        asin: código ASIN
+        logistica: 'FBA', 'DBA' ou None (tenta match exato, depois fallback)
+    
+    Retorna: dict com {comissao_percentual, taxa_fixa, frete_estimado, logistica} ou None
+    """
+    if not asin or str(asin).strip() == '':
+        return None
+    
+    asin = str(asin).strip()
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT logistica, comissao_percentual, taxa_fixa, frete_estimado
+            FROM dim_config_marketplace 
+            WHERE marketplace = 'AMAZON' AND asin = %s AND ativo = true
+            ORDER BY logistica
+        """, (asin,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not rows:
+            return None
+        
+        configs = []
+        for row in rows:
+            configs.append({
+                'logistica': str(row[0] or '').strip(),
+                'comissao_percentual': float(row[1] or 0),
+                'taxa_fixa': float(row[2] or 0),
+                'frete_estimado': float(row[3] or 0),
+            })
+        
+        # 1. Match exato por logística
+        if logistica:
+            for c in configs:
+                if c['logistica'] == logistica:
+                    return c
+            # Match parcial (ex: logistica='FBA', config='FBA')
+            for c in configs:
+                if logistica in c['logistica']:
+                    return c
+        
+        # 2. Fallback: se só tem uma config, usa ela
+        if len(configs) == 1:
+            return configs[0]
+        
+        # 3. Se tem múltiplas, prefere DBA (mais comum sem sufixo)
+        for c in configs:
+            if 'DBA' in c['logistica'] and 'PF' not in c['logistica']:
+                return c
+        
+        return configs[0]
+    
+    except Exception:
+        return None
+
+
+def _detectar_logistica_do_pedido(numero_pedido):
+    """
+    Detecta logística a partir do numero_pedido Amazon.
+    Formato: AMZ_{loja}_{data_ini}_{data_fim}_{sku_amz}
+    Se sku_amz contém '-FBA' → FBA, senão → DBA
+    """
+    pedido = str(numero_pedido or '').upper()
+    if '-FBA' in pedido:
+        return 'FBA'
+    return 'DBA'
+
+
+# ============================================================
+# CONFIG AMAZON — CRUD (NOVO v3.3)
+# ============================================================
+
+def buscar_configs_amazon_lista(engine):
+    """
+    Lista todas as configurações Amazon para exibição e edição.
+    Retorna DataFrame com id, asin, sku, logistica, taxas.
+    """
+    query = """
+        SELECT id, asin, sku, logistica, comissao_percentual, taxa_fixa, frete_estimado
+        FROM dim_config_marketplace 
+        WHERE marketplace = 'AMAZON' AND ativo = true
+        ORDER BY asin, logistica
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(query)
+        colunas = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=colunas)
+    except Exception:
+        return pd.DataFrame()
+
+
+def deletar_config_amazon(engine, asin, logistica):
+    """
+    Exclui um anúncio Amazon da dim_config_marketplace.
+    Deleta por ASIN + logística (chave composta).
+    Retorna True se deletou, False se erro.
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND logistica = %s",
+            (str(asin).strip(), str(logistica).strip())
+        )
+        deletados = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return deletados > 0
+    except Exception as e:
+        st.error(f"Erro ao excluir anúncio: {e}")
+        return False
+
+
+def salvar_config_amazon(engine, asin, sku, logistica, comissao_pct, taxa_fixa, frete_est):
+    """
+    Salva (insert/update) configuração de anúncio Amazon.
+    Usa DELETE+INSERT para UPSERT por (asin, logistica).
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM dim_config_marketplace WHERE asin = %s AND marketplace = 'AMAZON' AND logistica = %s",
+            (str(asin).strip(), str(logistica).strip())
+        )
+        cursor.execute("""
+            INSERT INTO dim_config_marketplace 
+                (asin, sku, marketplace, loja, logistica, 
+                 comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+            VALUES (%s, %s, 'AMAZON', 'AMAZON', %s, %s, %s, %s, TRUE, CURRENT_DATE)
+        """, (
+            str(asin).strip(), str(sku).strip(), str(logistica).strip(),
+            float(comissao_pct), float(taxa_fixa), float(frete_est)
+        ))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar config Amazon: {e}")
+        return False
+
+
+# ============================================================
 # LOGS E DUPLICATAS
 # ============================================================
 
@@ -127,19 +336,19 @@ def gravar_venda_pendente(cursor, dados):
     """
     Grava venda com SKU não cadastrado ou divergência na fact_vendas_pendentes.
 
+    VERSÃO 3.3: Inclui coluna logistica.
     VERSÃO 3.0: motivo agora é dinâmico — lê de dados['motivo'].
-    Se não informado, usa 'SKU não cadastrado' (compatível com chamadas existentes).
     """
-    # Motivo dinâmico: permite 'SKU não cadastrado', 'Divergência financeira', etc.
     motivo = dados.get('motivo', 'SKU não cadastrado')
+    logistica = dados.get('logistica', None)
 
     sql = """
         INSERT INTO fact_vendas_pendentes (
             marketplace_origem, loja_origem, numero_pedido, data_venda, sku, 
             codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo,
             imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas,
-            valor_liquido, arquivo_origem, data_processamento, status, motivo
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', %s)
+            valor_liquido, arquivo_origem, data_processamento, status, motivo, logistica
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', %s, %s)
         ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING
     """
     try:
@@ -150,7 +359,7 @@ def gravar_venda_pendente(cursor, dados):
             dados.get('imposto', 0), dados.get('comissao', 0), dados.get('frete', 0),
             dados.get('tarifa_fixa', 0), dados.get('outros_custos', 0), dados.get('total_tarifas', 0),
             dados.get('valor_liquido', 0), dados.get('arquivo_origem', ''),
-            motivo
+            motivo, logistica
         ))
         return True
     except Exception:
@@ -174,10 +383,7 @@ def buscar_pendentes(engine, sku=None, marketplace=None, status='Pendente'):
         return pd.DataFrame()
 
 def buscar_pendentes_resumo(engine):
-    """
-    Retorna resumo de pendentes por SKU.
-    CORREÇÃO: Incluída a agregação de lojas para evitar KeyError.
-    """
+    """Retorna resumo de pendentes por SKU."""
     query = """
         SELECT 
             sku, 
@@ -198,64 +404,128 @@ def buscar_pendentes_resumo(engine):
         return pd.DataFrame()
 
 def reprocessar_pendentes_por_sku(engine, sku):
-    """Reprocessa vendas pendentes após cadastro de SKU"""
+    """
+    Reprocessa vendas pendentes após cadastro de SKU.
+    
+    VERSÃO 3.3 - FIX CRÍTICO:
+        Agora RECALCULA taxas a partir da dim_config_marketplace para vendas Amazon.
+        Antes copiava as taxas do pendente (que eram zero quando ASIN não tinha config).
+        
+        Para cada pendente Amazon:
+        1. Pega o ASIN do campo codigo_anuncio
+        2. Detecta logística (FBA/DBA) do numero_pedido
+        3. Busca config atualizada em dim_config_marketplace
+        4. Recalcula: comissão, taxa_fixa, frete, total_tarifas, valor_liquido, margem
+    """
     skus_validos = buscar_skus_validos(engine)
-    if sku not in skus_validos: return {'sucesso': 0, 'erros': 0, 'mensagem': "SKU não cadastrado."}
+    if sku not in skus_validos:
+        return {'sucesso': 0, 'erros': 0, 'mensagem': "SKU não cadastrado."}
     
     custo_unit = buscar_custos_skus(engine).get(sku, 0)
     df_pendentes = buscar_pendentes(engine, sku=sku, status='Pendente')
     
     conn = engine.raw_connection()
     cursor = conn.cursor()
-    sucesso, erros, ids_repro = 0, 0, []
+    sucesso, erros, sem_config = 0, 0, 0
+    ids_repro = []
 
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
             codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo, custo_unitario, custo_total,
             imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
-            margem_total, margem_percentual, data_processamento, arquivo_origem)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+            margem_total, margem_percentual, data_processamento, arquivo_origem, logistica)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
     """
     for _, row in df_pendentes.iterrows():
         try:
             cursor.execute(f"SAVEPOINT repro_{row['id']}")
+            
             receita = float(row['valor_venda_efetivo'])
-            custo_total = custo_unit * int(row['quantidade'])
-            margem_total = float(row['valor_liquido']) - custo_total
+            qtd = int(row['quantidade'])
+            custo_total = custo_unit * qtd
+            imposto_val = float(row['imposto'])
+            marketplace = str(row.get('marketplace_origem', '')).upper()
+            
+            # ============================================================
+            # v3.3: RECALCULAR TAXAS para Amazon
+            # ============================================================
+            if 'AMAZON' in marketplace:
+                asin = str(row.get('codigo_anuncio', '')).strip()
+                logistica_det = _detectar_logistica_do_pedido(row.get('numero_pedido', ''))
+                
+                conf = buscar_config_amazon_por_asin(engine, asin, logistica_det)
+                
+                if conf:
+                    comissao_pct = conf['comissao_percentual']
+                    taxa_fixa_unit = conf['taxa_fixa']
+                    frete_est = conf['frete_estimado']
+                    logistica_final = conf['logistica'] or logistica_det
+                    
+                    v_comissao = receita * (comissao_pct / 100)
+                    if frete_est > 0:
+                        v_frete = frete_est * qtd
+                        v_taxa_fixa = 0.0
+                    else:
+                        v_frete = 0.0
+                        v_taxa_fixa = taxa_fixa_unit * qtd
+                else:
+                    # ASIN sem config — não reprocessar com taxa zero!
+                    sem_config += 1
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT repro_{row['id']}")
+                    continue
+            else:
+                # Outros marketplaces: manter taxas do pendente (Shopee, ML, etc.)
+                v_comissao = float(row['comissao'])
+                v_taxa_fixa = float(row['tarifa_fixa'])
+                v_frete = float(row['frete'])
+                logistica_final = row.get('logistica', None)
+            
+            total_tarifas = v_comissao + v_taxa_fixa + v_frete
+            valor_liquido = receita - total_tarifas - imposto_val
+            margem_total = valor_liquido - custo_total
             margem_pct = (margem_total / receita * 100) if receita > 0 else 0
+            preco_venda = receita / qtd if qtd > 0 else receita
             
             cursor.execute(sql_ins, (
                 row['marketplace_origem'], row['loja_origem'], row['numero_pedido'], row['data_venda'], sku,
-                row['codigo_anuncio'], row['quantidade'], row['preco_venda'], receita, custo_unit, custo_total,
-                row['imposto'], row['comissao'], row['frete'], row['tarifa_fixa'], row['outros_custos'],
-                row['total_tarifas'], row['valor_liquido'], margem_total, margem_pct, row['arquivo_origem']
+                row['codigo_anuncio'], qtd, preco_venda, receita, custo_unit, custo_total,
+                imposto_val, v_comissao, v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
+                margem_total, margem_pct, row['arquivo_origem'], logistica_final
             ))
-            ids_repro.append(int(row['id'])); sucesso += 1
+            ids_repro.append(int(row['id']))
+            sucesso += 1
         except Exception:
-            cursor.execute(f"ROLLBACK TO SAVEPOINT repro_{row['id']}"); erros += 1
+            cursor.execute(f"ROLLBACK TO SAVEPOINT repro_{row['id']}")
+            erros += 1
 
     if ids_repro:
-        cursor.execute(f"UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id IN ({','.join(['%s']*len(ids_repro))})", ids_repro)
+        cursor.execute(
+            f"UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id IN ({','.join(['%s']*len(ids_repro))})",
+            ids_repro
+        )
     
     conn.commit()
-    cursor.close(); conn.close()
-    return {'sucesso': sucesso, 'erros': erros, 'mensagem': f"Reprocessado: {sucesso} sucessos."}
+    cursor.close()
+    conn.close()
+    
+    msg = f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s)."
+    if sem_config > 0:
+        msg += f" ⚠️ {sem_config} venda(s) ignorada(s) — ASIN sem config cadastrada."
+    
+    return {'sucesso': sucesso, 'erros': erros, 'sem_config': sem_config, 'mensagem': msg}
 
 # ============================================================
-# VENDAS DESCARTADAS (NOVO v3.0)
+# VENDAS DESCARTADAS (v3.0)
 # ============================================================
 
 def gravar_venda_descartada(cursor, dados):
-    """
-    Grava venda descartada (cancelada/devolvida/mediação) em fact_vendas_descartadas.
-    Usa cursor já aberto (dentro da transação existente).
-    """
+    """Grava venda descartada em fact_vendas_descartadas."""
     sql = """
         INSERT INTO fact_vendas_descartadas (
             marketplace, loja, numero_pedido, status_original,
             motivo_descarte, receita_estimada, tarifa_venda_estimada,
-            tarifa_envio_estimada, arquivo_origem
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            tarifa_envio_estimada, arquivo_origem, logistica
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         cursor.execute(sql, (
@@ -267,7 +537,8 @@ def gravar_venda_descartada(cursor, dados):
             dados.get('receita_estimada', 0),
             dados.get('tarifa_venda_estimada', 0),
             dados.get('tarifa_envio_estimada', 0),
-            dados.get('arquivo_origem', '')
+            dados.get('arquivo_origem', ''),
+            dados.get('logistica', None)
         ))
         return True
     except Exception:
@@ -275,10 +546,7 @@ def gravar_venda_descartada(cursor, dados):
 
 
 def deletar_venda_snapshot(cursor, pedido, sku, loja):
-    """
-    Remove venda de fact_vendas_snapshot.
-    Usado quando status muda na reimportação (ex: 'Entregue' → 'Devolvido').
-    """
+    """Remove venda de fact_vendas_snapshot."""
     try:
         cursor.execute(
             "DELETE FROM fact_vendas_snapshot WHERE numero_pedido = %s AND sku = %s AND loja_origem = %s",
@@ -289,28 +557,20 @@ def deletar_venda_snapshot(cursor, pedido, sku, loja):
         return False
 
 # ============================================================
-# MAPEAMENTO DE SKUs (NOVO v3.1)
+# MAPEAMENTO DE SKUs (v3.1)
 # ============================================================
 
 def buscar_mapeamento_skus(engine):
-    """
-    Carrega tabela de mapeamento de SKUs (de→para).
-    Usado no processamento para corrigir SKUs automaticamente.
-    Retorna dict: {sku_errado: sku_correto}
-    """
+    """Carrega tabela de mapeamento de SKUs (de→para)."""
     try:
         df = pd.read_sql("SELECT sku_errado, sku_correto FROM dim_sku_mapeamento", engine)
         return {row['sku_errado']: row['sku_correto'] for _, row in df.iterrows()}
     except Exception:
-        # Tabela pode não existir ainda
         return {}
 
 
 def gravar_mapeamento_sku(engine, sku_errado, sku_correto):
-    """
-    Salva mapeamento de SKU (de→para) para correção automática em imports futuros.
-    Usa UPSERT: se já existir, atualiza o correto.
-    """
+    """Salva mapeamento de SKU (de→para) com UPSERT."""
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -331,23 +591,11 @@ def gravar_mapeamento_sku(engine, sku_errado, sku_correto):
 
 
 def buscar_pendentes_por_tipo(engine, tipo='sku'):
-    """
-    Busca vendas pendentes filtradas por tipo de motivo.
-    
-    VERSÃO 3.2: Usa ILIKE com padrões amplos para não perder vendas
-    de marketplaces que usam motivos ligeiramente diferentes.
-    
-    Args:
-        tipo: 'sku' → motivos relacionados a SKU (não cadastrado, não mapeado, etc.)
-              'divergencia' → motivo LIKE 'Divergência%'
-              'todos' → sem filtro de motivo
-    """
+    """Busca vendas pendentes filtradas por tipo de motivo (v3.2)."""
     query = "SELECT * FROM fact_vendas_pendentes WHERE status = 'Pendente'"
     params = []
 
     if tipo == 'sku':
-        # FIX v3.2: Pega TODAS as variações de motivo relacionadas a SKU/ASIN
-        # Inclui: 'SKU não cadastrado', 'SKU Amazon não mapeado', 'ASIN não configurado'
         query += " AND (motivo ILIKE %s OR motivo ILIKE %s OR motivo ILIKE %s)"
         params.append('%SKU%')
         params.append('%não cadastrado%')
@@ -373,14 +621,7 @@ def buscar_pendentes_por_tipo(engine, tipo='sku'):
 
 
 def buscar_pendentes_revisados(engine, limit=50):
-    """
-    NOVO v3.2: Busca histórico de vendas reprocessadas/revisadas.
-    Retorna DataFrame (não lista crua) — corrige o erro:
-    "List argument must consist only of tuples or Dictionaries"
-    
-    Esse erro ocorria quando a página de Vendas Pendentes tentava
-    exibir o histórico usando dados em formato incompatível.
-    """
+    """Busca histórico de vendas reprocessadas/revisadas (v3.2)."""
     query = """
         SELECT id, marketplace_origem, loja_origem, numero_pedido, 
                data_venda, sku, quantidade, valor_venda_efetivo,
@@ -407,21 +648,17 @@ def buscar_pendentes_revisados(engine, limit=50):
 def reprocessar_pendentes_manual(engine, ids_e_dados):
     """
     Reprocessa vendas pendentes com dados editados manualmente.
-    Cada item em ids_e_dados é um dict com:
-        id, sku (possivelmente corrigido), valor_venda_efetivo, comissao (tarifa),
-        imposto, frete, quantidade, sku_original (para mapeamento)
     
-    Busca custo de dim_produtos.preco_a_ser_considerado.
-    Grava no fact_vendas_snapshot e marca pendente como 'Revisado manualmente'.
-    
-    Retorna: {'sucesso': int, 'erros': int, 'mapeados': int, 'mensagem': str}
+    VERSÃO 3.3 - FIX CRÍTICO:
+        Para vendas Amazon, recalcula taxas a partir da dim_config_marketplace
+        em vez de usar os valores (possivelmente zerados) do pendente.
     """
     skus_validos = buscar_skus_validos(engine)
     custos_dict = buscar_custos_skus(engine)
 
     conn = engine.raw_connection()
     cursor = conn.cursor()
-    sucesso, erros, mapeados = 0, 0, 0
+    sucesso, erros, mapeados, sem_config = 0, 0, 0, 0
     ids_processados = []
 
     sql_ins = """
@@ -430,11 +667,11 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
             valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
             frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
-            margem_total, margem_percentual, data_processamento, arquivo_origem
+            margem_total, margem_percentual, data_processamento, arquivo_origem, logistica
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, NOW(), %s
+            %s, %s, NOW(), %s, %s
         )
     """
 
@@ -444,24 +681,52 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             sku = str(item['sku']).strip()
             sku_original = str(item.get('sku_original', sku)).strip()
 
-            # Validar SKU (possivelmente corrigido)
             if sku not in skus_validos:
                 erros += 1
                 continue
 
-            # Buscar custo
             custo_unit = custos_dict.get(sku, 0)
-
-            # Dados financeiros (podem ter sido editados)
             receita = float(item.get('valor_venda_efetivo', 0))
-            tarifa = float(item.get('comissao', 0))
-            imposto_val = float(item.get('imposto', 0))
-            frete = float(item.get('frete', 0))
             qtd = int(item.get('quantidade', 1))
+            imposto_val = float(item.get('imposto', 0))
+            marketplace = str(item.get('marketplace_origem', '')).upper()
+
+            # ============================================================
+            # v3.3: RECALCULAR TAXAS para Amazon
+            # ============================================================
+            if 'AMAZON' in marketplace:
+                asin = str(item.get('codigo_anuncio', '')).strip()
+                logistica_det = _detectar_logistica_do_pedido(item.get('numero_pedido', ''))
+                
+                conf = buscar_config_amazon_por_asin(engine, asin, logistica_det)
+                
+                if conf:
+                    comissao_pct = conf['comissao_percentual']
+                    taxa_fixa_unit = conf['taxa_fixa']
+                    frete_est = conf['frete_estimado']
+                    logistica_final = conf['logistica'] or logistica_det
+                    
+                    v_comissao = receita * (comissao_pct / 100)
+                    if frete_est > 0:
+                        v_frete = frete_est * qtd
+                        v_taxa_fixa = 0.0
+                    else:
+                        v_frete = 0.0
+                        v_taxa_fixa = taxa_fixa_unit * qtd
+                else:
+                    # Sem config — não gravar com taxa zero
+                    sem_config += 1
+                    erros += 1
+                    continue
+            else:
+                v_comissao = float(item.get('comissao', 0))
+                v_taxa_fixa = float(item.get('tarifa_fixa', 0))
+                v_frete = float(item.get('frete', 0))
+                logistica_final = item.get('logistica', None)
 
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_total = custo_unit * qtd
-            total_tarifas = tarifa + frete
+            total_tarifas = v_comissao + v_taxa_fixa + v_frete
             valor_liquido = receita - total_tarifas - imposto_val
             margem_total = valor_liquido - custo_total
             margem_pct = (margem_total / receita * 100) if receita > 0 else 0
@@ -476,10 +741,11 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 sku,
                 item.get('codigo_anuncio', ''),
                 qtd, preco_venda, 0, 0,
-                receita, custo_unit, custo_total, imposto_val, tarifa,
-                frete, 0, 0, total_tarifas, valor_liquido,
+                receita, custo_unit, custo_total, imposto_val, v_comissao,
+                v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
                 margem_total, margem_pct,
-                item.get('arquivo_origem', '')
+                item.get('arquivo_origem', ''),
+                logistica_final
             ))
 
             cursor.execute(f"RELEASE SAVEPOINT manual_{id_pendente}")
@@ -497,7 +763,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                     """, (sku_original, sku))
                     mapeados += 1
                 except Exception:
-                    pass  # Não bloquear por falha no mapeamento
+                    pass
 
         except Exception as e:
             try:
@@ -506,7 +772,6 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 pass
             erros += 1
 
-    # Marcar como revisados
     if ids_processados:
         placeholders = ','.join(['%s'] * len(ids_processados))
         cursor.execute(
@@ -518,16 +783,21 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     cursor.close()
     conn.close()
 
+    msg = f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s), {mapeados} mapeamento(s) salvo(s)."
+    if sem_config > 0:
+        msg += f" ⚠️ {sem_config} venda(s) sem config de ASIN — não gravadas."
+
     return {
         'sucesso': sucesso,
         'erros': erros,
         'mapeados': mapeados,
-        'mensagem': f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s), {mapeados} mapeamento(s) salvo(s)."
+        'sem_config': sem_config,
+        'mensagem': msg
     }
 
 
 # ============================================================
-# CURVA ABC (PARETO) - NOVO MODELO dim_tags_anuncio
+# CURVA ABC (PARETO)
 # ============================================================
 
 def recalcular_curva_abc(engine, dias=30):
