@@ -1,11 +1,16 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
-VERSAO 3.3 (17/03/2026):
+VERSAO 3.4 (17/03/2026):
+  - NOVO: Detecção automática de devoluções ao reimportar (todos marketplaces)
+         Se pedido mudou de "entregue" para "devolvido/cancelado", move para fact_devolucoes
+  - NOVO: Excluir lançamento individual do histórico (com vendas associadas)
+  - NOVO: Reprocessar lançamento para outra loja (corrigir loja errada)
+  - NOVO: Correções pontuais em vendas individuais (tab Consolidadas)
   - FIX: Periodo obrigatorio APENAS para Amazon (Shein/Magalu auto-detectam)
   - FIX: Preview com valores formatados (2 casas decimais)
   - FIX: Historico reprocessados usa buscar_pendentes_revisados
-  - NOVO: Pedido original exibido na tabela de vendas consolidadas
-  - NOVO: Integracao Shein e Magalu
+  - Pedido original exibido na tabela de vendas consolidadas
+  - Integracao Shein e Magalu
 """
 
 import streamlit as st
@@ -26,6 +31,10 @@ from processar_amazon import processar_arquivo_amazon, gravar_vendas_amazon
 from processar_shein import processar_arquivo_shein, gravar_vendas_shein
 from processar_magalu import processar_arquivo_magalu, gravar_vendas_magalu
 
+
+# ============================================================
+# HELPERS GERAIS
+# ============================================================
 
 def _detectar_marketplace(mktp):
     mktp_upper = mktp.upper()
@@ -84,6 +93,363 @@ def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, l
         cursor.close(); conn.close()
         return pd.DataFrame(rows, columns=cols)
     except: return pd.DataFrame()
+
+
+# ============================================================
+# FEATURE 1: SISTEMA DE DEVOLUÇÕES
+# Ao reimportar, compara status com o banco.
+# Se pedido mudou de entregue → devolvido/cancelado, move p/ fact_devolucoes.
+# Regra vale para TODOS os marketplaces.
+# ============================================================
+
+def _garantir_tabela_devolucoes(engine):
+    """Cria fact_devolucoes se não existir — espelha fact_vendas_snapshot + metadados."""
+    ddl = """
+    CREATE TABLE IF NOT EXISTS fact_devolucoes (
+        id SERIAL PRIMARY KEY,
+        -- campos espelhados de fact_vendas_snapshot
+        venda_id_original INTEGER,
+        numero_pedido VARCHAR(100),
+        pedido_original VARCHAR(100),
+        data_venda DATE,
+        sku VARCHAR(50),
+        codigo_anuncio VARCHAR(200),
+        quantidade INTEGER DEFAULT 1,
+        preco_venda NUMERIC(12,2) DEFAULT 0,
+        valor_venda_efetivo NUMERIC(12,2) DEFAULT 0,
+        custo_unitario NUMERIC(12,2) DEFAULT 0,
+        custo_total NUMERIC(12,2) DEFAULT 0,
+        imposto NUMERIC(12,2) DEFAULT 0,
+        comissao NUMERIC(12,2) DEFAULT 0,
+        frete NUMERIC(12,2) DEFAULT 0,
+        total_tarifas NUMERIC(12,2) DEFAULT 0,
+        valor_liquido NUMERIC(12,2) DEFAULT 0,
+        margem_total NUMERIC(12,2) DEFAULT 0,
+        margem_percentual NUMERIC(8,2) DEFAULT 0,
+        marketplace_origem VARCHAR(50),
+        loja_origem VARCHAR(100),
+        modo_envio VARCHAR(50),
+        tipo_logistica VARCHAR(50),
+        arquivo_origem VARCHAR(200),
+        -- campos de devolução
+        motivo_devolucao VARCHAR(200),
+        status_novo VARCHAR(50),
+        data_devolucao TIMESTAMP DEFAULT NOW(),
+        movido_de_vendas BOOLEAN DEFAULT TRUE,
+        arquivo_deteccao VARCHAR(200),
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_devolucoes_pedido ON fact_devolucoes(numero_pedido);
+    CREATE INDEX IF NOT EXISTS idx_devolucoes_data ON fact_devolucoes(data_venda);
+    CREATE INDEX IF NOT EXISTS idx_devolucoes_marketplace ON fact_devolucoes(marketplace_origem);
+    """
+    try:
+        conn = engine.raw_connection(); cursor = conn.cursor()
+        cursor.execute(ddl)
+        conn.commit(); cursor.close(); conn.close()
+    except Exception as e:
+        print(f"[NALA] Erro ao criar fact_devolucoes: {e}")
+
+
+def _extrair_pedidos_descartes(descartes):
+    """
+    Extrai números de pedido da lista de descartes (cancelados/devolvidos).
+    Aceita múltiplos formatos — cada processador pode usar campos diferentes.
+    Retorna dict { numero_pedido: motivo }.
+    """
+    pedidos = {}
+    if not descartes:
+        return pedidos
+
+    for item in descartes:
+        if isinstance(item, dict):
+            # Tenta vários campos de pedido possíveis
+            pedido = (
+                item.get('numero_pedido') or item.get('pedido') or
+                item.get('order_id') or item.get('pedido_original') or
+                item.get('numero_orden') or ''
+            )
+            pedido = str(pedido).strip()
+            if not pedido:
+                continue
+            # Tenta extrair motivo
+            motivo = (
+                item.get('motivo') or item.get('status') or
+                item.get('motivo_descarte') or item.get('razao') or 'Devolvido/Cancelado'
+            )
+            pedidos[pedido] = str(motivo)
+        elif isinstance(item, (list, tuple)) and len(item) >= 1:
+            pedidos[str(item[0]).strip()] = item[1] if len(item) > 1 else 'Devolvido/Cancelado'
+        elif isinstance(item, str):
+            pedidos[item.strip()] = 'Devolvido/Cancelado'
+
+    return pedidos
+
+
+def _processar_devolucoes(engine, descartes, marketplace, loja, arquivo_nome):
+    """
+    Compara pedidos descartados (cancelados/devolvidos) com fact_vendas_snapshot.
+    Se o pedido existia como venda, move para fact_devolucoes.
+
+    Regra universal — vale para TODOS os marketplaces.
+
+    Returns: (movidos, erros) — contagem de registros movidos e erros
+    """
+    pedidos_map = _extrair_pedidos_descartes(descartes)
+    if not pedidos_map:
+        return 0, 0
+
+    _garantir_tabela_devolucoes(engine)
+
+    pedidos_list = list(pedidos_map.keys())
+    movidos = 0
+    erros = 0
+
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        # Busca vendas existentes cujo pedido apareceu como devolvido/cancelado
+        placeholders = ','.join(['%s'] * len(pedidos_list))
+        cursor.execute(f"""
+            SELECT * FROM fact_vendas_snapshot
+            WHERE numero_pedido IN ({placeholders})
+              AND marketplace_origem = %s
+              AND loja_origem = %s
+        """, pedidos_list + [marketplace, loja])
+
+        cols = [d[0] for d in cursor.description]
+        vendas_existentes = cursor.fetchall()
+
+        if not vendas_existentes:
+            cursor.close(); conn.close()
+            return 0, 0
+
+        # Para cada venda encontrada, move para fact_devolucoes
+        ids_mover = []
+        for row in vendas_existentes:
+            venda = dict(zip(cols, row))
+            venda_id = venda.get('id')
+            numero_pedido = str(venda.get('numero_pedido', ''))
+            motivo = pedidos_map.get(numero_pedido, 'Devolvido/Cancelado')
+
+            try:
+                cursor.execute("""
+                    INSERT INTO fact_devolucoes (
+                        venda_id_original, numero_pedido, pedido_original, data_venda,
+                        sku, codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo,
+                        custo_unitario, custo_total, imposto, comissao, frete,
+                        total_tarifas, valor_liquido, margem_total, margem_percentual,
+                        marketplace_origem, loja_origem, modo_envio, tipo_logistica,
+                        arquivo_origem, motivo_devolucao, status_novo,
+                        data_devolucao, movido_de_vendas, arquivo_deteccao
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), TRUE, %s
+                    )
+                """, (
+                    venda_id,
+                    venda.get('numero_pedido'),
+                    venda.get('pedido_original'),
+                    venda.get('data_venda'),
+                    venda.get('sku'),
+                    venda.get('codigo_anuncio'),
+                    venda.get('quantidade', 1),
+                    venda.get('preco_venda', 0),
+                    venda.get('valor_venda_efetivo', 0),
+                    venda.get('custo_unitario', 0),
+                    venda.get('custo_total', 0),
+                    venda.get('imposto', 0),
+                    venda.get('comissao', 0),
+                    venda.get('frete', 0),
+                    venda.get('total_tarifas', 0),
+                    venda.get('valor_liquido', 0),
+                    venda.get('margem_total', 0),
+                    venda.get('margem_percentual', 0),
+                    venda.get('marketplace_origem'),
+                    venda.get('loja_origem'),
+                    venda.get('modo_envio'),
+                    venda.get('tipo_logistica'),
+                    venda.get('arquivo_origem'),
+                    motivo,
+                    motivo,
+                    arquivo_nome,
+                ))
+                ids_mover.append(venda_id)
+                movidos += 1
+            except Exception as e:
+                erros += 1
+                print(f"[NALA] Erro ao mover pedido {numero_pedido} para devoluções: {e}")
+
+        # Remove de fact_vendas_snapshot os registros movidos
+        if ids_mover:
+            ph = ','.join(['%s'] * len(ids_mover))
+            cursor.execute(f"DELETE FROM fact_vendas_snapshot WHERE id IN ({ph})", ids_mover)
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        erros += 1
+        print(f"[NALA] Erro geral ao processar devoluções: {e}")
+
+    return movidos, erros
+
+
+# ============================================================
+# FEATURE 2: EXCLUIR LANÇAMENTO DO HISTÓRICO
+# Remove registro do log_uploads + vendas associadas de fact_vendas_snapshot
+# ============================================================
+
+def _excluir_lancamento(engine, log_id, marketplace, loja, arquivo_nome, periodo_inicio, periodo_fim):
+    """
+    Exclui lançamento do log_uploads e todas as vendas associadas em fact_vendas_snapshot.
+    Usa marketplace + loja + arquivo_nome + período para match seguro.
+    Returns: (vendas_excluidas, sucesso, mensagem)
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        # 1. Excluir vendas associadas
+        where_vendas = "marketplace_origem = %s AND loja_origem = %s AND arquivo_origem = %s"
+        params_vendas = [marketplace, loja, arquivo_nome]
+
+        if periodo_inicio and periodo_fim:
+            where_vendas += " AND data_venda BETWEEN %s AND %s"
+            params_vendas.extend([str(periodo_inicio), str(periodo_fim)])
+
+        cursor.execute(f"DELETE FROM fact_vendas_snapshot WHERE {where_vendas}", params_vendas)
+        vendas_excluidas = cursor.rowcount
+
+        # 2. Excluir também devoluções associadas (se existirem)
+        try:
+            cursor.execute(f"DELETE FROM fact_devolucoes WHERE {where_vendas}", params_vendas)
+        except:
+            pass  # Tabela pode não existir ainda
+
+        # 3. Excluir do log
+        cursor.execute("DELETE FROM log_uploads WHERE id = %s", (log_id,))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return vendas_excluidas, True, f"Lançamento excluído: {vendas_excluidas} venda(s) removida(s)"
+
+    except Exception as e:
+        return 0, False, f"Erro ao excluir: {e}"
+
+
+# ============================================================
+# FEATURE 3: REPROCESSAR PARA OUTRA LOJA
+# Atualiza loja_origem + recalcula imposto de vendas já gravadas
+# ============================================================
+
+def _reprocessar_outra_loja(engine, log_id, marketplace, loja_antiga, arquivo_nome,
+                             periodo_inicio, periodo_fim, loja_nova, imposto_novo):
+    """
+    Troca a loja de um lançamento inteiro:
+    1. Atualiza loja_origem em fact_vendas_snapshot
+    2. Recalcula imposto com a alíquota da nova loja
+    3. Recalcula margem (valor_liquido e margem_total/margem_percentual)
+    4. Atualiza log_uploads
+    Returns: (atualizados, sucesso, mensagem)
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        # Monta WHERE para identificar vendas do lançamento
+        where = "marketplace_origem = %s AND loja_origem = %s AND arquivo_origem = %s"
+        params = [marketplace, loja_antiga, arquivo_nome]
+        if periodo_inicio and periodo_fim:
+            where += " AND data_venda BETWEEN %s AND %s"
+            params.extend([str(periodo_inicio), str(periodo_fim)])
+
+        # Recalcula: imposto = valor_venda_efetivo * (imposto_novo / 100)
+        # valor_liquido = valor_venda_efetivo - comissao - imposto_novo_calc - frete - total_tarifas
+        # margem_total = valor_liquido - custo_total
+        # margem_percentual = (margem_total / valor_venda_efetivo * 100) ou 0
+        imposto_decimal = float(imposto_novo) / 100.0
+
+        cursor.execute(f"""
+            UPDATE fact_vendas_snapshot SET
+                loja_origem = %s,
+                imposto = valor_venda_efetivo * %s,
+                valor_liquido = valor_venda_efetivo - comissao - (valor_venda_efetivo * %s) - frete - COALESCE(total_tarifas, 0),
+                margem_total = (valor_venda_efetivo - comissao - (valor_venda_efetivo * %s) - frete - COALESCE(total_tarifas, 0)) - custo_total,
+                margem_percentual = CASE
+                    WHEN valor_venda_efetivo > 0 THEN
+                        (((valor_venda_efetivo - comissao - (valor_venda_efetivo * %s) - frete - COALESCE(total_tarifas, 0)) - custo_total)
+                         / valor_venda_efetivo * 100)
+                    ELSE 0
+                END
+            WHERE {where}
+        """, [loja_nova, imposto_decimal, imposto_decimal, imposto_decimal, imposto_decimal] + params)
+
+        atualizados = cursor.rowcount
+
+        # Atualiza log_uploads
+        cursor.execute("UPDATE log_uploads SET loja = %s WHERE id = %s", (loja_nova, log_id))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        return atualizados, True, f"Lançamento migrado para '{loja_nova}': {atualizados} venda(s) recalculada(s)"
+
+    except Exception as e:
+        return 0, False, f"Erro ao reprocessar: {e}"
+
+
+# ============================================================
+# FEATURE 4: CORREÇÕES PONTUAIS EM VENDAS INDIVIDUAIS
+# Permite editar campos financeiros de vendas já gravadas
+# ============================================================
+
+def _salvar_correcao_venda(engine, venda_id, campos_alterados):
+    """
+    Salva correções pontuais em uma venda.
+    Recalcula valor_liquido, margem_total e margem_percentual.
+    Returns: (sucesso, mensagem)
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        sets = []
+        params = []
+        for campo, valor in campos_alterados.items():
+            sets.append(f"{campo} = %s")
+            params.append(valor)
+
+        if sets:
+            cursor.execute(f"UPDATE fact_vendas_snapshot SET {', '.join(sets)} WHERE id = %s",
+                           params + [venda_id])
+
+        # Recalcula campos derivados
+        cursor.execute("""
+            UPDATE fact_vendas_snapshot SET
+                valor_liquido = valor_venda_efetivo - comissao - imposto - frete - COALESCE(total_tarifas, 0),
+                margem_total = (valor_venda_efetivo - comissao - imposto - frete - COALESCE(total_tarifas, 0)) - custo_total,
+                margem_percentual = CASE
+                    WHEN valor_venda_efetivo > 0 THEN
+                        (((valor_venda_efetivo - comissao - imposto - frete - COALESCE(total_tarifas, 0)) - custo_total)
+                         / valor_venda_efetivo * 100)
+                    ELSE 0
+                END
+            WHERE id = %s
+        """, (venda_id,))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True, "Venda corrigida com sucesso"
+
+    except Exception as e:
+        return False, f"Erro ao corrigir: {e}"
 
 
 # ============================================================
@@ -205,7 +571,6 @@ def tab_processar_upload(engine):
             st.subheader("📋 Preview das Vendas (primeiras 20 linhas)")
             df_preview = df_proc.head(20).copy()
 
-            # Colunas financeiras para formatar
             colunas_valor = ['receita', 'tarifa', 'imposto', 'frete', 'custo', 'margem',
                              'comissao', 'taxa_fixa', 'taxa_estocagem', 'valor_liquido',
                              'preco_venda', 'desconto_parceiro', 'desconto_marketplace', 'total_tarifas']
@@ -215,7 +580,6 @@ def tab_processar_upload(engine):
             if 'margem_pct' in df_preview.columns:
                 df_preview['margem_pct'] = df_preview['margem_pct'].apply(formatar_percentual)
 
-            # Escolher colunas relevantes para exibicao
             colunas_exibir = []
             for c in ['pedido_original', 'pedido', 'data', 'sku', 'sku_original', 'qtd',
                        'preco_venda', 'receita', 'comissao', 'tarifa_fixa', 'frete',
@@ -248,17 +612,25 @@ def tab_processar_upload(engine):
                         df_proc, mktp, loja, arquivo_nome, engine, d_ini, d_fim,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
                 elif mp_key == 'SHEIN':
-                    # Shein: datas auto-detectadas (data_ini/data_fim opcionais)
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_shein(
                         df_proc, mktp, loja, arquivo_nome, engine,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
                 elif mp_key == 'MAGALU':
-                    # Magalu: datas auto-detectadas
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_magalu(
                         df_proc, mktp, loja, arquivo_nome, engine,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
                 else:
                     st.error("⚠️ Processador não identificado."); return
+
+                # ─── v3.4: DETECÇÃO DE DEVOLUÇÕES ───
+                # Compara descartes com vendas existentes no banco.
+                # Se pedido existia e agora veio como devolvido/cancelado → move p/ fact_devolucoes
+                devolvidos = 0
+                descartes_list = info.get('descartes', [])
+                if descartes_list:
+                    devolvidos, erros_dev = _processar_devolucoes(
+                        engine, descartes_list, mktp, loja, arquivo_nome
+                    )
 
                 # Log
                 try:
@@ -281,6 +653,9 @@ def tab_processar_upload(engine):
                 if pendentes > 0: st.warning(f"⏳ {pendentes} pendente(s) — veja tab Vendas Pendentes")
                 if descartadas > 0: st.info(f"🗑️ {descartadas} cancelada(s)/devolvida(s) rastreadas")
                 if atualizados > 0: st.info(f"🔄 {atualizados} registro(s) do período substituídos")
+                # ─── v3.4: Feedback devoluções ───
+                if devolvidos > 0:
+                    st.warning(f"↩️ {devolvidos} pedido(s) movido(s) para devoluções (status mudou de entregue → devolvido/cancelado)")
                 if erros > 0: st.warning(f"⚠️ {erros} linha(s) com erro")
                 if skus_invalidos:
                     lista = ', '.join(sorted(list(skus_invalidos))[:10])
@@ -295,7 +670,7 @@ def tab_processar_upload(engine):
 
 
 # ============================================================
-# TAB 2: VENDAS CONSOLIDADAS
+# TAB 2: VENDAS CONSOLIDADAS (com correções pontuais v3.4)
 # ============================================================
 
 def tab_vendas_consolidadas(engine):
@@ -377,7 +752,6 @@ def tab_vendas_consolidadas(engine):
     df_d['custo_total'] = df_d['custo_total'].apply(formatar_valor)
     df_d['margem_percentual'] = df_d['margem_percentual'].apply(formatar_percentual)
 
-    # FIX v3.3: Mostrar pedido_original se existir
     cols_exibir = ['data_venda', 'loja_origem', 'sku', 'codigo_anuncio', 'quantidade',
                    'valor_venda_efetivo', 'custo_total', 'margem_percentual']
     if 'pedido_original' in df_d.columns:
@@ -399,6 +773,75 @@ def tab_vendas_consolidadas(engine):
             f"vendas_{data_ini.strftime('%d%m%Y')}_{data_fim.strftime('%d%m%Y')}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    # ─── v3.4: CORREÇÕES PONTUAIS ───
+    st.divider()
+    with st.expander("✏️ Correções Pontuais (editar venda individual)", expanded=False):
+        st.caption("Edite campos financeiros de vendas individuais. Os campos derivados (líquido, margem) serão recalculados automaticamente.")
+
+        # Busca ID do pedido para corrigir
+        id_corrigir = st.number_input("ID da venda (coluna ID):", min_value=1, step=1, key="id_correcao")
+
+        if st.button("🔍 Carregar venda", key="btn_carregar_correcao"):
+            try:
+                conn = engine.raw_connection(); cursor = conn.cursor()
+                cursor.execute("SELECT * FROM fact_vendas_snapshot WHERE id = %s", (int(id_corrigir),))
+                cols_v = [d[0] for d in cursor.description]; row = cursor.fetchone()
+                cursor.close(); conn.close()
+                if row:
+                    st.session_state['venda_correcao'] = dict(zip(cols_v, row))
+                else:
+                    st.warning("Venda não encontrada."); st.session_state.pop('venda_correcao', None)
+            except Exception as e:
+                st.error(f"Erro: {e}")
+
+        if 'venda_correcao' in st.session_state:
+            v = st.session_state['venda_correcao']
+            st.markdown(f"**Pedido:** {v.get('numero_pedido','-')} | **SKU:** {v.get('sku','-')} | "
+                        f"**Loja:** {v.get('loja_origem','-')} | **Data:** {v.get('data_venda','-')}")
+
+            c1, c2, c3 = st.columns(3)
+            novo_receita = c1.number_input("Receita (R$):", value=float(v.get('valor_venda_efetivo', 0)),
+                                           format="%.2f", key="corr_receita")
+            novo_comissao = c2.number_input("Comissão (R$):", value=float(v.get('comissao', 0)),
+                                            format="%.2f", key="corr_comissao")
+            novo_imposto = c3.number_input("Imposto (R$):", value=float(v.get('imposto', 0)),
+                                           format="%.2f", key="corr_imposto")
+
+            c4, c5, c6 = st.columns(3)
+            novo_frete = c4.number_input("Frete (R$):", value=float(v.get('frete', 0)),
+                                         format="%.2f", key="corr_frete")
+            novo_custo = c5.number_input("Custo Total (R$):", value=float(v.get('custo_total', 0)),
+                                         format="%.2f", key="corr_custo")
+            novo_tarifas = c6.number_input("Total Tarifas (R$):", value=float(v.get('total_tarifas', 0) or 0),
+                                           format="%.2f", key="corr_tarifas")
+
+            # Preview do recalculo
+            liq_prev = novo_receita - novo_comissao - novo_imposto - novo_frete - novo_tarifas
+            mg_prev = liq_prev - novo_custo
+            mg_pct_prev = (mg_prev / novo_receita * 100) if novo_receita > 0 else 0
+            st.info(f"📊 Preview: Líquido = {formatar_valor(liq_prev)} | "
+                    f"Margem = {formatar_valor(mg_prev)} ({formatar_percentual(mg_pct_prev)})")
+
+            if st.button("💾 Salvar Correção", key="btn_salvar_correcao", type="primary"):
+                campos = {
+                    'valor_venda_efetivo': novo_receita,
+                    'comissao': novo_comissao,
+                    'imposto': novo_imposto,
+                    'frete': novo_frete,
+                    'custo_total': novo_custo,
+                    'total_tarifas': novo_tarifas,
+                }
+                ok, msg = _salvar_correcao_venda(engine, int(v['id']), campos)
+                if ok:
+                    st.success(f"✅ {msg}")
+                    st.session_state.pop('venda_correcao', None)
+                    try: recalcular_curva_abc(engine, dias=30)
+                    except: pass
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+    # ─── DELETAR (existente) ───
     st.divider()
     with st.expander("🗑️ Deletar Vendas (ADMIN)", expanded=False):
         st.warning("⚠️ **ATENÇÃO:** Ação irreversível!")
@@ -443,22 +886,177 @@ def tab_vendas_consolidadas(engine):
 
 
 # ============================================================
-# TAB 3: HISTORICO
+# TAB 3: HISTORICO (com excluir + reprocessar outra loja v3.4)
 # ============================================================
 
 def tab_historico_uploads(engine):
     st.subheader("📚 Histórico de Importações")
+
     try:
-        df_log = pd.read_sql("""SELECT data_upload, marketplace, loja, arquivo_nome,
+        df_log = pd.read_sql("""SELECT id, data_upload, marketplace, loja, arquivo_nome,
             periodo_inicio, periodo_fim, total_linhas, linhas_importadas, linhas_erro, status
             FROM log_uploads ORDER BY data_upload DESC LIMIT 200""", engine)
-        if not df_log.empty:
-            df_log['data_upload'] = pd.to_datetime(df_log['data_upload']).dt.strftime('%d/%m/%Y %H:%M')
-            for c in ['periodo_inicio','periodo_fim']:
-                if c in df_log.columns: df_log[c] = pd.to_datetime(df_log[c], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
-            st.dataframe(df_log, use_container_width=True, height=600)
-        else: st.info("Nenhuma importação registrada.")
-    except Exception as e: st.error(f"⚠️ Erro: {e}")
+    except Exception as e:
+        st.error(f"⚠️ Erro: {e}"); return
+
+    if df_log.empty:
+        st.info("Nenhuma importação registrada."); return
+
+    # Formata para exibição
+    df_exib = df_log.copy()
+    df_exib['data_upload'] = pd.to_datetime(df_exib['data_upload']).dt.strftime('%d/%m/%Y %H:%M')
+    for c in ['periodo_inicio','periodo_fim']:
+        if c in df_exib.columns:
+            df_exib[c] = pd.to_datetime(df_exib[c], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
+
+    st.dataframe(df_exib.drop(columns=['id']), use_container_width=True, height=400)
+
+    # ─── v3.4: EXCLUIR LANÇAMENTO ───
+    st.divider()
+    with st.expander("🗑️ Excluir Lançamento (remove upload + vendas associadas)", expanded=False):
+        st.warning("⚠️ Remove o registro do histórico E todas as vendas gravadas por esse upload.")
+
+        # Monta opções legíveis
+        opcoes_log = {}
+        for _, row in df_log.iterrows():
+            dt = pd.to_datetime(row['data_upload']).strftime('%d/%m/%Y %H:%M')
+            p_ini = pd.to_datetime(row['periodo_inicio'], errors='coerce')
+            p_fim = pd.to_datetime(row['periodo_fim'], errors='coerce')
+            p_ini_str = p_ini.strftime('%d/%m/%Y') if pd.notna(p_ini) else '-'
+            p_fim_str = p_fim.strftime('%d/%m/%Y') if pd.notna(p_fim) else '-'
+            label = f"[{dt}] {row['marketplace']} — {row['loja']} — {row['arquivo_nome']} ({p_ini_str} a {p_fim_str}) — {row['linhas_importadas']} vendas"
+            opcoes_log[label] = row
+
+        sel_label = st.selectbox("Selecione o lançamento:", list(opcoes_log.keys()), key="sel_excluir_log")
+
+        if sel_label:
+            sel = opcoes_log[sel_label]
+            st.caption(f"ID: {sel['id']} | Marketplace: {sel['marketplace']} | Loja: {sel['loja']} | "
+                       f"Arquivo: {sel['arquivo_nome']} | Linhas importadas: {sel['linhas_importadas']}")
+
+            conf_excluir = st.checkbox("✅ Confirmo que desejo excluir este lançamento e TODAS as vendas associadas",
+                                       key="conf_excluir_lancamento")
+
+            if st.button("🗑️ EXCLUIR LANÇAMENTO", type="secondary", key="btn_excluir_lancamento"):
+                if not conf_excluir:
+                    st.warning("Confirme antes de excluir."); return
+
+                vendas_del, ok, msg = _excluir_lancamento(
+                    engine,
+                    log_id=int(sel['id']),
+                    marketplace=sel['marketplace'],
+                    loja=sel['loja'],
+                    arquivo_nome=sel['arquivo_nome'],
+                    periodo_inicio=sel['periodo_inicio'],
+                    periodo_fim=sel['periodo_fim'],
+                )
+                if ok:
+                    st.success(f"✅ {msg}")
+                    try: recalcular_curva_abc(engine, dias=30)
+                    except: pass
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+    # ─── v3.4: REPROCESSAR PARA OUTRA LOJA ───
+    with st.expander("🔄 Reprocessar para Outra Loja (corrigir loja errada)", expanded=False):
+        st.info("Use quando subiu um relatório na loja errada. As vendas serão migradas e o imposto recalculado.")
+
+        opcoes_repr = {}
+        for _, row in df_log.iterrows():
+            dt = pd.to_datetime(row['data_upload']).strftime('%d/%m/%Y %H:%M')
+            label = f"[{dt}] {row['marketplace']} — {row['loja']} — {row['arquivo_nome']} — {row['linhas_importadas']} vendas"
+            opcoes_repr[label] = row
+
+        sel_repr_label = st.selectbox("Selecione o lançamento:", list(opcoes_repr.keys()), key="sel_repr_log")
+
+        if sel_repr_label:
+            sel_r = opcoes_repr[sel_repr_label]
+
+            # Carrega lojas do mesmo marketplace para destino
+            try:
+                df_lojas_mktp = pd.read_sql(
+                    "SELECT loja, imposto FROM dim_lojas WHERE marketplace = %s",
+                    engine, params=(sel_r['marketplace'],)
+                )
+            except:
+                df_lojas_mktp = pd.DataFrame(columns=['loja','imposto'])
+
+            if df_lojas_mktp.empty:
+                st.warning("Nenhuma outra loja cadastrada neste marketplace."); return
+
+            # Remove a loja atual das opções
+            lojas_destino = df_lojas_mktp[df_lojas_mktp['loja'] != sel_r['loja']]
+            if lojas_destino.empty:
+                st.warning("Só existe uma loja neste marketplace. Cadastre outra em Config."); return
+
+            opcoes_loja = {}
+            for _, lr in lojas_destino.iterrows():
+                label_loja = f"{lr['loja']} (Imposto: {formatar_percentual(lr['imposto'])})"
+                opcoes_loja[label_loja] = lr
+
+            sel_nova_loja = st.selectbox("Nova loja destino:", list(opcoes_loja.keys()), key="sel_nova_loja")
+
+            if sel_nova_loja:
+                nova = opcoes_loja[sel_nova_loja]
+                st.caption(f"De: **{sel_r['loja']}** → Para: **{nova['loja']}** | "
+                           f"Novo imposto: {formatar_percentual(nova['imposto'])}")
+
+                conf_repr = st.checkbox("✅ Confirmo a migração deste lançamento", key="conf_repr_loja")
+
+                if st.button("🔄 MIGRAR LANÇAMENTO", type="primary", key="btn_repr_loja"):
+                    if not conf_repr:
+                        st.warning("Confirme antes de migrar."); return
+
+                    atualiz, ok, msg = _reprocessar_outra_loja(
+                        engine,
+                        log_id=int(sel_r['id']),
+                        marketplace=sel_r['marketplace'],
+                        loja_antiga=sel_r['loja'],
+                        arquivo_nome=sel_r['arquivo_nome'],
+                        periodo_inicio=sel_r['periodo_inicio'],
+                        periodo_fim=sel_r['periodo_fim'],
+                        loja_nova=nova['loja'],
+                        imposto_novo=float(nova['imposto']),
+                    )
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        try: recalcular_curva_abc(engine, dias=30)
+                        except: pass
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {msg}")
+
+    # ─── v3.4: DEVOLUÇÕES ───
+    with st.expander("↩️ Devoluções Detectadas", expanded=False):
+        _garantir_tabela_devolucoes(engine)
+        try:
+            df_dev = pd.read_sql("""
+                SELECT numero_pedido, sku, data_venda, marketplace_origem, loja_origem,
+                       valor_venda_efetivo, motivo_devolucao, data_devolucao, arquivo_deteccao
+                FROM fact_devolucoes
+                ORDER BY data_devolucao DESC
+                LIMIT 200
+            """, engine)
+            if not df_dev.empty:
+                df_dev['data_venda'] = pd.to_datetime(df_dev['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
+                df_dev['data_devolucao'] = pd.to_datetime(df_dev['data_devolucao'], errors='coerce').dt.strftime('%d/%m/%Y %H:%M').fillna('-')
+                df_dev['valor_venda_efetivo'] = df_dev['valor_venda_efetivo'].apply(formatar_valor)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total Devoluções", formatar_quantidade(len(df_dev)))
+                # Precisamos dos valores brutos para somar — refaz query simples
+                try:
+                    df_soma = pd.read_sql("SELECT COALESCE(SUM(valor_venda_efetivo),0) as total FROM fact_devolucoes", engine)
+                    c2.metric("Valor Total", formatar_valor(df_soma['total'].iloc[0]))
+                except:
+                    pass
+
+                st.dataframe(df_dev, use_container_width=True, height=300, hide_index=True)
+            else:
+                st.info("Nenhuma devolução detectada ainda.")
+        except Exception as e:
+            st.info("Tabela de devoluções será criada no próximo upload.")
 
 
 # ============================================================
