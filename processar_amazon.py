@@ -2,9 +2,14 @@
 PROCESSADOR AMAZON - Sistema Nala
 Processa Business Report (CSV) com datas acumuladas
 
+VERSÃO 1.4 (17/03/2026):
+  - NOVO: Salva coluna 'logistica' (FBA/DBA) em cada venda no snapshot e pendentes
+  - NOVO: Logística detectada é passada para descartes também
+  - MELHORIA: INSERT no snapshot e pendentes agora inclui campo logistica
+  - Todas as demais lógicas v1.3 mantidas intactas
+
 VERSÃO 1.3 (16/03/2026):
   - FIX CRÍTICO: Lookup de config agora usa (asin + logística) para pegar taxas corretas
-         Antes, set_index('asin') sobrescrevia duplicatas e perdia configs de FBA/DBA
   - FIX: ASINs sem config vão para pendentes (antes usava fallback silencioso de 15%)
   - FIX: Detecção de logística pelo sufixo do SKU (-FBA, -DBA)
   - FIX: Motivo padronizado para 'SKU não cadastrado'
@@ -40,19 +45,21 @@ def _detectar_logistica(sku_amz):
     """
     Detecta o tipo de logística pelo sufixo do SKU da Amazon.
     
+    Regra: se contém '-FBA' → FBA, senão → DBA (sem sufixo = DBA).
+    
     Exemplos:
         'L-0152-FBA' → 'FBA'
         'L-0152-DBA' → 'DBA'
-        'L-0152'     → None (sem sufixo detectável)
+        'L-0152'     → 'DBA'  (v1.4: agora retorna DBA em vez de None)
     
-    Retorna: 'FBA', 'DBA' ou None
+    Retorna: 'FBA' ou 'DBA'
     """
     sku_upper = str(sku_amz).upper().strip()
     if '-FBA' in sku_upper:
         return 'FBA'
     elif '-DBA' in sku_upper:
         return 'DBA'
-    return None
+    return 'DBA'  # v1.4: sem sufixo = DBA (antes retornava None)
 
 
 def _buscar_config_amazon(engine):
@@ -60,11 +67,8 @@ def _buscar_config_amazon(engine):
     Busca TODAS as configurações de anúncios Amazon.
     
     Retorna dois dicts:
-        config_por_asin_logistica: {(asin, logistica): {sku, comissao_percentual, taxa_fixa, frete_estimado}}
+        config_por_asin_logistica: {(asin, logistica): {sku, comissao_percentual, taxa_fixa, frete_estimado, logistica}}
         config_por_asin: {asin: [{sku, logistica, comissao_percentual, taxa_fixa, frete_estimado}, ...]}
-    
-    O primeiro é para match exato (asin + logística).
-    O segundo é fallback quando não consegue detectar logística do SKU.
     """
     config_por_asin_logistica = {}
     config_por_asin = {}
@@ -99,10 +103,8 @@ def _buscar_config_amazon(engine):
                 'frete_estimado': float(dados.get('frete_estimado', 0) or 0),
             }
             
-            # Dict por (asin, logistica) — match exato
             config_por_asin_logistica[(asin, logistica)] = config_item
             
-            # Dict por asin — lista de todas as logísticas (para fallback)
             if asin not in config_por_asin:
                 config_por_asin[asin] = []
             config_por_asin[asin].append(config_item)
@@ -119,7 +121,7 @@ def _resolver_config(asin, sku_amz, config_por_asin_logistica, config_por_asin):
     
     Ordem de prioridade:
         1. Match exato: (asin, logística detectada do SKU)
-        2. Match parcial por logística: FBA no sufixo → procura configs FBA do ASIN
+        2. Match parcial por logística
         3. Fallback: primeira config do ASIN (quando só tem uma logística)
         4. None: ASIN não configurado → vai para pendentes
     
@@ -160,7 +162,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
     """
     Lê o Business Report da Amazon e prepara os dados para gravação.
 
-    VERSÃO 1.3: Config com logística, ASINs sem config → pendentes.
+    VERSÃO 1.4: Inclui campo 'logistica' em cada venda.
     """
     try:
         df = pd.read_csv(arquivo)
@@ -179,7 +181,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
     if 'sku_amz' not in df.columns:
         return None, "Coluna 'Código SKU' não encontrada no arquivo."
 
-    # 2. BUSCAR CONFIGURAÇÕES (v1.3: com logística, sem duplicatas)
+    # 2. BUSCAR CONFIGURAÇÕES (v1.3: com logística)
     config_por_asin_logistica, config_por_asin = _buscar_config_amazon(engine)
     
     total_configs = len(config_por_asin_logistica)
@@ -212,6 +214,9 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
             except (ValueError, TypeError):
                 qtd = 0
 
+            # v1.4: Detectar logística para todos os caminhos
+            logistica_detectada = _detectar_logistica(sku_amz)
+
             if qtd <= 0 or receita <= 0:
                 if sku_amz:
                     descartes.append({
@@ -222,6 +227,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                         'receita_estimada': max(receita, 0),
                         'tarifa_venda_estimada': 0,
                         'tarifa_envio_estimada': 0,
+                        'logistica': logistica_detectada,  # v1.4
                     })
                 linhas_descartadas += 1
                 continue
@@ -234,6 +240,9 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
             asin_configurado = conf is not None
             if not asin_configurado:
                 asins_sem_config.add(asin)
+
+            # v1.4: Pegar logística da config (mais confiável) ou usar a detectada
+            logistica_final = conf.get('logistica', logistica_detectada) if conf else logistica_detectada
 
             # ============================================================
             # RESOLUÇÃO DE SKU
@@ -299,6 +308,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 'margem': margem,
                 'margem_pct': margem_pct,
                 'tem_custo': custo_un > 0,
+                'logistica': logistica_final,  # v1.4: NOVO campo
                 '_custo_unit': custo_un,
                 '_asin_configurado': asin_configurado,
             })
@@ -346,9 +356,9 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
     """
     Grava vendas da Amazon com Delete-Before-Insert para evitar duplicatas de período.
 
-    VERSÃO 1.3:
-    - FIX: ASINs sem config → pendentes com motivo 'ASIN não configurado'
-    - FIX: Motivo padronizado 'SKU não cadastrado' para SKUs não cadastrados
+    VERSÃO 1.4:
+    - NOVO: Salva coluna 'logistica' no fact_vendas_snapshot e fact_vendas_pendentes
+    - FIX v1.3 mantido: ASINs sem config → pendentes com motivo 'ASIN não configurado'
     """
     if descartes is None:
         descartes = []
@@ -408,17 +418,18 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                 err += 1
 
         # 3. GRAVAR VENDAS
+        # v1.4: Adicionada coluna 'logistica' ao INSERT
         sql_ins = """
             INSERT INTO fact_vendas_snapshot (
                 marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
                 codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
                 valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
                 frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
-                margem_total, margem_percentual, data_processamento, arquivo_origem
+                margem_total, margem_percentual, data_processamento, arquivo_origem, logistica
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, NOW(), %s
+                %s, %s, NOW(), %s, %s
             )
         """
 
@@ -430,6 +441,7 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
 
                 sku = str(row['sku']).strip()
                 asin = str(row.get('asin', '')).strip()
+                logistica = str(row.get('logistica', 'DBA')).strip()  # v1.4
 
                 data_venda = datetime.strptime(row['data'], "%d/%m/%Y").date()
                 receita = float(row['receita'])
@@ -476,6 +488,7 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                         'valor_liquido': valor_liquido,
                         'arquivo_origem': arq_nome,
                         'motivo': motivo,
+                        'logistica': logistica,  # v1.4: NOVO
                     }
 
                     cursor.execute(f"SAVEPOINT pend_amz_{idx}")
@@ -506,7 +519,7 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                     qtd, preco_venda, 0, 0,
                     receita, custo_unit, custo_total, imposto_val, comissao,
                     frete, taxa_fixa_val, 0, total_tarifas, valor_liquido,
-                    margem, margem_pct, arq_nome
+                    margem, margem_pct, arq_nome, logistica  # v1.4: NOVO parâmetro
                 ))
 
                 cursor.execute(f"RELEASE SAVEPOINT venda_amz_{idx}")
