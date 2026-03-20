@@ -752,12 +752,24 @@ def tab_vendas_consolidadas(engine):
     df_d['custo_total'] = df_d['custo_total'].apply(formatar_valor)
     df_d['margem_percentual'] = df_d['margem_percentual'].apply(formatar_percentual)
 
-    cols_exibir = ['data_venda', 'loja_origem', 'sku', 'codigo_anuncio', 'quantidade',
-                   'valor_venda_efetivo', 'custo_total', 'margem_percentual']
+    # v3.5: Coluna pedido_original com fallback para numero_pedido
+    # Amazon (relatório agregado) mostra "-"
     if 'pedido_original' in df_d.columns:
-        cols_exibir.insert(2, 'pedido_original')
+        df_d['pedido_original'] = df_d.apply(
+            lambda r: str(r['pedido_original']) if pd.notna(r['pedido_original']) and str(r['pedido_original']).strip() not in ('', 'None', 'nan')
+            else ('-' if 'AMAZON' in str(r.get('marketplace_origem', '')).upper()
+                  else str(r.get('numero_pedido', '-'))),
+            axis=1
+        )
     else:
-        cols_exibir.insert(2, 'numero_pedido')
+        df_d['pedido_original'] = df_d.apply(
+            lambda r: '-' if 'AMAZON' in str(r.get('marketplace_origem', '')).upper()
+            else str(r.get('numero_pedido', '-')),
+            axis=1
+        )
+
+    cols_exibir = ['data_venda', 'loja_origem', 'pedido_original', 'sku', 'codigo_anuncio', 'quantidade',
+                   'valor_venda_efetivo', 'custo_total', 'margem_percentual']
 
     st.dataframe(df_d[cols_exibir], use_container_width=True, height=600)
 
@@ -765,6 +777,13 @@ def tab_vendas_consolidadas(engine):
         buffer = io.BytesIO()
         df_e = df_vendas.copy()
         df_e['data_venda'] = pd.to_datetime(df_e['data_venda']).dt.strftime('%d/%m/%Y')
+        # v3.5: Coluna pedido_original com fallback para numero_pedido
+        if 'pedido_original' in df_e.columns:
+            df_e['pedido_original'] = df_e.apply(
+                lambda r: str(r['pedido_original']) if pd.notna(r['pedido_original']) and str(r['pedido_original']).strip() not in ('', 'None', 'nan')
+                else str(r.get('numero_pedido', '')),
+                axis=1
+            )
         for col in ['preco_venda','valor_venda_efetivo','custo_unitario','custo_total','imposto','comissao','frete','total_tarifas','valor_liquido','margem_total']:
             if col in df_e.columns: df_e[col] = df_e[col].apply(lambda x: f"{float(x):.2f}".replace('.',','))
         if 'margem_percentual' in df_e.columns: df_e['margem_percentual'] = df_e['margem_percentual'].apply(lambda x: f"{float(x):.2f}".replace('.',','))
