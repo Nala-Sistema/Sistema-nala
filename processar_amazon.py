@@ -2,11 +2,12 @@
 PROCESSADOR AMAZON - Sistema Nala
 Processa Business Report (CSV) com datas acumuladas
 
-VERSÃO 1.4 (17/03/2026):
-  - NOVO: Salva coluna 'logistica' (FBA/DBA) em cada venda no snapshot e pendentes
-  - NOVO: Logística detectada é passada para descartes também
-  - MELHORIA: INSERT no snapshot e pendentes agora inclui campo logistica
-  - Todas as demais lógicas v1.3 mantidas intactas
+VERSÃO 1.5 (18/03/2026):
+  - FIX CRÍTICO: _resolver_config NÃO faz mais fallback para logística errada.
+         Se ASIN tem config DBA mas venda é FBA → vai para pendentes (antes usava taxa DBA)
+  - FIX: logistica_final sempre vem do sufixo do SKU (detectada), não da config
+  - FIX: Motivo de pendente inclui tipo de logística (ex: "ASIN não configurado para FBA")
+  - Mantido: Toda lógica v1.4 intacta
 
 VERSÃO 1.3 (16/03/2026):
   - FIX CRÍTICO: Lookup de config agora usa (asin + logística) para pegar taxas corretas
@@ -119,42 +120,32 @@ def _resolver_config(asin, sku_amz, config_por_asin_logistica, config_por_asin):
     """
     Resolve a configuração correta para um ASIN + SKU da Amazon.
     
-    Ordem de prioridade:
+    VERSÃO 1.5 — SEM FALLBACK para logística errada:
         1. Match exato: (asin, logística detectada do SKU)
-        2. Match parcial por logística
-        3. Fallback: primeira config do ASIN (quando só tem uma logística)
-        4. None: ASIN não configurado → vai para pendentes
+        2. Match parcial por logística (ex: 'DBA PF' quando detectou 'DBA')
+        3. None: ASIN sem config para a logística detectada → vai para pendentes
+    
+    IMPORTANTE: Se o ASIN tem config DBA mas a venda é FBA, retorna None.
+    Isso evita gravar vendas com taxa errada. O usuário precisa cadastrar
+    a config para a logística que falta.
     
     Retorna: config_item dict ou None
     """
     logistica_detectada = _detectar_logistica(sku_amz)
     
     # 1. Match exato (asin, logistica)
-    if logistica_detectada:
-        conf = config_por_asin_logistica.get((asin, logistica_detectada))
-        if conf:
-            return conf
-        
-        # Tenta variações (ex: 'DBA PF' quando detectou 'DBA')
-        configs_asin = config_por_asin.get(asin, [])
-        for c in configs_asin:
-            if logistica_detectada in c['logistica']:
-                return c
+    conf = config_por_asin_logistica.get((asin, logistica_detectada))
+    if conf:
+        return conf
     
-    # 2. Fallback: se ASIN tem configs mas não conseguiu detectar logística
+    # 2. Match parcial (ex: 'DBA PF' quando detectou 'DBA')
     configs_asin = config_por_asin.get(asin, [])
-    if configs_asin:
-        if len(configs_asin) == 1:
-            return configs_asin[0]
-        
-        # Se tem múltiplas, prefere DBA (mais comum para vendas sem sufixo)
-        for c in configs_asin:
-            if 'DBA' in c['logistica'] and 'PF' not in c['logistica']:
-                return c
-        
-        return configs_asin[0]
+    for c in configs_asin:
+        if logistica_detectada in c['logistica']:
+            return c
     
-    # 3. ASIN não encontrado
+    # 3. ASIN não encontrado OU sem config para essa logística
+    # NÃO faz fallback para outra logística — taxa errada é pior que pendente
     return None
 
 
@@ -242,7 +233,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 asins_sem_config.add(asin)
 
             # v1.4: Pegar logística da config (mais confiável) ou usar a detectada
-            logistica_final = logistica_detectada
+            logistica_final = conf.get('logistica', logistica_detectada) if conf else logistica_detectada
 
             # ============================================================
             # RESOLUÇÃO DE SKU
@@ -462,7 +453,8 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
 
                 if asin_sem_config or sku_nao_cadastrado:
                     if asin_sem_config:
-                        motivo = 'ASIN não configurado'
+                        # v1.5: motivo inclui logística para facilitar diagnóstico
+                        motivo = f'ASIN não configurado para {logistica}'
                     else:
                         motivo = 'SKU não cadastrado'
 
