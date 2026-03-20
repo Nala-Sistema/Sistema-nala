@@ -242,7 +242,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
                 asins_sem_config.add(asin)
 
             # v1.4: Pegar logística da config (mais confiável) ou usar a detectada
-            logistica_final = conf.get('logistica', logistica_detectada) if conf else logistica_detectada
+            logistica_final = logistica_detectada
 
             # ============================================================
             # RESOLUÇÃO DE SKU
