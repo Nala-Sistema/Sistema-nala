@@ -2,6 +2,11 @@
 PROCESSADOR SHOPEE - Sistema Nala
 Processa arquivos de vendas da Shopee (.xlsx exportado do painel)
 
+VERSÃO 2.1 (18/03/2026):
+  - NOVO: Salva pedido_original no banco (pedido real da Shopee)
+  - FIX: Barra de progresso agora mostra texto com contagem de pedidos
+  - Mantido: Toda lógica v2.0 intacta
+
 REGRAS DE NEGÓCIO:
 - Receita = Subtotal do produto (Preço acordado × Qtd)
 - Comissão pedidos simples: Net Commission Fee + Taxa de serviço líquida (valor do arquivo)
@@ -387,6 +392,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
 
             resultados.append({
                 'pedido':          pedido_id,
+                'pedido_original': pedido_id,  # v2.1: NOVO — pedido real da Shopee
                 'data':            data_venda,
                 'sku':             sku,
                 'codigo_anuncio':  codigo_anuncio,
@@ -472,6 +478,11 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     """
     Grava vendas da Shopee na tabela fact_vendas_snapshot.
 
+    VERSÃO 2.1:
+    - NOVO: Salva pedido_original no INSERT
+    - FIX: Barra de progresso mostra texto com contagem
+    - Mantido: Toda lógica v2.0 intacta
+
     VERSÃO 2.0:
     - Proteção contra duplicatas: pré-carrega (pedido, sku) existentes da loja
     - Vendas pendentes: SKU não cadastrado vai para fact_vendas_pendentes
@@ -505,12 +516,15 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
 
     total    = len(df_vendas)
     progress = st.progress(0)
+    status_text = st.empty()  # v2.1: texto de status
 
+    # v2.1: INSERT agora inclui pedido_original
     sql_insert = """
         INSERT INTO fact_vendas_snapshot (
             marketplace_origem,
             loja_origem,
             numero_pedido,
+            pedido_original,
             data_venda,
             sku,
             codigo_anuncio,
@@ -535,9 +549,9 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
         ) VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
-            %s, NOW(), %s
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, NOW(), %s
         )
     """
 
@@ -547,12 +561,16 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     for idx, (_, row) in enumerate(df_vendas.iterrows()):
         sku = row['sku']
         pedido = str(row['pedido']).strip()
+        pedido_original = str(row.get('pedido_original', pedido)).strip()  # v2.1
+
+        # v2.1: Atualizar texto do progresso
+        progress.progress(min((idx + 1) / total, 1.0))
+        status_text.text(f"Gravando venda {idx + 1} de {total}...")
 
         # ---- PROTEÇÃO DUPLICATA ----
         chave = (pedido, sku)
         if chave in duplicatas_existentes:
             duplicatas_count += 1
-            progress.progress(min((idx + 1) / total, 1.0))
             continue
 
         # ---- SKU NÃO CADASTRADO → SALVAR COMO PENDENTE ----
@@ -597,7 +615,6 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             else:
                 erros += 1
 
-            progress.progress(min((idx + 1) / total, 1.0))
             continue
 
         # ---- GRAVAÇÃO NORMAL ----
@@ -624,6 +641,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 marketplace,
                 loja,
                 pedido,
+                pedido_original,  # v2.1: NOVO parâmetro
                 row['data'],
                 sku,
                 row['codigo_anuncio'],
@@ -658,8 +676,6 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 pass
             erros += 1
 
-        progress.progress(min((idx + 1) / total, 1.0))
-
     # Commit único no final (vendas + pendentes)
     try:
         conn.commit()
@@ -670,5 +686,6 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     cursor.close()
     conn.close()
     progress.empty()
+    status_text.empty()  # v2.1: limpar texto
 
     return registros, erros, skus_invalidos, duplicatas_count, pendentes_count
