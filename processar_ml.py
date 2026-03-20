@@ -2,6 +2,12 @@
 PROCESSADOR MERCADO LIVRE - Sistema Nala
 Processa arquivos de vendas do Mercado Livre
 
+VERSÃO 3.1 (18/03/2026):
+  - FIX: Batch commit a cada 500 registros para evitar timeout do Neon
+  - NOVO: Salva pedido_original no banco (pedido real do ML)
+  - FIX: Barra de progresso mostra texto com contagem
+  - Mantido: Toda lógica v3.0 intacta
+
 VERSÃO 3.0 (11/03/2026):
   - NOVO: Lógica de carrinho (parent-child) com distribuição proporcional
   - NOVO: Rastreamento de descartes em fact_vendas_descartadas
@@ -45,6 +51,9 @@ PALAVRAS_DESCARTE = ['cancelad', 'devolv', 'devoluc', 'reembolso', 'mediacao']
 
 # Tolerância para divergência financeira em carrinhos (R$)
 TOLERANCIA_DIVERGENCIA = 5.00
+
+# v3.1: Batch commit size para evitar timeout do Neon
+BATCH_COMMIT_SIZE = 500
 
 
 def detectar_header_ml(arquivo):
@@ -294,6 +303,10 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     """
     Processa arquivo Excel do Mercado Livre.
 
+    VERSÃO 3.1:
+    - NOVO: pedido_original = pedido real do ML
+    - Mantido: Toda lógica v3.0 intacta
+
     VERSÃO 3.0:
     - Pré-processamento de carrinhos (parent-child)
     - Coleta de descartes para rastreamento
@@ -462,9 +475,13 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # ---- DATA ----
             data_venda = converter_data_ml(row.get('data'))
 
+            # ---- v3.1: pedido_original = numero real do pedido ML ----
+            pedido_real = str(row.get('pedido', '')).strip()
+
             # ---- MONTAR REGISTRO ----
             venda = {
-                'pedido': str(row.get('pedido', '')),
+                'pedido': pedido_real,
+                'pedido_original': pedido_real,  # v3.1: NOVO
                 'data': data_venda,
                 'sku': sku,
                 'codigo_anuncio': codigo_anuncio,
@@ -573,6 +590,12 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
     """
     Grava vendas do ML no banco com validação de SKU e barra de progresso.
 
+    VERSÃO 3.1:
+    - FIX: Batch commit a cada 500 registros (evita timeout Neon em uploads grandes)
+    - NOVO: Salva pedido_original no INSERT
+    - FIX: Barra de progresso com texto de contagem
+    - Mantido: Toda lógica v3.0 intacta
+
     VERSÃO 3.0:
     - Novo param descartes: lista de vendas descartadas para rastreamento
     - Novo param pendentes_carrinho: vendas com divergência financeira
@@ -615,8 +638,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
     if total_itens == 0:
         total_itens = 1  # Evitar divisão por zero
     progress_bar = st.progress(0)
-    status_text = st.empty()
+    status_text = st.empty()  # v3.1: texto de status
     item_atual = 0
+    ops_since_commit = 0  # v3.1: contador para batch commit
 
     # ============================================================
     # 5A. PROCESSAR DESCARTES (NOVO v3.0)
@@ -663,6 +687,8 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             except Exception:
                 cursor.execute(f"ROLLBACK TO SAVEPOINT desc_{item_atual}")
                 erros += 1
+
+            ops_since_commit += 1
 
         except Exception:
             erros += 1
@@ -732,12 +758,39 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                 cursor.execute(f"ROLLBACK TO SAVEPOINT pend_carr_{item_atual}")
                 erros += 1
 
+            ops_since_commit += 1
+
         except Exception:
             erros += 1
 
+    # v3.1: Commit parcial após descartes+pendentes antes de começar vendas
+    if ops_since_commit > 0:
+        try:
+            conn.commit()
+            ops_since_commit = 0
+        except Exception:
+            pass
+
     # ============================================================
     # 5C. PROCESSAR VENDAS NORMAIS (loop existente mantido)
+    # v3.1: batch commit + pedido_original no INSERT
     # ============================================================
+
+    # v3.1: INSERT agora inclui pedido_original
+    sql = """
+        INSERT INTO fact_vendas_snapshot (
+            marketplace_origem, loja_origem, numero_pedido, pedido_original, data_venda, sku,
+            codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
+            valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
+            frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
+            margem_total, margem_percentual, data_processamento, arquivo_origem
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, NOW(), %s
+        )
+    """
+
     for idx, row in df_vendas.iterrows():
         try:
             # Atualizar progresso
@@ -753,6 +806,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
 
             sku = str(sku).strip()
             pedido = str(row['pedido']).strip()
+
+            # v3.1: pedido_original
+            pedido_original = str(row.get('pedido_original', pedido)).strip()
 
             # ---- PROTEÇÃO DUPLICATA ----
             chave = (pedido, sku)
@@ -804,6 +860,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                 else:
                     erros += 1
 
+                ops_since_commit += 1
                 continue
 
             # ---- GRAVAÇÃO NORMAL ----
@@ -831,23 +888,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             # SAVEPOINT: se der erro nessa venda, só desfaz ela
             cursor.execute(f"SAVEPOINT venda_{idx}")
 
-            # SQL INSERT
-            sql = """
-                INSERT INTO fact_vendas_snapshot (
-                    marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
-                    codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
-                    valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
-                    frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
-                    margem_total, margem_percentual, data_processamento, arquivo_origem
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, NOW(), %s
-                )
-            """
-
+            # v3.1: INSERT com pedido_original
             cursor.execute(sql, (
-                marketplace, loja, pedido, data_venda, sku,
+                marketplace, loja, pedido, pedido_original, data_venda, sku,
                 codigo_anuncio,
                 qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto_val, tarifa,
@@ -862,6 +905,16 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             # Adicionar ao set de duplicatas (evita duplicata intra-arquivo)
             duplicatas_existentes.add(chave)
 
+            ops_since_commit += 1
+
+            # v3.1: BATCH COMMIT a cada N registros (evita timeout Neon)
+            if ops_since_commit >= BATCH_COMMIT_SIZE:
+                try:
+                    conn.commit()
+                    ops_since_commit = 0
+                except Exception as e:
+                    st.warning(f"Aviso: erro no commit parcial: {str(e)[:100]}")
+
         except Exception as e:
             # ROLLBACK só desta venda, não de todas
             try:
@@ -872,7 +925,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             if erros == 1:
                 st.warning(f"Primeiro erro: {str(e)[:200]}")
 
-    # 6. COMMIT FINAL (todas as vendas + pendentes + descartes que deram certo)
+    # 6. COMMIT FINAL (registros restantes desde último batch commit)
     try:
         conn.commit()
     except Exception as e:
@@ -885,7 +938,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
 
     # 8. LIMPAR BARRA
     progress_bar.empty()
-    status_text.empty()
+    status_text.empty()  # v3.1: limpar texto
 
     return (registros, erros, skus_invalidos, duplicatas_count,
             pendentes_count, descartadas_count, atualizados_count)
