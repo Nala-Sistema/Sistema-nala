@@ -784,9 +784,6 @@ def tab_vendas_consolidadas(engine):
                 else str(r.get('numero_pedido', '')),
                 axis=1
             )
-           # v3.5: Trocar numero_pedido pelo pedido_original no Excel
-        if 'pedido_original' in df_e.columns and 'numero_pedido' in df_e.columns:
-            df_e = df_e.drop(columns=['numero_pedido'])
         for col in ['preco_venda','valor_venda_efetivo','custo_unitario','custo_total','imposto','comissao','frete','total_tarifas','valor_liquido','margem_total']:
             if col in df_e.columns: df_e[col] = df_e[col].apply(lambda x: f"{float(x):.2f}".replace('.',','))
         if 'margem_percentual' in df_e.columns: df_e['margem_percentual'] = df_e['margem_percentual'].apply(lambda x: f"{float(x):.2f}".replace('.',','))
