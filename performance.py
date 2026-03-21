@@ -91,7 +91,7 @@ def _seletor_mes():
 
 def _render_meta_loja(engine, loja, marketplace, ano_mes):
     meta_info = buscar_meta_loja(engine, loja, ano_mes)
-    meta_atual = float(meta_info['meta_receita']) if meta_info else 0
+    meta_atual = float(meta_info['meta_receita']) if meta_info else 0.0
     modelo_atual = meta_info.get('modelo_projecao', 'Linear') if meta_info else 'Linear'
 
     col1, col2, col3 = st.columns([2, 1, 1])
