@@ -487,7 +487,6 @@ MARKETPLACES = [
 ]
 
 def main():
-    st.set_page_config(page_title="Performance Nala", layout="wide")
     st.title("📊 Performance Mensal")
 
     engine = get_engine()
