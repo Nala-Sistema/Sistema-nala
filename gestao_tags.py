@@ -400,7 +400,7 @@ def tab_produtos_sku(engine):
                       'receita', 'margem_media', 'lojas', 'observacoes']].copy()
     df_display.columns = ['SKU', 'Produto', 'Curva', 'Tag', 'Vendas',
                           'Receita', 'Margem %', 'Lojas', 'Observações']
-    df_display['Margem %'] = df_display['Margem %'].round(1)
+    df_display['Margem %'] = pd.to_numeric(df_display['Margem %'], errors='coerce').fillna(0).round(1)
 
     opcoes_tags_sku = [''] + _buscar_opcoes_tags(engine, 'sku')
 
