@@ -363,21 +363,21 @@ def _render_tab_marketplace(engine, marketplace, ano_mes):
         st.warning(f"Nenhuma loja cadastrada para {marketplace}.")
         return
 
-    for loja in lojas:
-        st.markdown(f"### 🏪 {loja}")
+    # Seletor de loja (em vez de mostrar todas de uma vez)
+    loja = st.selectbox("🏪 Selecione a loja:", lojas, key=f"sel_loja_{marketplace}")
 
-        # Meta da loja
-        meta_receita, modelo = _render_meta_loja(engine, loja, marketplace, ano_mes)
+    st.markdown(f"### 🏪 {loja}")
 
-        # Resumo
-        _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo)
+    # Meta da loja
+    meta_receita, modelo = _render_meta_loja(engine, loja, marketplace, ano_mes)
 
-        st.divider()
+    # Resumo
+    _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo)
 
-        # Tabela de anúncios
-        _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo)
+    st.divider()
 
-        st.markdown("---")
+    # Tabela de anúncios
+    _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo)
 
 
 # ============================================================
