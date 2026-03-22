@@ -280,6 +280,12 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
     """
     df_v = _raw_query(engine, sql_vendas, (loja, primeiro, ultimo))
 
+    # Converter Decimal → float/int (PostgreSQL retorna Decimal)
+    if not df_v.empty:
+        for c in ['qtd_vendas', 'fat_vendas', 'margem_atual']:
+            if c in df_v.columns:
+                df_v[c] = pd.to_numeric(df_v[c], errors='coerce').fillna(0)
+
     # Devoluções
     sql_dev = """
         SELECT codigo_anuncio, tipo_logistica as logistica,
@@ -291,6 +297,11 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         GROUP BY codigo_anuncio, tipo_logistica
     """
     df_d = _raw_query(engine, sql_dev, (loja, primeiro, ultimo))
+
+    if not df_d.empty:
+        for c in ['qtd_dev', 'fat_dev']:
+            if c in df_d.columns:
+                df_d[c] = pd.to_numeric(df_d[c], errors='coerce').fillna(0)
 
     if df_v.empty:
         return pd.DataFrame(columns=['codigo_anuncio', 'sku', 'logistica',
@@ -320,11 +331,14 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         df['qtd_dev'] = 0
         df['fat_dev'] = 0
 
-    df['qtd_dev'] = df['qtd_dev'].fillna(0).astype(int)
-    df['fat_dev'] = df['fat_dev'].fillna(0).astype(float)
+    df['qtd_dev'] = pd.to_numeric(df['qtd_dev'], errors='coerce').fillna(0).astype(int)
+    df['fat_dev'] = pd.to_numeric(df['fat_dev'], errors='coerce').fillna(0).astype(float)
+    df['qtd_vendas'] = pd.to_numeric(df['qtd_vendas'], errors='coerce').fillna(0).astype(int)
+    df['fat_vendas'] = pd.to_numeric(df['fat_vendas'], errors='coerce').fillna(0).astype(float)
+    df['margem_atual'] = pd.to_numeric(df['margem_atual'], errors='coerce').fillna(0).astype(float)
     df['qtd_realizado'] = (df['qtd_vendas'] - df['qtd_dev']).clip(lower=0)
     df['fat_realizado'] = (df['fat_vendas'] - df['fat_dev']).clip(lower=0)
-    df['margem_atual'] = df['margem_atual'].fillna(0).round(2)
+    df['margem_atual'] = df['margem_atual'].round(2)
 
     return df[['codigo_anuncio', 'sku', 'logistica', 'qtd_realizado', 'fat_realizado', 'margem_atual']]
 
@@ -358,6 +372,11 @@ def buscar_historico_meses(engine, loja, ano_mes_ref, meses_atras=3, marketplace
             GROUP BY {group_cols}
         """
         df = _raw_query(engine, sql, (loja, primeiro, ultimo))
+        if not df.empty:
+            if 'qtd' in df.columns:
+                df['qtd'] = pd.to_numeric(df['qtd'], errors='coerce').fillna(0).astype(int)
+            if 'fat' in df.columns:
+                df['fat'] = pd.to_numeric(df['fat'], errors='coerce').fillna(0).astype(float)
         if not is_amazon and not df.empty:
             df['logistica'] = None
         resultado[mes] = df
