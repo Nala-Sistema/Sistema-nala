@@ -1,5 +1,9 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
+VERSAO 3.5 (21/03/2026):
+  - NOVO: Colunas Curva ABC e Tag Manual nas Vendas Consolidadas + Export Excel
+  - NOVO: Fix Magalu codigo_anuncio vazio (preenche com SKU em runtime)
+
 VERSAO 3.4 (17/03/2026):
   - NOVO: Detecção automática de devoluções ao reimportar (todos marketplaces)
          Se pedido mudou de "entregue" para "devolvido/cancelado", move para fact_devolucoes
@@ -93,6 +97,68 @@ def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, l
         cursor.close(); conn.close()
         return pd.DataFrame(rows, columns=cols)
     except: return pd.DataFrame()
+
+
+# ============================================================
+# v3.5: ENRIQUECER VENDAS COM TAGS (Curva ABC + Tag Manual)
+# ============================================================
+
+def _enriquecer_com_tags(engine, df):
+    """
+    Adiciona colunas 'curva' e 'tag' ao DataFrame de vendas,
+    cruzando com dim_tags_anuncio por (marketplace_origem, codigo_anuncio).
+    Também corrige Magalu sem codigo_anuncio (preenche com SKU em runtime).
+    """
+    if df.empty:
+        df['curva'] = ''
+        df['tag'] = ''
+        return df
+
+    # Fix Magalu: preencher codigo_anuncio vazio com SKU
+    mask_magalu = (
+        (df['marketplace_origem'] == 'MAGALU') &
+        (df['codigo_anuncio'].isna() | (df['codigo_anuncio'].astype(str).str.strip() == ''))
+    )
+    if mask_magalu.any():
+        df.loc[mask_magalu, 'codigo_anuncio'] = df.loc[mask_magalu, 'sku']
+
+    # Buscar todas as tags
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT marketplace, codigo_anuncio, tag_curva, tag_status FROM dim_tags_anuncio")
+        cols = [d[0] for d in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        df_tags = pd.DataFrame(rows, columns=cols)
+    except Exception:
+        df['curva'] = ''
+        df['tag'] = ''
+        return df
+
+    if df_tags.empty:
+        df['curva'] = ''
+        df['tag'] = ''
+        return df
+
+    # Renomear para merge
+    df_tags = df_tags.rename(columns={
+        'marketplace': 'marketplace_origem',
+        'tag_curva': 'curva',
+        'tag_status': 'tag',
+    })
+
+    # Merge
+    df = df.merge(
+        df_tags[['marketplace_origem', 'codigo_anuncio', 'curva', 'tag']],
+        on=['marketplace_origem', 'codigo_anuncio'],
+        how='left'
+    )
+    df['curva'] = df['curva'].fillna('')
+    df['tag'] = df['tag'].fillna('')
+
+    return df
 
 
 # ============================================================
@@ -723,6 +789,9 @@ def tab_vendas_consolidadas(engine):
     if df_vendas.empty:
         st.warning("⚠️ Nenhuma venda encontrada."); return
 
+    # ─── v3.5: ENRIQUECER COM TAGS ───
+    df_vendas = _enriquecer_com_tags(engine, df_vendas)
+
     df_cc = df_vendas[df_vendas['custo_total'] > 0]
     df_sc = df_vendas[df_vendas['custo_total'] == 0]
     dias_d = (data_fim - data_ini).days
@@ -768,7 +837,8 @@ def tab_vendas_consolidadas(engine):
             axis=1
         )
 
-    cols_exibir = ['data_venda', 'loja_origem', 'pedido_original', 'sku', 'codigo_anuncio', 'quantidade',
+    cols_exibir = ['data_venda', 'loja_origem', 'pedido_original', 'sku', 'codigo_anuncio',
+                   'curva', 'tag', 'quantidade',
                    'valor_venda_efetivo', 'custo_total', 'margem_percentual']
 
     st.dataframe(df_d[cols_exibir], use_container_width=True, height=600)
