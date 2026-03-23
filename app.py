@@ -105,6 +105,9 @@ def main():
         st.session_state.logado = False
     if 'perfil' not in st.session_state:
         st.session_state.perfil = None
+    # v3.5: Inicializar ambiente
+    if 'ambiente_nala' not in st.session_state:
+        st.session_state.ambiente_nala = "Produção"
 
     # --- TELA DE LOGIN ---
     if not st.session_state.logado:
@@ -152,6 +155,22 @@ def main():
             aba = st.radio("Menu Principal:", opcoes_menu)
 
             st.markdown("---")
+
+            # ─── v3.5: TOGGLE DE AMBIENTE (só Admin) ───
+            if st.session_state.perfil == "Admin":
+                ambiente = st.selectbox(
+                    "🔧 Ambiente:",
+                    ["Produção", "Dev"],
+                    index=0 if st.session_state.ambiente_nala == "Produção" else 1,
+                    key="sel_ambiente_nala",
+                )
+                if ambiente != st.session_state.ambiente_nala:
+                    st.session_state.ambiente_nala = ambiente
+                    st.rerun()
+                if ambiente == "Dev":
+                    st.warning("⚠️ AMBIENTE DE TESTE")
+                st.markdown("---")
+
             if st.button("🚪 Sair"):
                 st.session_state.logado = False
                 st.session_state.perfil = None
@@ -173,7 +192,9 @@ def main():
             c4.metric("SKUs na Base", m['skus'])
 
             st.divider()
-            st.info(f"💡 Bem-vindo, {st.session_state.perfil}. Use o menu lateral para navegar.")
+            # v3.5: Mostrar ambiente atual
+            env_label = f"🟢 Produção" if st.session_state.ambiente_nala == "Produção" else "🟡 Dev (Teste)"
+            st.info(f"💡 Bem-vindo, {st.session_state.perfil}. Ambiente: {env_label}. Use o menu lateral para navegar.")
 
         elif aba == "📊 Performance":
             carregar_modulo("performance")
