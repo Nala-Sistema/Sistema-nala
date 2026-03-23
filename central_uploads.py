@@ -105,13 +105,14 @@ def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, l
 
 def _enriquecer_com_tags(engine, df):
     """
-    Adiciona colunas 'curva' e 'tag' ao DataFrame de vendas,
-    cruzando com dim_tags_anuncio por (marketplace_origem, codigo_anuncio).
+    Adiciona colunas 'curva', 'tag' e 'produto' ao DataFrame de vendas,
+    cruzando com dim_tags_anuncio e dim_produtos.
     Também corrige Magalu sem codigo_anuncio (preenche com SKU em runtime).
     """
     if df.empty:
         df['curva'] = ''
         df['tag'] = ''
+        df['produto'] = ''
         return df
 
     # Fix Magalu: preencher codigo_anuncio vazio com SKU
@@ -121,6 +122,26 @@ def _enriquecer_com_tags(engine, df):
     )
     if mask_magalu.any():
         df.loc[mask_magalu, 'codigo_anuncio'] = df.loc[mask_magalu, 'sku']
+
+    # Buscar nomes dos produtos
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
+        cols_p = [d[0] for d in cursor.description]
+        rows_p = cursor.fetchall()
+        df_prod = pd.DataFrame(rows_p, columns=cols_p)
+        cursor.close()
+        conn.close()
+    except Exception:
+        df_prod = pd.DataFrame(columns=['sku', 'nome'])
+
+    if not df_prod.empty:
+        df_prod = df_prod.rename(columns={'nome': 'produto'})
+        df = df.merge(df_prod[['sku', 'produto']], on='sku', how='left')
+        df['produto'] = df['produto'].fillna('')
+    else:
+        df['produto'] = ''
 
     # Buscar todas as tags
     try:
@@ -837,7 +858,7 @@ def tab_vendas_consolidadas(engine):
             axis=1
         )
 
-    cols_exibir = ['data_venda', 'loja_origem', 'pedido_original', 'sku', 'codigo_anuncio',
+    cols_exibir = ['data_venda', 'loja_origem', 'pedido_original', 'sku', 'produto', 'codigo_anuncio',
                    'curva', 'tag', 'quantidade',
                    'valor_venda_efetivo', 'custo_total', 'margem_percentual']
 
