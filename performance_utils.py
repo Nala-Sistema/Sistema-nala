@@ -313,8 +313,9 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
     if not df_d.empty and not is_amazon:
         df_d_agg = df_d.groupby('codigo_anuncio').agg(
             qtd_dev=('qtd_dev', 'sum'), fat_dev=('fat_dev', 'sum')).reset_index()
-        df_v_agg = df_v.groupby(['codigo_anuncio', 'sku']).agg(
-            qtd_vendas=('qtd_vendas', 'sum'), fat_vendas=('fat_vendas', 'sum'),
+        df_v_agg = df_v.groupby('codigo_anuncio').agg(
+            sku=('sku', 'first'), qtd_vendas=('qtd_vendas', 'sum'),
+            fat_vendas=('fat_vendas', 'sum'),
             margem_atual=('margem_atual', 'mean')).reset_index()
         df_v_agg['logistica'] = None
         df = df_v_agg.merge(df_d_agg, on='codigo_anuncio', how='left')
@@ -322,8 +323,9 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         df = df_v.merge(df_d, on=['codigo_anuncio', 'logistica'], how='left')
     else:
         if not is_amazon:
-            df = df_v.groupby(['codigo_anuncio', 'sku']).agg(
-                qtd_vendas=('qtd_vendas', 'sum'), fat_vendas=('fat_vendas', 'sum'),
+            df = df_v.groupby('codigo_anuncio').agg(
+                sku=('sku', 'first'), qtd_vendas=('qtd_vendas', 'sum'),
+                fat_vendas=('fat_vendas', 'sum'),
                 margem_atual=('margem_atual', 'mean')).reset_index()
             df['logistica'] = None
         else:
