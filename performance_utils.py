@@ -566,12 +566,20 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
 
     # Montar lista de anúncios únicos (da realização OU das metas)
     anuncios = set()
+    # Primeiro: anúncios do realizado (com SKU correto)
     if not df_real.empty:
         for _, r in df_real.iterrows():
-            anuncios.add((r['codigo_anuncio'], r['sku'], r.get('logistica')))
+            log = r.get('logistica')
+            log = None if pd.isna(log) else log
+            anuncios.add((r['codigo_anuncio'], r['sku'], log))
+    # Depois: anúncios das metas que NÃO aparecem no realizado
+    codigos_existentes = {(a[0], a[2]) for a in anuncios}  # (codigo_anuncio, logistica)
     if not df_metas.empty:
         for _, r in df_metas.iterrows():
-            anuncios.add((r['codigo_anuncio'], '', r.get('logistica')))
+            log = r.get('logistica')
+            log = None if pd.isna(log) else log
+            if (r['codigo_anuncio'], log) not in codigos_existentes:
+                anuncios.add((r['codigo_anuncio'], '', log))
 
     if not anuncios:
         return pd.DataFrame()
@@ -684,5 +692,10 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
 
     df = pd.DataFrame(rows)
     if not df.empty:
+        # Deduplica: para não-Amazon, por codigo_anuncio; para Amazon, por codigo_anuncio+logistica
+        if is_amazon:
+            df = df.drop_duplicates(subset=['codigo_anuncio', 'logistica'], keep='first')
+        else:
+            df = df.drop_duplicates(subset=['codigo_anuncio'], keep='first')
         df = df.sort_values('fat_realizado', ascending=False).reset_index(drop=True)
     return df
