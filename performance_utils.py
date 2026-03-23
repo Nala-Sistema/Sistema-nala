@@ -263,39 +263,64 @@ def salvar_metas_anuncio_lote(engine, metas_list):
 def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
     """
     Busca vendas realizadas por anúncio no mês, descontando devoluções.
-    Para Amazon, agrupa também por logística.
+    Para Amazon: agrupa por codigo_anuncio + logistica.
+    Para outros: agrupa APENAS por codigo_anuncio (evita duplicatas).
     """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
+    is_amazon = marketplace and 'AMAZON' in marketplace.upper()
 
-    # Vendas
-    sql_vendas = """
-        SELECT codigo_anuncio, sku, logistica,
-               SUM(quantidade) as qtd_vendas,
-               SUM(valor_venda_efetivo) as fat_vendas,
-               AVG(margem_percentual) as margem_atual
-        FROM fact_vendas_snapshot
-        WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-        GROUP BY codigo_anuncio, sku, logistica
-    """
+    # SQL diferente por marketplace para evitar duplicatas na raiz
+    if is_amazon:
+        sql_vendas = """
+            SELECT codigo_anuncio, MAX(sku) as sku, logistica,
+                   SUM(quantidade)::float as qtd_vendas,
+                   SUM(valor_venda_efetivo)::float as fat_vendas,
+                   AVG(margem_percentual)::float as margem_atual
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio, logistica
+        """
+    else:
+        sql_vendas = """
+            SELECT codigo_anuncio, MAX(sku) as sku, NULL as logistica,
+                   SUM(quantidade)::float as qtd_vendas,
+                   SUM(valor_venda_efetivo)::float as fat_vendas,
+                   AVG(margem_percentual)::float as margem_atual
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio
+        """
+
     df_v = _raw_query(engine, sql_vendas, (loja, primeiro, ultimo))
 
-    # Converter Decimal → float/int (PostgreSQL retorna Decimal)
     if not df_v.empty:
         for c in ['qtd_vendas', 'fat_vendas', 'margem_atual']:
             if c in df_v.columns:
                 df_v[c] = pd.to_numeric(df_v[c], errors='coerce').fillna(0)
 
     # Devoluções
-    sql_dev = """
-        SELECT codigo_anuncio, tipo_logistica as logistica,
-               SUM(quantidade) as qtd_dev,
-               SUM(valor_venda_efetivo) as fat_dev
-        FROM fact_devolucoes
-        WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-        GROUP BY codigo_anuncio, tipo_logistica
-    """
+    if is_amazon:
+        sql_dev = """
+            SELECT codigo_anuncio, tipo_logistica as logistica,
+                   SUM(quantidade)::float as qtd_dev,
+                   SUM(valor_venda_efetivo)::float as fat_dev
+            FROM fact_devolucoes
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio, tipo_logistica
+        """
+    else:
+        sql_dev = """
+            SELECT codigo_anuncio, NULL as logistica,
+                   SUM(quantidade)::float as qtd_dev,
+                   SUM(valor_venda_efetivo)::float as fat_dev
+            FROM fact_devolucoes
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio
+        """
     df_d = _raw_query(engine, sql_dev, (loja, primeiro, ultimo))
 
     if not df_d.empty:
@@ -307,27 +332,15 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         return pd.DataFrame(columns=['codigo_anuncio', 'sku', 'logistica',
                                      'qtd_realizado', 'fat_realizado', 'margem_atual'])
 
-    # Para marketplaces não-Amazon, ignorar logística no merge
-    is_amazon = marketplace and 'AMAZON' in marketplace.upper()
-
-    if not df_d.empty and not is_amazon:
-        df_d_agg = df_d.groupby('codigo_anuncio').agg(
-            qtd_dev=('qtd_dev', 'sum'), fat_dev=('fat_dev', 'sum')).reset_index()
-        df_v_agg = df_v.groupby(['codigo_anuncio', 'sku']).agg(
-            qtd_vendas=('qtd_vendas', 'sum'), fat_vendas=('fat_vendas', 'sum'),
-            margem_atual=('margem_atual', 'mean')).reset_index()
-        df_v_agg['logistica'] = None
-        df = df_v_agg.merge(df_d_agg, on='codigo_anuncio', how='left')
-    elif not df_d.empty and is_amazon:
-        df = df_v.merge(df_d, on=['codigo_anuncio', 'logistica'], how='left')
-    else:
-        if not is_amazon:
-            df = df_v.groupby(['codigo_anuncio', 'sku']).agg(
-                qtd_vendas=('qtd_vendas', 'sum'), fat_vendas=('fat_vendas', 'sum'),
-                margem_atual=('margem_atual', 'mean')).reset_index()
-            df['logistica'] = None
+    # Merge vendas com devoluções
+    if not df_d.empty:
+        if is_amazon:
+            df = df_v.merge(df_d, on=['codigo_anuncio', 'logistica'], how='left')
         else:
-            df = df_v.copy()
+            df = df_v.merge(df_d[['codigo_anuncio', 'qtd_dev', 'fat_dev']],
+                            on='codigo_anuncio', how='left')
+    else:
+        df = df_v.copy()
         df['qtd_dev'] = 0
         df['fat_dev'] = 0
 
@@ -566,12 +579,20 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
 
     # Montar lista de anúncios únicos (da realização OU das metas)
     anuncios = set()
+    # Primeiro: anúncios do realizado (com SKU correto)
     if not df_real.empty:
         for _, r in df_real.iterrows():
-            anuncios.add((r['codigo_anuncio'], r['sku'], r.get('logistica')))
+            log = r.get('logistica')
+            log = None if pd.isna(log) else log
+            anuncios.add((r['codigo_anuncio'], r['sku'], log))
+    # Depois: anúncios das metas que NÃO aparecem no realizado
+    codigos_existentes = {(a[0], a[2]) for a in anuncios}  # (codigo_anuncio, logistica)
     if not df_metas.empty:
         for _, r in df_metas.iterrows():
-            anuncios.add((r['codigo_anuncio'], '', r.get('logistica')))
+            log = r.get('logistica')
+            log = None if pd.isna(log) else log
+            if (r['codigo_anuncio'], log) not in codigos_existentes:
+                anuncios.add((r['codigo_anuncio'], '', log))
 
     if not anuncios:
         return pd.DataFrame()
@@ -684,5 +705,10 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
 
     df = pd.DataFrame(rows)
     if not df.empty:
+        # Deduplica: para não-Amazon, por codigo_anuncio; para Amazon, por codigo_anuncio+logistica
+        if is_amazon:
+            df = df.drop_duplicates(subset=['codigo_anuncio', 'logistica'], keep='first')
+        else:
+            df = df.drop_duplicates(subset=['codigo_anuncio'], keep='first')
         df = df.sort_values('fat_realizado', ascending=False).reset_index(drop=True)
     return df
