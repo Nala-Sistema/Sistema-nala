@@ -1,6 +1,10 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.3 (17/03/2026)
+Versão: 3.4 (21/03/2026)
+
+CHANGELOG v3.4:
+  - NOVO: Suporte a múltiplos ambientes (Produção/Dev) via st.session_state
+  - get_engine() agora lê ambiente_nala do session_state
 
 CHANGELOG v3.3:
   - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
@@ -33,12 +37,17 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-# URL do banco Neon
-DB_URL = "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require"
+# URLs dos bancos Neon (Produção e Dev)
+AMBIENTES_DB = {
+    "Produção": "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require",
+    "Dev": "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-icy-shadow-ac1qgp3l-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require",
+}
 
 def get_engine():
-    """Retorna engine do SQLAlchemy"""
-    return create_engine(DB_URL)
+    """Retorna engine do SQLAlchemy baseado no ambiente selecionado."""
+    ambiente = st.session_state.get("ambiente_nala", "Produção")
+    db_url = AMBIENTES_DB.get(ambiente, AMBIENTES_DB["Produção"])
+    return create_engine(db_url)
 
 # ============================================================
 # CONVERSORES E BUSCAS BÁSICAS
