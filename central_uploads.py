@@ -105,14 +105,15 @@ def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, l
 
 def _enriquecer_com_tags(engine, df):
     """
-    Adiciona colunas 'curva', 'tag' e 'produto' ao DataFrame de vendas,
-    cruzando com dim_tags_anuncio e dim_produtos.
-    Também corrige Magalu sem codigo_anuncio (preenche com SKU em runtime).
+    Adiciona colunas 'curva', 'tag' e 'produto' ao DataFrame de vendas.
+    Usa mapeamento por dict (NÃO merge) para evitar duplicação de linhas.
     """
+    n_original = len(df)
+
     if df.empty:
+        df['produto'] = ''
         df['curva'] = ''
         df['tag'] = ''
-        df['produto'] = ''
         return df
 
     # Fix Magalu: preencher codigo_anuncio vazio com SKU
@@ -123,61 +124,38 @@ def _enriquecer_com_tags(engine, df):
     if mask_magalu.any():
         df.loc[mask_magalu, 'codigo_anuncio'] = df.loc[mask_magalu, 'sku']
 
-    # Buscar nomes dos produtos
+    # 1. Nomes dos produtos (dict: sku → nome)
+    nomes = {}
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
-        cols_p = [d[0] for d in cursor.description]
-        rows_p = cursor.fetchall()
-        df_prod = pd.DataFrame(rows_p, columns=cols_p)
+        for row in cursor.fetchall():
+            nomes[row[0]] = row[1] or ''
         cursor.close()
         conn.close()
     except Exception:
-        df_prod = pd.DataFrame(columns=['sku', 'nome'])
+        pass
+    df['produto'] = df['sku'].map(nomes).fillna('')
 
-    if not df_prod.empty:
-        df_prod = df_prod.rename(columns={'nome': 'produto'})
-        df = df.merge(df_prod[['sku', 'produto']], on='sku', how='left')
-        df['produto'] = df['produto'].fillna('')
-    else:
-        df['produto'] = ''
-
-    # Buscar todas as tags
+    # 2. Tags (dict: (marketplace, codigo_anuncio) → {curva, tag})
+    tags = {}
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT marketplace, codigo_anuncio, tag_curva, tag_status FROM dim_tags_anuncio")
-        cols = [d[0] for d in cursor.description]
-        rows = cursor.fetchall()
+        for row in cursor.fetchall():
+            tags[(row[0], row[1])] = {'curva': row[2] or '', 'tag': row[3] or ''}
         cursor.close()
         conn.close()
-        df_tags = pd.DataFrame(rows, columns=cols)
     except Exception:
-        df['curva'] = ''
-        df['tag'] = ''
-        return df
+        pass
 
-    if df_tags.empty:
-        df['curva'] = ''
-        df['tag'] = ''
-        return df
+    df['curva'] = df.apply(lambda r: tags.get((r['marketplace_origem'], r['codigo_anuncio']), {}).get('curva', ''), axis=1)
+    df['tag'] = df.apply(lambda r: tags.get((r['marketplace_origem'], r['codigo_anuncio']), {}).get('tag', ''), axis=1)
 
-    # Renomear para merge
-    df_tags = df_tags.rename(columns={
-        'marketplace': 'marketplace_origem',
-        'tag_curva': 'curva',
-        'tag_status': 'tag',
-    })
-
-    # Merge
-    df = df.merge(
-        df_tags[['marketplace_origem', 'codigo_anuncio', 'curva', 'tag']],
-        on=['marketplace_origem', 'codigo_anuncio'],
-        how='left'
-    )
-    df['curva'] = df['curva'].fillna('')
-    df['tag'] = df['tag'].fillna('')
+    # Garantir que não criou linhas extras
+    assert len(df) == n_original, f"Enriquecimento criou linhas extras: {len(df)} vs {n_original}"
 
     return df
 
@@ -1308,6 +1286,7 @@ def _exibir_historico(engine):
 
 def main():
     st.title("💰 Central de Vendas")
+    st.caption("v3.5 — tags + produto + dict mapping")
     engine = get_engine()
     t1, t2, t3, t4 = st.tabs(["📤 Processar Upload","📊 Vendas Consolidadas","📚 Histórico","⏳ Vendas Pendentes"])
     with t1: tab_processar_upload(engine)
