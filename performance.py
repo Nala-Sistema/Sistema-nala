@@ -488,6 +488,7 @@ MARKETPLACES = [
 
 def main():
     st.title("📊 Performance Mensal")
+    st.caption("v1.2 — fix duplicatas + dict mapping")
 
     engine = get_engine()
     ano_mes = _seletor_mes()
