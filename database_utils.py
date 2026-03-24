@@ -1,10 +1,6 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.4 (21/03/2026)
-
-CHANGELOG v3.4:
-  - NOVO: Suporte a múltiplos ambientes (Produção/Dev) via st.session_state
-  - get_engine() agora lê ambiente_nala do session_state
+Versão: 3.3 (17/03/2026)
 
 CHANGELOG v3.3:
   - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
@@ -37,16 +33,13 @@ from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 
-# URLs dos bancos Neon (Produção e Dev)
-AMBIENTES_DB = {
-    "Produção": "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require",
-    "Dev": "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-icy-shadow-ac1qgp3l-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require",
-}
+# v3.5: Código agnóstico ao banco — lê APENAS do Secrets do Streamlit.
+# Cada app (Produção e Dev) tem seu próprio Secret com a URL correta.
+# Isso garante isolamento total: Dev nunca acessa banco de Produção.
 
 def get_engine():
-    """Retorna engine do SQLAlchemy baseado no ambiente selecionado."""
-    ambiente = st.session_state.get("ambiente_nala", "Produção")
-    db_url = AMBIENTES_DB.get(ambiente, AMBIENTES_DB["Produção"])
+    """Retorna engine do SQLAlchemy lendo DB_URL exclusivamente do Secrets."""
+    db_url = st.secrets["DB_URL"]
     return create_engine(db_url)
 
 # ============================================================
