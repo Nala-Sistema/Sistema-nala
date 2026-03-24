@@ -37,7 +37,13 @@ import streamlit as st
 DB_URL = "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require"
 
 def get_engine():
-    """Retorna engine do SQLAlchemy"""
+    """Retorna engine do SQLAlchemy (v3.4: respeita ambiente Produção/Dev)"""
+    try:
+        override = st.session_state.get('_db_url_override')
+        if override:
+            return create_engine(override)
+    except Exception:
+        pass  # Fora do Streamlit (scripts CLI)
     return create_engine(DB_URL)
 
 # ============================================================
