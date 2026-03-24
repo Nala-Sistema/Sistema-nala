@@ -26,11 +26,8 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import io
 
-DB_URL = "postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require"
-
-
-def get_engine():
-    return create_engine(DB_URL)
+# v3.1: Usa get_engine de database_utils (respeita ambiente Produção/Dev)
+from database_utils import get_engine
 
 
 def _query_to_df(engine, query, params=None):
