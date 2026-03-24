@@ -767,7 +767,7 @@ def _tab_usuarios(engine):
     with st.form("form_novo_usuario", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
         novo_username = col1.text_input("Username")
-        novo_role = col2.selectbox("Perfil", ["ADMIN", "COMPRAS", "GESTOR"])
+        novo_role = col2.selectbox("Perfil", ["ADMIN", "CONTROLADORIA", "DIRETOR", "COMPRAS", "GESTOR"])
         novo_senha = col3.text_input("Senha", type="password")
         novo_senha_confirm = st.text_input("Confirmar Senha", type="password")
 
