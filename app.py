@@ -26,32 +26,19 @@ st.markdown("""
 
 
 # ============================================================
-# AMBIENTES (PRODUÇÃO / DEV)
+# CONEXÃO COM BANCO — agnóstico ao ambiente
+# Lê exclusivamente do st.secrets["DB_URL"] configurado no Streamlit Cloud.
+# Cada app (Produção / Dev) tem seu próprio Secret apontando pro banco correto.
 # ============================================================
+from database_utils import get_engine
 
-AMBIENTES = {
-    '🟢 Produção': 'postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-long-unit-acfema6a-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require',
-    '🟡 Dev':      'postgresql://neondb_owner:npg_fplFq8iAR4Ur@ep-icy-shadow-ac1qgp3l-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require',
-}
-
-AMBIENTE_PADRAO = '🟢 Produção'
-
-
-def _get_engine_ambiente():
-    """
-    Retorna engine do banco baseado no ambiente selecionado.
-    Também armazena a DB_URL no session_state para que
-    database_utils.get_engine() possa usar a mesma conexão.
-    """
-    from sqlalchemy import create_engine
-
-    ambiente = st.session_state.get('ambiente', AMBIENTE_PADRAO)
-    db_url = AMBIENTES.get(ambiente, AMBIENTES[AMBIENTE_PADRAO])
-
-    # Salva no session_state para database_utils usar
-    st.session_state['_db_url_override'] = db_url
-
-    return create_engine(db_url)
+def _is_dev_environment():
+    """Detecta se estamos no ambiente Dev baseado na URL do banco."""
+    try:
+        db_url = st.secrets.get("DB_URL", "")
+        return "ep-icy-shadow" in db_url
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -205,7 +192,7 @@ def _tela_login(engine):
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
         if os.path.exists("logo.png"):
-            st.image("logo.png", use_container_width=True)
+            st.image("logo.png", width=200)
         else:
             st.markdown("<h1 style='text-align:center; color:#d4af37;'>NALA</h1>",
                         unsafe_allow_html=True)
@@ -225,28 +212,10 @@ def _tela_login(engine):
                     if usuario:
                         st.session_state.logado = True
                         st.session_state.usuario = usuario
-
-                        # Se não é ADMIN, força Produção
-                        if usuario['role'] != 'ADMIN':
-                            st.session_state.ambiente = AMBIENTE_PADRAO
-
                         st.rerun()
                     else:
                         st.error("Acesso negado. Usuário ou senha incorretos.")
 
-        # Toggle de ambiente — só aparece no expander (discreto)
-        with st.expander("⚙️ Avançado"):
-            ambiente_atual = st.session_state.get('ambiente', AMBIENTE_PADRAO)
-            novo_ambiente = st.selectbox(
-                "Ambiente",
-                options=list(AMBIENTES.keys()),
-                index=list(AMBIENTES.keys()).index(ambiente_atual),
-                key="sel_ambiente_login",
-                help="Apenas ADMIN pode usar o ambiente Dev"
-            )
-            if novo_ambiente != ambiente_atual:
-                st.session_state.ambiente = novo_ambiente
-                st.rerun()
 
 
 # ============================================================
@@ -354,20 +323,14 @@ def _area_logada(engine):
     # ---- SIDEBAR ----
     with st.sidebar:
         if os.path.exists("logo.png"):
-            st.image("logo.png", use_container_width=True)
+            st.image("logo.png", width=200)
         else:
             st.markdown("<h1 style='color: #d4af37; text-align: center;'>NALA</h1>",
                         unsafe_allow_html=True)
 
-        # Badge de ambiente
-        ambiente = st.session_state.get('ambiente', AMBIENTE_PADRAO)
-        if ambiente != AMBIENTE_PADRAO:
-            st.markdown(
-                "<div style='background:#F59E0B;color:#000;padding:6px 12px;"
-                "border-radius:6px;text-align:center;font-weight:bold;margin-bottom:8px;'>"
-                "AMBIENTE DEV</div>",
-                unsafe_allow_html=True
-            )
+        # Badge de ambiente Dev (detectado automaticamente pelo Secret)
+        if _is_dev_environment():
+            st.warning("⚠️ AMBIENTE DE DESENVOLVIMENTO (TESTES)")
 
         st.markdown("---")
 
@@ -378,23 +341,9 @@ def _area_logada(engine):
         st.markdown("---")
         st.caption(f"👤 {nome} ({role})")
 
-        # Toggle de ambiente no sidebar (só ADMIN)
-        if role == 'ADMIN':
-            ambiente_atual = st.session_state.get('ambiente', AMBIENTE_PADRAO)
-            novo_ambiente = st.selectbox(
-                "Ambiente",
-                options=list(AMBIENTES.keys()),
-                index=list(AMBIENTES.keys()).index(ambiente_atual),
-                key="sel_ambiente_sidebar",
-            )
-            if novo_ambiente != ambiente_atual:
-                st.session_state.ambiente = novo_ambiente
-                st.rerun()
-
         if st.button("🚪 Sair"):
             st.session_state.logado = False
             st.session_state.usuario = {}
-            st.session_state.ambiente = AMBIENTE_PADRAO
             st.rerun()
 
     # ---- ROTEAMENTO ----
@@ -463,11 +412,9 @@ def main():
         st.session_state.logado = False
     if 'usuario' not in st.session_state:
         st.session_state.usuario = {}
-    if 'ambiente' not in st.session_state:
-        st.session_state.ambiente = AMBIENTE_PADRAO
 
-    # Engine do banco — baseado no ambiente selecionado
-    engine = _get_engine_ambiente()
+    # Engine do banco — lê do st.secrets["DB_URL"] (agnóstico ao ambiente)
+    engine = get_engine()
 
     # Garantir que tabela dim_usuario_lojas existe
     _garantir_tabela_usuario_lojas(engine)
