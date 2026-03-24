@@ -801,6 +801,69 @@ def _tab_usuarios(engine):
 
     st.divider()
 
+    # ---- ATRIBUIR LOJAS A GESTOR (v3.1) ----
+    st.markdown("### 🏪 Atribuir Lojas a Gestor")
+    st.caption("Gestores só veem dados das lojas atribuídas. Deixe vazio = vê todas (não recomendado para GESTOR).")
+
+    gestores = _query_to_df(engine,
+        "SELECT id_usuario, username FROM dim_usuarios WHERE role = 'GESTOR' AND ativo = TRUE ORDER BY username"
+    )
+
+    if not gestores.empty:
+        sel_gestor = st.selectbox(
+            "Selecione o Gestor:",
+            gestores['username'].tolist(),
+            key="sel_gestor_lojas"
+        )
+
+        if sel_gestor:
+            id_gestor = int(gestores[gestores['username'] == sel_gestor]['id_usuario'].iloc[0])
+
+            # Buscar todas as lojas
+            df_lojas_gest = _query_to_df(engine, "SELECT id, marketplace, loja FROM dim_lojas ORDER BY marketplace, loja")
+
+            # Buscar lojas já atribuídas
+            df_atribuidas = _query_to_df(engine,
+                "SELECT id_loja FROM dim_usuario_lojas WHERE id_usuario = %s", (id_gestor,)
+            )
+            ids_atribuidas = set(df_atribuidas['id_loja'].tolist()) if not df_atribuidas.empty else set()
+
+            if not df_lojas_gest.empty:
+                opcoes_lojas = {row['id']: f"{row['marketplace']} — {row['loja']}" for _, row in df_lojas_gest.iterrows()}
+
+                selecionadas = st.multiselect(
+                    f"Lojas para {sel_gestor}:",
+                    options=list(opcoes_lojas.keys()),
+                    default=[lid for lid in ids_atribuidas if lid in opcoes_lojas],
+                    format_func=lambda x: opcoes_lojas.get(x, str(x)),
+                    key="multi_lojas_gestor"
+                )
+
+                if st.button("💾 Salvar Atribuição de Lojas", key="btn_salvar_lojas_gestor", type="primary"):
+                    try:
+                        conn = engine.raw_connection()
+                        cursor = conn.cursor()
+                        # Limpar atribuições antigas
+                        cursor.execute("DELETE FROM dim_usuario_lojas WHERE id_usuario = %s", (id_gestor,))
+                        # Inserir novas
+                        for id_loja in selecionadas:
+                            cursor.execute(
+                                "INSERT INTO dim_usuario_lojas (id_usuario, id_loja) VALUES (%s, %s)",
+                                (id_gestor, id_loja)
+                            )
+                        conn.commit()
+                        cursor.close()
+                        conn.close()
+                        st.success(f"✅ {len(selecionadas)} loja(s) atribuída(s) a {sel_gestor}!")
+                    except Exception as e:
+                        st.error(f"Erro: {e}")
+            else:
+                st.warning("Nenhuma loja cadastrada em dim_lojas.")
+    else:
+        st.info("Nenhum gestor cadastrado. Crie um usuário com perfil GESTOR primeiro.")
+
+    st.divider()
+
     # ---- ALTERAR SENHA ----
     st.markdown("### 🔑 Alterar Senha")
 
