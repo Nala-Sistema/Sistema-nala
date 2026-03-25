@@ -1,6 +1,9 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.3 (17/03/2026)
+Versão: 3.4 (25/03/2026)
+
+CHANGELOG v3.4:
+  - NOVO: excluir_pendentes_por_ids() — deleta permanentemente vendas pendentes por lista de IDs
 
 CHANGELOG v3.3:
   - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
@@ -38,9 +41,20 @@ import streamlit as st
 # Isso garante isolamento total: Dev nunca acessa banco de Produção.
 
 def get_engine():
-    """Retorna engine do SQLAlchemy lendo DB_URL exclusivamente do Secrets."""
-    db_url = st.secrets["DB_URL"]
-    return create_engine(db_url)
+    """Retorna engine do SQLAlchemy lendo DB_URL de forma segura."""
+    try:
+        # O uso do .get evita o erro de interrupção imediata (KeyError)
+        db_url = st.secrets.get("DB_URL")
+        
+        if not db_url:
+            st.error("❌ A variável 'DB_URL' não foi encontrada no Streamlit Cloud.")
+            st.info("Acesse: Settings -> Secrets e cole a URL do banco de dados.")
+            st.stop() # Para o app aqui em vez de dar erro de tela vermelha
+            
+        return create_engine(db_url)
+    except Exception as e:
+        st.error(f"⚠️ Falha ao criar a conexão com o banco: {e}")
+        st.stop()
 
 # ============================================================
 # CONVERSORES E BUSCAS BÁSICAS
@@ -645,6 +659,47 @@ def buscar_pendentes_revisados(engine, limit=50):
     except Exception as e:
         st.error(f"Erro ao buscar pendentes revisados: {e}")
         return pd.DataFrame()
+
+
+def excluir_pendentes_por_ids(engine, ids):
+    """
+    Exclui permanentemente vendas pendentes por lista de IDs.
+    Usado quando o usuário identifica registros como lixo ou duplicata.
+    
+    VERSÃO 3.4: Nova função.
+    
+    Args:
+        engine: SQLAlchemy engine
+        ids: lista de IDs (int) de fact_vendas_pendentes
+    
+    Returns: dict com {excluidos, erros, mensagem}
+    """
+    if not ids:
+        return {'excluidos': 0, 'erros': 0, 'mensagem': 'Nenhum ID fornecido.'}
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['%s'] * len(ids))
+        cursor.execute(
+            f"DELETE FROM fact_vendas_pendentes WHERE id IN ({placeholders})",
+            [int(i) for i in ids]
+        )
+        excluidos = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {
+            'excluidos': excluidos,
+            'erros': 0,
+            'mensagem': f'{excluidos} pendente(s) excluída(s) permanentemente.'
+        }
+    except Exception as e:
+        return {
+            'excluidos': 0,
+            'erros': 1,
+            'mensagem': f'Erro ao excluir pendentes: {e}'
+        }
 
 
 def reprocessar_pendentes_manual(engine, ids_e_dados):
