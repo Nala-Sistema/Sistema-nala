@@ -38,9 +38,20 @@ import streamlit as st
 # Isso garante isolamento total: Dev nunca acessa banco de Produção.
 
 def get_engine():
-    """Retorna engine do SQLAlchemy lendo DB_URL exclusivamente do Secrets."""
-    db_url = st.secrets["DB_URL"]
-    return create_engine(db_url)
+    """Retorna engine do SQLAlchemy lendo DB_URL de forma segura."""
+    try:
+        # O uso do .get evita o erro de interrupção imediata (KeyError)
+        db_url = st.secrets.get("DB_URL")
+        
+        if not db_url:
+            st.error("❌ A variável 'DB_URL' não foi encontrada no Streamlit Cloud.")
+            st.info("Acesse: Settings -> Secrets e cole a URL do banco de dados.")
+            st.stop() # Para o app aqui em vez de dar erro de tela vermelha
+            
+        return create_engine(db_url)
+    except Exception as e:
+        st.error(f"⚠️ Falha ao criar a conexão com o banco: {e}")
+        st.stop()
 
 # ============================================================
 # CONVERSORES E BUSCAS BÁSICAS
