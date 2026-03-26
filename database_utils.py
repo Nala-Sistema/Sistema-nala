@@ -12,6 +12,8 @@ CHANGELOG v3.4:
         4. Se ambas falham, exibe st.error() com detalhes em vez de continue silencioso.
   - NOVO: buscar_config_amazon_por_sku() — busca config por SKU na dim_config_marketplace
         (complemento da buscar_config_amazon_por_asin para fallback).
+  - NOVO: excluir_pendentes_por_ids() — exclui pendentes por lista de IDs
+        (usado pela central_uploads para exclusão de pendentes).
 
 CHANGELOG v3.3:
   - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
@@ -738,6 +740,38 @@ def buscar_pendentes_revisados(engine, limit=50):
     except Exception as e:
         st.error(f"Erro ao buscar pendentes revisados: {e}")
         return pd.DataFrame()
+
+
+def excluir_pendentes_por_ids(engine, ids):
+    """
+    Exclui registros de fact_vendas_pendentes pelos IDs informados.
+    
+    NOVO v3.4 — Complemento para central_uploads (exclusão de pendentes).
+    
+    Args:
+        ids: lista de IDs (int) a deletar
+    
+    Retorna: dict com {excluidos: int, erros: int}
+    """
+    if not ids:
+        return {'excluidos': 0, 'erros': 0}
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['%s'] * len(ids))
+        cursor.execute(
+            f"DELETE FROM fact_vendas_pendentes WHERE id IN ({placeholders})",
+            [int(i) for i in ids]
+        )
+        excluidos = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {'excluidos': excluidos, 'erros': 0}
+    except Exception as e:
+        st.error(f"Erro ao excluir pendentes: {e}")
+        return {'excluidos': 0, 'erros': len(ids)}
 
 
 def reprocessar_pendentes_manual(engine, ids_e_dados):
