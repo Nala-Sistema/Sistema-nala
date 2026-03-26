@@ -383,7 +383,7 @@ def buscar_usuarios():
     
     try:
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT id_usuario, nome FROM dim_usuarios WHERE ativo = TRUE")
+        cursor.execute("SELECT id_usuario, COALESCE(nome, username) as nome FROM dim_usuarios WHERE ativo = TRUE")
         usuarios = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -662,20 +662,16 @@ def main():
             with col2:
                 icone = st.text_input("Ícone (emoji)", value="📋")
             
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.form_submit_button("💾 Criar", use_container_width=True):
-                    if nome:
-                        criar_quadro(nome, descricao, cor, icone, st.session_state.user_id)
-                        st.success("✅ Quadro criado!")
-                        del st.session_state.criando_quadro
-                        st.rerun()
-            
-            with col2:
-                if st.form_submit_button("❌ Cancelar", use_container_width=True):
+            if st.form_submit_button("💾 Criar Quadro", use_container_width=True):
+                if nome:
+                    criar_quadro(nome, descricao, cor, icone, st.session_state.user_id)
+                    st.success("✅ Quadro criado!")
                     del st.session_state.criando_quadro
                     st.rerun()
+        
+        if st.button("❌ Cancelar", key="btn_cancelar_quadro"):
+            del st.session_state.criando_quadro
+            st.rerun()
     
     # Exibir quadro selecionado
     if quadro_selecionado:
@@ -774,29 +770,25 @@ def main():
                 etiquetas_input = st.text_input("Etiquetas (separadas por vírgula)")
                 etiquetas = [e.strip() for e in etiquetas_input.split(',')] if etiquetas_input else []
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if st.form_submit_button("💾 Criar", use_container_width=True):
-                        if titulo:
-                            criar_card(
-                                st.session_state.criando_card,
-                                titulo,
-                                descricao,
-                                prioridade,
-                                responsavel,
-                                data_prazo,
-                                etiquetas,
-                                st.session_state.user_id
-                            )
-                            st.success("✅ Card criado!")
-                            del st.session_state.criando_card
-                            st.rerun()
-                
-                with col2:
-                    if st.form_submit_button("❌ Cancelar", use_container_width=True):
+                if st.form_submit_button("💾 Criar Card", use_container_width=True):
+                    if titulo:
+                        criar_card(
+                            st.session_state.criando_card,
+                            titulo,
+                            descricao,
+                            prioridade,
+                            responsavel,
+                            data_prazo,
+                            etiquetas,
+                            st.session_state.user_id
+                        )
+                        st.success("✅ Card criado!")
                         del st.session_state.criando_card
                         st.rerun()
+            
+            if st.button("❌ Cancelar", key="btn_cancelar_card"):
+                del st.session_state.criando_card
+                st.rerun()
     
     # Modais
     if st.session_state.get('card_editando'):
