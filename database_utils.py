@@ -1,6 +1,19 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.3 (17/03/2026)
+Versão: 3.4 (26/03/2026)
+
+CHANGELOG v3.4:
+  - FIX CRÍTICO: reprocessar_pendentes_manual() — corrige "giro infinito" em vendas Amazon
+        cujo SKU foi corrigido mas ASIN não tinha config.
+        Agora:
+        1. Tenta buscar config pelo ASIN (codigo_anuncio) — comportamento original.
+        2. Se não encontra, faz FALLBACK buscando config pelo SKU corrigido.
+        3. Se encontra via SKU, usa o ASIN oficial da config (prioridade de dados).
+        4. Se ambas falham, exibe st.error() com detalhes em vez de continue silencioso.
+  - NOVO: buscar_config_amazon_por_sku() — busca config por SKU na dim_config_marketplace
+        (complemento da buscar_config_amazon_por_asin para fallback).
+  - NOVO: excluir_pendentes_por_ids() — exclui pendentes por lista de IDs
+        (usado pela central_uploads para exclusão de pendentes).
 
 CHANGELOG v3.3:
   - FIX CRÍTICO: reprocessar_pendentes_por_sku() agora RECALCULA taxas a partir de
@@ -188,6 +201,77 @@ def buscar_config_amazon_por_asin(engine, asin, logistica=None):
                 if c['logistica'] == logistica:
                     return c
             # Match parcial (ex: logistica='FBA', config='FBA')
+            for c in configs:
+                if logistica in c['logistica']:
+                    return c
+        
+        # 2. Fallback: se só tem uma config, usa ela
+        if len(configs) == 1:
+            return configs[0]
+        
+        # 3. Se tem múltiplas, prefere DBA (mais comum sem sufixo)
+        for c in configs:
+            if 'DBA' in c['logistica'] and 'PF' not in c['logistica']:
+                return c
+        
+        return configs[0]
+    
+    except Exception:
+        return None
+
+
+def buscar_config_amazon_por_sku(engine, sku, logistica=None):
+    """
+    Busca configuração Amazon por SKU na dim_config_marketplace.
+    
+    NOVO v3.4 — Fallback para quando busca por ASIN falha.
+    
+    Cenário: Usuário corrigiu o SKU na tela de pendentes, mas o ASIN original
+    do arquivo não bate com nada no banco. Este fallback tenta encontrar a config
+    pelo SKU corrigido, e se achar, devolve também o ASIN oficial dessa config.
+    
+    Args:
+        sku: código SKU (corrigido pelo usuário)
+        logistica: 'FBA', 'DBA' ou None
+    
+    Retorna: dict com {asin, comissao_percentual, taxa_fixa, frete_estimado, logistica} ou None
+    """
+    if not sku or str(sku).strip() == '':
+        return None
+    
+    sku = str(sku).strip()
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT asin, logistica, comissao_percentual, taxa_fixa, frete_estimado
+            FROM dim_config_marketplace 
+            WHERE marketplace = 'AMAZON' AND sku = %s AND ativo = true
+            ORDER BY logistica
+        """, (sku,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not rows:
+            return None
+        
+        configs = []
+        for row in rows:
+            configs.append({
+                'asin': str(row[0] or '').strip(),
+                'logistica': str(row[1] or '').strip(),
+                'comissao_percentual': float(row[2] or 0),
+                'taxa_fixa': float(row[3] or 0),
+                'frete_estimado': float(row[4] or 0),
+            })
+        
+        # 1. Match exato por logística
+        if logistica:
+            for c in configs:
+                if c['logistica'] == logistica:
+                    return c
             for c in configs:
                 if logistica in c['logistica']:
                     return c
@@ -658,11 +742,54 @@ def buscar_pendentes_revisados(engine, limit=50):
         return pd.DataFrame()
 
 
+def excluir_pendentes_por_ids(engine, ids):
+    """
+    Exclui registros de fact_vendas_pendentes pelos IDs informados.
+    
+    NOVO v3.4 — Complemento para central_uploads (exclusão de pendentes).
+    
+    Args:
+        ids: lista de IDs (int) a deletar
+    
+    Retorna: dict com {excluidos: int, erros: int}
+    """
+    if not ids:
+        return {'excluidos': 0, 'erros': 0}
+    
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        placeholders = ','.join(['%s'] * len(ids))
+        cursor.execute(
+            f"DELETE FROM fact_vendas_pendentes WHERE id IN ({placeholders})",
+            [int(i) for i in ids]
+        )
+        excluidos = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {'excluidos': excluidos, 'erros': 0}
+    except Exception as e:
+        st.error(f"Erro ao excluir pendentes: {e}")
+        return {'excluidos': 0, 'erros': len(ids)}
+
+
 def reprocessar_pendentes_manual(engine, ids_e_dados):
     """
     Reprocessa vendas pendentes com dados editados manualmente.
     
-    VERSÃO 3.3 - FIX CRÍTICO:
+    VERSÃO 3.4 - FIX CRÍTICO (giro infinito Amazon):
+        Antes: se buscar_config_amazon_por_asin retornava None, fazia continue
+        silencioso — a tela piscava e nada acontecia, sem erro nem sucesso.
+        
+        Agora — Busca em Duas Etapas:
+        1. Tenta buscar config pelo ASIN (codigo_anuncio) — comportamento original.
+        2. Se falha, tenta FALLBACK pelo SKU corrigido pelo usuário.
+        3. Se encontra via SKU, usa o ASIN oficial da config como codigo_anuncio
+           (prioridade de dados — garante que o Snapshot tenha o ASIN correto).
+        4. Se ambas falham, exibe st.error() com detalhes claros.
+    
+    VERSÃO 3.3:
         Para vendas Amazon, recalcula taxas a partir da dim_config_marketplace
         em vez de usar os valores (possivelmente zerados) do pendente.
     """
@@ -705,13 +832,22 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             marketplace = str(item.get('marketplace_origem', '')).upper()
 
             # ============================================================
-            # v3.3: RECALCULAR TAXAS para Amazon
+            # v3.4: BUSCA EM DUAS ETAPAS para Amazon (fix giro infinito)
             # ============================================================
             if 'AMAZON' in marketplace:
                 asin = str(item.get('codigo_anuncio', '')).strip()
                 logistica_det = _detectar_logistica_do_pedido(item.get('numero_pedido', ''))
                 
+                # --- Etapa 1: Busca pelo ASIN original (codigo_anuncio) ---
                 conf = buscar_config_amazon_por_asin(engine, asin, logistica_det)
+                codigo_anuncio_final = asin  # default: manter o ASIN original
+                
+                # --- Etapa 2: Fallback pelo SKU corrigido ---
+                if not conf:
+                    conf = buscar_config_amazon_por_sku(engine, sku, logistica_det)
+                    if conf and conf.get('asin'):
+                        # Prioridade de dados: usar ASIN oficial da config
+                        codigo_anuncio_final = conf['asin']
                 
                 if conf:
                     comissao_pct = conf['comissao_percentual']
@@ -727,7 +863,13 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                         v_frete = 0.0
                         v_taxa_fixa = taxa_fixa_unit * qtd
                 else:
-                    # Sem config — não gravar com taxa zero
+                    # --- Feedback de erro (v3.4): acaba com o giro no vácuo ---
+                    st.error(
+                        f"❌ Pedido `{item.get('numero_pedido', '?')}` não processado — "
+                        f"ASIN `{asin}` não encontrado para logística `{logistica_det}` "
+                        f"e SKU `{sku}` também não possui config cadastrada na Amazon. "
+                        f"Cadastre o anúncio em **Configurações → Amazon** antes de reprocessar."
+                    )
                     sem_config += 1
                     erros += 1
                     continue
@@ -736,6 +878,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 v_taxa_fixa = float(item.get('tarifa_fixa', 0))
                 v_frete = float(item.get('frete', 0))
                 logistica_final = item.get('logistica', None)
+                codigo_anuncio_final = item.get('codigo_anuncio', '')
 
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_total = custo_unit * qtd
@@ -752,7 +895,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 item.get('numero_pedido', ''),
                 item.get('data_venda'),
                 sku,
-                item.get('codigo_anuncio', ''),
+                codigo_anuncio_final,
                 qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto_val, v_comissao,
                 v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
