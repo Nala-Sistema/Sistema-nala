@@ -1,5 +1,9 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
+VERSAO 3.6 (25/03/2026):
+  - NOVO: Botão "Excluir Selecionadas" nas seções de pendentes (SKU + Divergência)
+  - FIX: Dicionário de itens na seção Divergência agora passa tarifa_fixa corretamente
+
 VERSAO 3.5 (21/03/2026):
   - NOVO: Colunas Curva ABC e Tag Manual nas Vendas Consolidadas + Export Excel
   - NOVO: Fix Magalu codigo_anuncio vazio (preenche com SKU em runtime)
@@ -27,7 +31,7 @@ from database_utils import (
     get_engine, gravar_log_upload, buscar_pendentes, buscar_pendentes_resumo,
     reprocessar_pendentes_por_sku, recalcular_curva_abc, buscar_pendentes_por_tipo,
     reprocessar_pendentes_manual, gravar_mapeamento_sku, buscar_custos_skus,
-    buscar_skus_validos, buscar_pendentes_revisados,
+    buscar_skus_validos, buscar_pendentes_revisados, excluir_pendentes_por_ids,
 )
 from processar_ml import processar_arquivo_ml, gravar_vendas_ml
 from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
@@ -1210,22 +1214,34 @@ def _secao_pend_sku(engine):
         nf = [str(r['sku']).strip() for _,r in sels.iterrows() if str(r['sku']).strip() not in skus_v]
         if nf: st.warning(f"⚠️ Não cadastrado(s): {', '.join(nf)}")
         st.info(f"📌 {len(sels)} selecionada(s)")
-        if st.button("🔄 Reprocessar SKUs", key="btn_sku", type="primary"):
-            with st.spinner("Reprocessando..."):
-                itens = [{'id':r['id'],'sku':str(r['sku']).strip(),'sku_original':str(r['sku_original']).strip(),
-                    'valor_venda_efetivo':r['valor_venda_efetivo'],'comissao':r['comissao'],'imposto':r['imposto'],
-                    'frete':r['frete'],'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
-                    'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
-                    'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                    'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
-                res = reprocessar_pendentes_manual(engine, itens)
-                if res['sucesso'] > 0:
-                    st.success(f"✅ {res['mensagem']}")
-                    if res['mapeados'] > 0: st.info(f"🔧 {res['mapeados']} mapeamento(s) salvo(s)")
-                    try: recalcular_curva_abc(engine, dias=30)
-                    except: pass
+
+        col_btn_sku1, col_btn_sku2 = st.columns(2)
+        with col_btn_sku1:
+            if st.button("🔄 Reprocessar SKUs", key="btn_sku", type="primary"):
+                with st.spinner("Reprocessando..."):
+                    itens = [{'id':r['id'],'sku':str(r['sku']).strip(),'sku_original':str(r['sku_original']).strip(),
+                        'valor_venda_efetivo':r['valor_venda_efetivo'],'comissao':r['comissao'],'imposto':r['imposto'],
+                        'frete':r['frete'],'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
+                        'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
+                        'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
+                    res = reprocessar_pendentes_manual(engine, itens)
+                    if res['sucesso'] > 0:
+                        st.success(f"✅ {res['mensagem']}")
+                        if res['mapeados'] > 0: st.info(f"🔧 {res['mapeados']} mapeamento(s) salvo(s)")
+                        try: recalcular_curva_abc(engine, dias=30)
+                        except: pass
+                        st.rerun()
+                    else: st.error(f"❌ {res['mensagem']}")
+        with col_btn_sku2:
+            if st.button("🗑️ Excluir Selecionadas", key="btn_excluir_pend_sku", type="secondary"):
+                ids_excluir = sels['id'].tolist()
+                res_del = excluir_pendentes_por_ids(engine, ids_excluir)
+                if res_del['excluidos'] > 0:
+                    st.success(f"✅ {res_del['mensagem']}")
                     st.rerun()
-                else: st.error(f"❌ {res['mensagem']}")
+                else:
+                    st.error(f"❌ {res_del['mensagem']}")
 
 
 def _secao_pend_div(engine):
@@ -1235,7 +1251,7 @@ def _secao_pend_div(engine):
     if df.empty: st.success("✅ Nenhuma por divergência."); return
 
     df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
-        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo']].copy()
+        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','tarifa_fixa','imposto','frete','motivo']].copy()
     df_e['sku_original'] = df_e['sku'].copy()
     df_e['data_venda'] = pd.to_datetime(df_e['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
     df_e.insert(0, 'Sel', False)
@@ -1244,7 +1260,8 @@ def _secao_pend_div(engine):
         'Sel': st.column_config.CheckboxColumn("Sel", default=False),
         'sku': st.column_config.TextColumn("SKU (editável)"), 'sku_original': None,
         'valor_venda_efetivo': st.column_config.NumberColumn("Receita", format="%.2f"),
-        'comissao': st.column_config.NumberColumn("Tarifa", format="%.2f"),
+        'comissao': st.column_config.NumberColumn("Comissão", format="%.2f"),
+        'tarifa_fixa': st.column_config.NumberColumn("Taxa Fixa", format="%.2f"),
         'imposto': st.column_config.NumberColumn("Imposto", format="%.2f"),
         'frete': st.column_config.NumberColumn("Frete", format="%.2f"),
     }, use_container_width=True, height=400, hide_index=True, key="ed_pend_div")
@@ -1252,21 +1269,34 @@ def _secao_pend_div(engine):
     sels = df_ed[df_ed['Sel']==True]
     if len(sels) > 0:
         st.info(f"📌 {len(sels)} selecionada(s)")
-        if st.button("🔄 Reprocessar Divergências", key="btn_div", type="primary"):
-            with st.spinner("Reprocessando..."):
-                itens = [{'id':r['id'],'sku':str(r['sku']).strip(),'sku_original':str(r['sku_original']).strip(),
-                    'valor_venda_efetivo':r['valor_venda_efetivo'],'comissao':r['comissao'],'imposto':r['imposto'],
-                    'frete':r['frete'],'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
-                    'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
-                    'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                    'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
-                res = reprocessar_pendentes_manual(engine, itens)
-                if res['sucesso'] > 0:
-                    st.success(f"✅ {res['mensagem']}")
-                    try: recalcular_curva_abc(engine, dias=30)
-                    except: pass
+
+        col_btn_div1, col_btn_div2 = st.columns(2)
+        with col_btn_div1:
+            if st.button("🔄 Reprocessar Divergências", key="btn_div", type="primary"):
+                with st.spinner("Reprocessando..."):
+                    itens = [{'id':r['id'],'sku':str(r['sku']).strip(),'sku_original':str(r['sku_original']).strip(),
+                        'valor_venda_efetivo':r['valor_venda_efetivo'],'comissao':r['comissao'],'imposto':r['imposto'],
+                        'frete':r['frete'],'tarifa_fixa':r.get('tarifa_fixa', 0),
+                        'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
+                        'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
+                        'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
+                    res = reprocessar_pendentes_manual(engine, itens)
+                    if res['sucesso'] > 0:
+                        st.success(f"✅ {res['mensagem']}")
+                        try: recalcular_curva_abc(engine, dias=30)
+                        except: pass
+                        st.rerun()
+                    else: st.error(f"❌ {res['mensagem']}")
+        with col_btn_div2:
+            if st.button("🗑️ Excluir Selecionadas", key="btn_excluir_pend_div", type="secondary"):
+                ids_excluir = sels['id'].tolist()
+                res_del = excluir_pendentes_por_ids(engine, ids_excluir)
+                if res_del['excluidos'] > 0:
+                    st.success(f"✅ {res_del['mensagem']}")
                     st.rerun()
-                else: st.error(f"❌ {res['mensagem']}")
+                else:
+                    st.error(f"❌ {res_del['mensagem']}")
 
 
 def _exibir_historico(engine):
@@ -1286,7 +1316,7 @@ def _exibir_historico(engine):
 
 def main():
     st.title("💰 Central de Vendas")
-    st.caption("v3.5 — tags + produto + dict mapping")
+    st.caption("v3.6 — excluir pendentes + fix tarifa_fixa divergência")
     engine = get_engine()
     t1, t2, t3, t4 = st.tabs(["📤 Processar Upload","📊 Vendas Consolidadas","📚 Histórico","⏳ Vendas Pendentes"])
     with t1: tab_processar_upload(engine)
