@@ -185,18 +185,29 @@ def detectar_header_shopee(arquivo) -> int:
 
 def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Padroniza nomes de colunas do arquivo Shopee.
-    Normaliza variações de maiúsculas/minúsculas na coluna de taxa de serviço.
+    Padroniza nomes de colunas do arquivo Shopee (v2.2).
+    Suporta variações em Inglês e Português para evitar erros de mapeamento.
     """
     rename_map = {}
     for col in df.columns:
         col_norm = str(col).lower().strip()
-        # Normalizar variações de "Taxa de serviço líquida"
-        if 'taxa de serviço' in col_norm and ('líquida' in col_norm or 'liquida' in col_norm):
+        
+        # Mapeamento: Net Commission Fee / Taxa de comissão líquida
+        if col_norm in ['net commission fee', 'taxa de comissão líquida', 'taxa de comissao liquida']:
+            rename_map[col] = 'Net Commission Fee'
+            
+        # Mapeamento: Taxa de serviço líquida
+        elif 'taxa de serviço' in col_norm or 'taxa de servico' in col_norm:
             rename_map[col] = 'Taxa de serviço líquida'
-        # Normalizar "Taxa de serviço" isolado (sem "líquida")
-        elif col_norm == 'taxa de serviço':
-            rename_map[col] = 'Taxa de serviço líquida'
+            
+        # Mapeamento: ID do Pedido (Garante que espaços não quebrem a detecção)
+        elif col_norm == 'id do pedido':
+            rename_map[col] = 'ID do pedido'
+
+        # Mapeamento: Cashback (Opcional, para integridade de dados)
+        elif 'coin cashback' in col_norm or 'moedas' in col_norm:
+            rename_map[col] = 'Seller Absorbed Coin Cashback'
+            
     return df.rename(columns=rename_map)
 
 
@@ -243,7 +254,6 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             'Quantidade',
             'Subtotal do produto',
             'Net Commission Fee',
-            'Taxa de serviço líquida',
         ]
         faltando = [c for c in colunas_obrigatorias if c not in df.columns]
         if faltando:
