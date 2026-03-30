@@ -397,6 +397,15 @@ def _area_logada(engine):
     elif modulo == 'kanban':
         carregar_modulo("kanban_board")
 
+    elif modulo == 'tabela_preco':
+        from tabela_preco import tabela_preco_page
+        tabela_preco_page()
+
+    elif modulo == 'ads':
+        mostrar_badge_filtro_loja()
+        from analise_ads import modulo_ads
+        modulo_ads(engine)
+
     elif modulo == 'config':
         mostrar_badge_leitura('config')
         carregar_modulo("configuracoes")
