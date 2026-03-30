@@ -1,6 +1,11 @@
 """
 GESTÃO DE SKUs - Sistema Nala
-Versão: 2.0 (29/03/2026)
+Versão: 2.1 (30/03/2026)
+
+CHANGELOG v2.1:
+  - NOVO: Campos de dimensão e peso (largura, comprimento, altura, peso_bruto)
+        Aparecem no formulário de cadastro/edição, template e importação.
+        NÃO aparecem na lista principal (regra de UX).
 
 CHANGELOG v2.0:
   - FIX: DB_URL hardcoded removido — usa get_engine() de database_utils.py
@@ -168,7 +173,8 @@ def main():
                     'preco_compra': 0.0, 'embalagem': 0.0, 'mdo': 0.0,
                     'custo_ads': 0.0, 'outros_custos': 0.0,
                     'preco_a_ser_considerado': 0.0,
-                    'margem_minima': 0.0, 'margem_desejavel': 0.0
+                    'margem_minima': 0.0, 'margem_desejavel': 0.0,
+                    'largura': 0.0, 'comprimento': 0.0, 'altura': 0.0, 'peso_bruto': 0.0,
                 }
 
                 # Se modo edição, buscar SKU existente
@@ -189,7 +195,8 @@ def main():
                                 SELECT p.sku, p.nome, p.categoria, p.status, 
                                        p.preco_a_ser_considerado, p.margem_minima, p.margem_desejavel,
                                        c.cod_fornecedor, c.preco_compra, c.embalagem, c.mdo, 
-                                       c.custo_ads, c.outros_custos
+                                       c.custo_ads, c.outros_custos,
+                                       p.largura, p.comprimento, p.altura, p.peso_bruto
                                 FROM dim_produtos p
                                 LEFT JOIN dim_produtos_custos c ON p.sku = c.sku
                                 WHERE p.sku = :sku
@@ -213,6 +220,10 @@ def main():
                                         'mdo': float(result[10] or 0.0),
                                         'custo_ads': float(result[11] or 0.0),
                                         'outros_custos': float(result[12] or 0.0),
+                                        'largura': float(result[13] or 0.0),
+                                        'comprimento': float(result[14] or 0.0),
+                                        'altura': float(result[15] or 0.0),
+                                        'peso_bruto': float(result[16] or 0.0),
                                     }
                                     st.success(f"✅ SKU {sku_code} carregado para edição!")
                     except Exception as e:
@@ -291,6 +302,26 @@ def main():
                         help="Margem percentual desejável/ideal para este SKU"
                     )
 
+                    st.markdown("### Dimensões e Peso")
+                    st.caption("Usado no cálculo de frete (peso cubado) no módulo Tabela de Preço.")
+                    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+                    v_largura = col_d1.text_input(
+                        "Largura (cm)",
+                        value=str(valores_padrao['largura']).replace('.', ','),
+                    )
+                    v_comprimento = col_d2.text_input(
+                        "Comprimento (cm)",
+                        value=str(valores_padrao['comprimento']).replace('.', ','),
+                    )
+                    v_altura = col_d3.text_input(
+                        "Altura (cm)",
+                        value=str(valores_padrao['altura']).replace('.', ','),
+                    )
+                    v_peso_bruto = col_d4.text_input(
+                        "Peso Bruto (kg)",
+                        value=str(valores_padrao['peso_bruto']).replace('.', ','),
+                    )
+
                     # BOTÃO SALVAR
                     submitted = st.form_submit_button("💾 Salvar Produto", type="primary")
 
@@ -307,15 +338,21 @@ def main():
                                 preco_final_float = converter_valor_para_float(v_preco_final)
                                 margem_min_float = converter_valor_para_float(v_margem_min)
                                 margem_des_float = converter_valor_para_float(v_margem_des)
+                                largura_float = converter_valor_para_float(v_largura)
+                                comprimento_float = converter_valor_para_float(v_comprimento)
+                                altura_float = converter_valor_para_float(v_altura)
+                                peso_bruto_float = converter_valor_para_float(v_peso_bruto)
 
                                 with engine.connect() as conn:
                                     # 1. Inserir/Atualizar em dim_produtos
                                     query_produtos = text("""
                                         INSERT INTO dim_produtos 
                                             (sku, nome, categoria, status, preco_a_ser_considerado,
-                                             margem_minima, margem_desejavel)
+                                             margem_minima, margem_desejavel,
+                                             largura, comprimento, altura, peso_bruto)
                                         VALUES (:sku, :nome, :categoria, :status, :preco,
-                                                :margem_min, :margem_des)
+                                                :margem_min, :margem_des,
+                                                :largura, :comprimento, :altura, :peso_bruto)
                                         ON CONFLICT (sku) 
                                         DO UPDATE SET
                                             nome = EXCLUDED.nome,
@@ -323,7 +360,11 @@ def main():
                                             status = EXCLUDED.status,
                                             preco_a_ser_considerado = EXCLUDED.preco_a_ser_considerado,
                                             margem_minima = EXCLUDED.margem_minima,
-                                            margem_desejavel = EXCLUDED.margem_desejavel
+                                            margem_desejavel = EXCLUDED.margem_desejavel,
+                                            largura = EXCLUDED.largura,
+                                            comprimento = EXCLUDED.comprimento,
+                                            altura = EXCLUDED.altura,
+                                            peso_bruto = EXCLUDED.peso_bruto
                                     """)
 
                                     conn.execute(query_produtos, {
@@ -334,6 +375,10 @@ def main():
                                         "preco": preco_final_float,
                                         "margem_min": margem_min_float,
                                         "margem_des": margem_des_float,
+                                        "largura": largura_float,
+                                        "comprimento": comprimento_float,
+                                        "altura": altura_float,
+                                        "peso_bruto": peso_bruto_float,
                                     })
 
                                     # 2. Inserir/Atualizar em dim_produtos_custos
@@ -444,6 +489,10 @@ def main():
                         'preco_a_ser_considerado': ['17,38', '21,88'],
                         'margem_minima': ['10,0', '12,0'],
                         'margem_desejavel': ['25,0', '30,0'],
+                        'largura': ['20,0', '15,0'],
+                        'comprimento': ['30,0', '25,0'],
+                        'altura': ['10,0', '8,0'],
+                        'peso_bruto': ['0,50', '0,35'],
                     }
 
                     df_template = pd.DataFrame(template_data)
@@ -519,15 +568,25 @@ def main():
                                             row.get('margem_minima', 0))
                                         margem_des = converter_valor_para_float(
                                             row.get('margem_desejavel', 0))
+                                        largura = converter_valor_para_float(
+                                            row.get('largura', 0))
+                                        comprimento = converter_valor_para_float(
+                                            row.get('comprimento', 0))
+                                        altura = converter_valor_para_float(
+                                            row.get('altura', 0))
+                                        peso_bruto = converter_valor_para_float(
+                                            row.get('peso_bruto', 0))
 
                                         with engine.connect() as conn:
                                             query_prod = text("""
                                                 INSERT INTO dim_produtos 
                                                     (sku, nome, categoria, status, 
                                                      preco_a_ser_considerado,
-                                                     margem_minima, margem_desejavel)
+                                                     margem_minima, margem_desejavel,
+                                                     largura, comprimento, altura, peso_bruto)
                                                 VALUES (:sku, :nome, :cat, :status, :preco,
-                                                        :margem_min, :margem_des)
+                                                        :margem_min, :margem_des,
+                                                        :largura, :comprimento, :altura, :peso_bruto)
                                                 ON CONFLICT (sku) 
                                                 DO UPDATE SET
                                                     nome = EXCLUDED.nome,
@@ -535,7 +594,11 @@ def main():
                                                     status = EXCLUDED.status,
                                                     preco_a_ser_considerado = EXCLUDED.preco_a_ser_considerado,
                                                     margem_minima = EXCLUDED.margem_minima,
-                                                    margem_desejavel = EXCLUDED.margem_desejavel
+                                                    margem_desejavel = EXCLUDED.margem_desejavel,
+                                                    largura = EXCLUDED.largura,
+                                                    comprimento = EXCLUDED.comprimento,
+                                                    altura = EXCLUDED.altura,
+                                                    peso_bruto = EXCLUDED.peso_bruto
                                             """)
 
                                             conn.execute(query_prod, {
@@ -546,6 +609,10 @@ def main():
                                                 "preco": preco_final,
                                                 "margem_min": margem_min,
                                                 "margem_des": margem_des,
+                                                "largura": largura,
+                                                "comprimento": comprimento,
+                                                "altura": altura,
+                                                "peso_bruto": peso_bruto,
                                             })
 
                                             query_custos = text("""
