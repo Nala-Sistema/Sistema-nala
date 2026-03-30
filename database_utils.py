@@ -1,6 +1,11 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.4 (26/03/2026)
+Versão: 3.5 (29/03/2026)
+
+CHANGELOG v3.5:
+  - MELHORIA: buscar_custos_skus() agora inclui outros_custos na soma dos custos.
+        Reflete a nova coluna dim_produtos_custos.outros_custos.
+  - Versão do header sincronizada com comentários internos.
 
 CHANGELOG v3.4:
   - FIX CRÍTICO: reprocessar_pendentes_manual() — corrige "giro infinito" em vendas Amazon
@@ -80,12 +85,16 @@ def _converter_data_br_para_banco(data_str):
         return str(data_str).strip()
 
 def buscar_custos_skus(engine, force_refresh=None):
-    """Busca custos priorizando dim_produtos.preco_a_ser_considerado"""
+    """
+    Busca custos priorizando dim_produtos.preco_a_ser_considerado.
+    
+    v3.5: Inclui COALESCE(pc.outros_custos, 0) na soma dos custos explodidos.
+    """
     query = """
         SELECT p.sku,
             COALESCE(
                 NULLIF(p.preco_a_ser_considerado, 0),
-                NULLIF(pc.preco_compra + pc.embalagem + pc.mdo + pc.custo_ads, 0),
+                NULLIF(pc.preco_compra + pc.embalagem + pc.mdo + pc.custo_ads + COALESCE(pc.outros_custos, 0), 0),
                 pc.preco_compra, 0
             ) as custo
         FROM dim_produtos p
