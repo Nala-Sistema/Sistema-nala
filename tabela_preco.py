@@ -33,8 +33,7 @@ def carregar_produtos_ativos(_engine):
             p.preco_a_ser_considerado,
             COALESCE(p.preco_a_ser_considerado, 0) AS custo_sku,
             p.margem_minima, p.margem_desejavel,
-            p.largura, p.comprimento, p.altura, p.peso_bruto,
-            p.created_at AS data_cadastro
+            p.largura, p.comprimento, p.altura, p.peso_bruto
         FROM dim_produtos p
         WHERE p.status = 'Ativo'
         ORDER BY p.nome
