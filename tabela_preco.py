@@ -1161,12 +1161,13 @@ def tabela_preco_page():
     st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace")
 
     # Verificar sessão
-    if 'usuario' not in st.session_state or 'perfil' not in st.session_state:
+    usuario_dict = st.session_state.get('usuario', {})
+    if not usuario_dict or not usuario_dict.get('role'):
         st.error("Sessão não encontrada. Faça login novamente.")
         return
 
-    usuario = st.session_state['usuario']
-    perfil = st.session_state['perfil']
+    usuario = usuario_dict.get('username', '')
+    perfil = usuario_dict.get('role', '')
     engine = get_engine()
 
     # Determinar tabs acessíveis
