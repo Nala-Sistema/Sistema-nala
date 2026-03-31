@@ -113,15 +113,15 @@ def carregar_vendas_30d(_engine, marketplace):
     data_corte = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     query = text("""
         SELECT
-            sku,
-            marketplace,
-            loja,
+            fv.sku,
+            dl.loja AS loja,
             COUNT(*) AS qtd_vendas_30d,
-            AVG(margem_percentual) AS margem_real_30d
-        FROM fact_vendas_snapshot
-        WHERE LOWER(marketplace) = LOWER(:mkt)
-          AND data_venda >= :data_corte
-        GROUP BY sku, marketplace, loja
+            AVG(fv.margem_percentual) AS margem_real_30d
+        FROM fact_vendas_snapshot fv
+        JOIN dim_lojas dl ON fv.loja_origem = dl.loja
+        WHERE LOWER(dl.marketplace) = LOWER(:mkt)
+          AND fv.data_venda >= :data_corte
+        GROUP BY fv.sku, dl.loja
     """)
     with _engine.connect() as conn:
         df = pd.read_sql(query, conn, params={"mkt": marketplace, "data_corte": data_corte})
@@ -132,9 +132,11 @@ def carregar_vendas_30d(_engine, marketplace):
 def carregar_lojas_gestor(_engine, usuario):
     """Carrega lojas autorizadas para um gestor."""
     query = text("""
-        SELECT loja, marketplace
-        FROM dim_usuario_lojas
-        WHERE LOWER(usuario) = LOWER(:usr)
+        SELECT dl.loja, dl.marketplace
+        FROM dim_usuario_lojas dul
+        JOIN dim_lojas dl ON dul.id_loja = dl.id
+        JOIN dim_usuarios du ON dul.id_usuario = du.id_usuario
+        WHERE LOWER(du.username) = LOWER(:usr)
     """)
     with _engine.connect() as conn:
         df = pd.read_sql(query, conn, params={"usr": usuario})
@@ -1157,7 +1159,7 @@ def render_tab_b2b(engine, perfil, usuario):
 def tabela_preco_page():
     """Função principal do módulo Tabela de Preço."""
     st.title("📊 Tabela de Preço")
-    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v2.1")
+    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v2.2")
 
     # Verificar sessão
     usuario_dict = st.session_state.get('usuario', {})
