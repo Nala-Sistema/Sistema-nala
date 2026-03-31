@@ -139,6 +139,7 @@ def _shopee_upload(engine):
     )
 
     if arquivos and st.button("🔍 ANALISAR", key="ads_analisar", type="primary"):
+        nomes_arquivos = []
         for arquivo in arquivos:
             st.markdown(f"**Arquivo:** {arquivo.name}")
 
@@ -174,12 +175,20 @@ def _shopee_upload(engine):
             # Salvar no session_state para gravar
             st.session_state[f'ads_df_{arquivo.name}'] = df
             st.session_state[f'ads_meta_{arquivo.name}'] = meta
+            nomes_arquivos.append(arquivo.name)
 
-        # Botão gravar
+        # Salvar lista de nomes para o botão GRAVAR sobreviver ao re-render
+        st.session_state['ads_arquivos_analisados'] = nomes_arquivos
+
+    # Botão gravar — FORA do bloco ANALISAR para sobreviver ao re-render
+    nomes_pendentes = st.session_state.get('ads_arquivos_analisados', [])
+    if nomes_pendentes:
+        st.divider()
+        st.info(f"📄 {len(nomes_pendentes)} arquivo(s) analisado(s) aguardando gravação.")
         if st.button("💾 GRAVAR NO BANCO", key="ads_gravar", type="primary"):
-            for arquivo in arquivos:
-                key_df = f'ads_df_{arquivo.name}'
-                key_meta = f'ads_meta_{arquivo.name}'
+            for nome_arq in nomes_pendentes:
+                key_df = f'ads_df_{nome_arq}'
+                key_meta = f'ads_meta_{nome_arq}'
 
                 if key_df not in st.session_state:
                     continue
@@ -187,14 +196,14 @@ def _shopee_upload(engine):
                 df = st.session_state[key_df]
                 meta = st.session_state[key_meta]
 
-                with st.spinner(f"Gravando {arquivo.name}..."):
-                    gravados, erros, duplicatas = gravar_ads_shopee(df, arquivo.name, engine)
+                with st.spinner(f"Gravando {nome_arq}..."):
+                    gravados, erros, duplicatas = gravar_ads_shopee(df, nome_arq, engine)
 
                     # Auto-match SKUs conhecidos
                     _auto_match_skus(engine, df)
 
                     # Log do upload
-                    _registrar_log_ads(engine, meta, arquivo.name, gravados, len(erros))
+                    _registrar_log_ads(engine, meta, nome_arq, gravados, len(erros))
 
                 if gravados > 0:
                     st.success(f"✅ {gravados} registros gravados")
@@ -204,6 +213,12 @@ def _shopee_upload(engine):
                     st.warning(f"⚠️ {len(erros)} erros:")
                     for e in erros[:5]:
                         st.caption(e)
+
+            # Limpar session_state após gravação
+            for nome_arq in nomes_pendentes:
+                st.session_state.pop(f'ads_df_{nome_arq}', None)
+                st.session_state.pop(f'ads_meta_{nome_arq}', None)
+            st.session_state.pop('ads_arquivos_analisados', None)
 
 
 def _auto_match_skus(engine, df_ads):
