@@ -1157,7 +1157,7 @@ def render_tab_b2b(engine, perfil, usuario):
 def tabela_preco_page():
     """Função principal do módulo Tabela de Preço."""
     st.title("📊 Tabela de Preço")
-    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace")
+    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v2.1")
 
     # Verificar sessão
     usuario_dict = st.session_state.get('usuario', {})
