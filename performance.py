@@ -9,6 +9,11 @@ Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Histórico de 3 meses como colunas expandíveis
 - Integração com tags (Curva ABC + Status manual)
 
+VERSÃO 1.4 (06/04/2026):
+  - NOVO: Template XLSX e tabela visual agora mostram vendas do mês anterior
+    (Qtd e Fat) como referência para preenchimento de metas
+  - Mês anterior sempre visível na tabela; toggle cobre apenas M-2 e M-3
+
 VERSÃO 1.3 (06/04/2026):
   - NOVO: Download de template XLSX com metas por anúncio (pré-preenchido)
   - NOVO: Upload de planilha XLSX para UPSERT de metas em lote
@@ -187,19 +192,33 @@ def _gerar_template_metas(df, is_amazon):
     Gera XLSX template para download de metas por anúncio.
     Inclui todos os anúncios do universo (regra 3 meses) com metas
     pré-preenchidas quando existentes.
+    v1.4: Inclui vendas do mês anterior (Qtd e Fat) como referência.
     """
     cols_template = ['codigo_anuncio', 'sku', 'produto']
     if is_amazon:
         cols_template.append('logistica')
+
+    # Vendas do mês anterior como referência (hist_1 = mês mais recente)
+    has_hist = 'hist_1_qtd' in df.columns
+    if has_hist:
+        cols_template += ['hist_1_qtd', 'hist_1_fat']
+
     cols_template += ['meta_qtd', 'observacao']
 
     df_template = df[cols_template].copy()
+
+    # Descobrir label do mês anterior para nome das colunas
+    mes_ant_label = 'Mês Ant.'
+    if has_hist and 'hist_1_mes' in df.columns and not df.empty:
+        mes_ant_label = df['hist_1_mes'].iloc[0]
 
     rename_map = {
         'codigo_anuncio': 'Código Anúncio',
         'sku': 'SKU',
         'produto': 'Produto',
         'logistica': 'Logística',
+        'hist_1_qtd': f'{mes_ant_label} Qtd',
+        'hist_1_fat': f'{mes_ant_label} Fat.',
         'meta_qtd': 'Meta Qtd',
         'observacao': 'Observação',
     }
@@ -210,18 +229,33 @@ def _gerar_template_metas(df, is_amazon):
         df_template.to_excel(writer, index=False, sheet_name='Metas')
         # Ajustar largura das colunas
         ws = writer.sheets['Metas']
-        col_widths = {
-            'A': 22,  # Código Anúncio
-            'B': 15,  # SKU
-            'C': 35,  # Produto
-        }
         if is_amazon:
-            col_widths['D'] = 12   # Logística
-            col_widths['E'] = 12   # Meta Qtd
-            col_widths['F'] = 30   # Observação
+            col_widths = {
+                'A': 22,  # Código Anúncio
+                'B': 15,  # SKU
+                'C': 35,  # Produto
+                'D': 12,  # Logística
+                'E': 14,  # Mês Ant. Qtd
+                'F': 16,  # Mês Ant. Fat.
+                'G': 12,  # Meta Qtd
+                'H': 30,  # Observação
+            }
         else:
-            col_widths['D'] = 12   # Meta Qtd
-            col_widths['E'] = 30   # Observação
+            col_widths = {
+                'A': 22,  # Código Anúncio
+                'B': 15,  # SKU
+                'C': 35,  # Produto
+                'D': 14,  # Mês Ant. Qtd
+                'E': 16,  # Mês Ant. Fat.
+                'F': 12,  # Meta Qtd
+                'G': 30,  # Observação
+            }
+        if not has_hist:
+            # Sem histórico: remover colunas de mês anterior do mapa
+            if is_amazon:
+                col_widths = {'A': 22, 'B': 15, 'C': 35, 'D': 12, 'E': 12, 'F': 30}
+            else:
+                col_widths = {'A': 22, 'B': 15, 'C': 35, 'D': 12, 'E': 30}
         for col_letter, width in col_widths.items():
             ws.column_dimensions[col_letter].width = width
     buffer.seek(0)
@@ -381,8 +415,8 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
         st.info("Nenhum anúncio com vendas nos últimos 3 meses para esta loja.")
         return
 
-    # Toggle histórico
-    mostrar_hist = st.toggle("📊 Mostrar colunas de histórico", value=False,
+    # Toggle histórico (M-2 e M-3 — mês anterior já aparece sempre)
+    mostrar_hist = st.toggle("📊 Mostrar colunas de histórico (M-2 e M-3)", value=False,
                              key=f"hist_{loja}_{ano_mes}")
 
     # Buscar opções de tags
@@ -393,13 +427,21 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
     cols_principais = ['codigo_anuncio', 'sku', 'produto']
     if is_amazon:
         cols_principais.append('logistica')
-    cols_principais += ['curva', 'tag', 'margem_ant', 'margem_atual',
-                        'meta_qtd', 'meta_fat', 'qtd_realizado', 'fat_realizado',
+    cols_principais += ['curva', 'tag', 'margem_ant', 'margem_atual']
+
+    # Vendas do mês anterior sempre visíveis (v1.4)
+    cols_mes_ant = []
+    if 'hist_1_qtd' in df.columns:
+        cols_mes_ant = ['hist_1_qtd', 'hist_1_fat']
+
+    cols_principais += cols_mes_ant
+    cols_principais += ['meta_qtd', 'meta_fat', 'qtd_realizado', 'fat_realizado',
                         'performance', 'proj_qtd', 'proj_fat', 'observacao']
 
+    # Histórico M-2 e M-3 (toggle)
     cols_hist = []
     if mostrar_hist:
-        for i in range(1, 4):
+        for i in range(2, 4):
             if f'hist_{i}_qtd' in df.columns:
                 mes_label = df[f'hist_{i}_mes'].iloc[0] if f'hist_{i}_mes' in df.columns and len(df) > 0 else f'M-{i}'
                 cols_hist += [f'hist_{i}_qtd', f'hist_{i}_fat']
@@ -688,7 +730,7 @@ MARKETPLACES = [
 
 def main():
     st.title("📊 Performance Mensal")
-    st.caption("v1.3 — download/upload metas + regra 3 meses")
+    st.caption("v1.4 — vendas mês anterior no template + tabela")
 
     engine = get_engine()
     ano_mes = _seletor_mes()
