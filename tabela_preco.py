@@ -674,9 +674,58 @@ def render_tab_shopee(engine, perfil, usuario):
                 botao_download_xlsx(edited[col_order], f"dl_sp_{loja}", f"tabela_preco_Shopee_{loja}.xlsx")
 
 
+
 # ============================================================
-# TAB AMAZON — Por ASIN, tabela unificada
+# TAB AMAZON — Por ASIN, tabela unificada com flags de loja
 # ============================================================
+
+AMZ_LOJAS_COLS = ["AMZ-Nala", "AMZ-LPT", "AMZ-Innovare", "AMZ-Yanni"]
+
+
+def _garantir_tabela_asin_lojas(engine):
+    """Auto-create dim_asin_lojas se não existir."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dim_asin_lojas (
+                    id SERIAL PRIMARY KEY,
+                    asin VARCHAR(50) NOT NULL,
+                    loja VARCHAR(100) NOT NULL,
+                    UNIQUE(asin, loja)
+                )
+            """))
+            conn.commit()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_asin_lojas(_engine):
+    """Carrega flags ASIN -> loja."""
+    try:
+        query = text("SELECT asin, loja FROM dim_asin_lojas")
+        with _engine.connect() as conn:
+            return pd.read_sql(query, conn)
+    except Exception:
+        return pd.DataFrame(columns=['asin', 'loja'])
+
+
+def salvar_asin_lojas_batch(engine, edited_df):
+    """Salva flags de loja para todos os ASINs editados."""
+    try:
+        with engine.connect() as conn:
+            for _, r in edited_df.iterrows():
+                asin = r['asin']
+                lojas_marcadas = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
+                conn.execute(text("DELETE FROM dim_asin_lojas WHERE asin = :asin"), {"asin": asin})
+                for loja in lojas_marcadas:
+                    conn.execute(text(
+                        "INSERT INTO dim_asin_lojas (asin, loja) VALUES (:asin, :loja) ON CONFLICT DO NOTHING"
+                    ), {"asin": asin, "loja": loja})
+            conn.commit()
+    except Exception:
+        pass
+
 
 def buscar_frete_amazon(df_frete, peso_kg, preco_venda):
     """Busca tarifa de frete Amazon na tabela dim_frete_amazon."""
@@ -709,23 +758,22 @@ def taxa_fixa_dba(preco):
         return 6.50
     elif preco < 79:
         return 6.75
-    return 0  # >=79 usa frete, não taxa fixa
+    return 0  # >=79 usa frete
 
 
 def render_tab_amazon(engine, perfil, usuario):
     st.subheader("📦 Amazon")
 
-    # Carregar ASINs cadastrados
+    _garantir_tabela_asin_lojas(engine)
+
     df_configs = carregar_configs_amazon(engine)
     if df_configs.empty:
-        st.info("Nenhum ASIN cadastrado no módulo Configurações → Amazon. "
-                "Cadastre os ASINs lá primeiro.")
+        st.info("Nenhum ASIN cadastrado em Configurações > Amazon.")
         return
 
-    # Carregar preços salvos
     df_precos = carregar_precos_salvos(engine, "Amazon")
+    df_asin_lojas = carregar_asin_lojas(engine)
 
-    # Carregar fretes
     try:
         df_frete_dba = carregar_frete_amazon(engine, 'DBA')
     except Exception:
@@ -735,168 +783,136 @@ def render_tab_amazon(engine, perfil, usuario):
     except Exception:
         df_frete_fba = pd.DataFrame()
 
-    # Lojas e impostos
-    df_lojas = carregar_lojas(engine)
-    amz_lojas = df_lojas[df_lojas['marketplace'].str.upper().str.contains('AMAZON')]
+    df_lojas_all = carregar_lojas(engine)
+    amz_lojas = df_lojas_all[df_lojas_all['marketplace'].str.upper().str.contains('AMAZON')]
 
-    # GESTOR: filtrar lojas
-    if perfil == "GESTOR":
-        gestor_lojas = carregar_lojas_gestor(engine, usuario)
-        permitidas = gestor_lojas[gestor_lojas['marketplace'].str.upper().str.contains('AMAZON')]['loja'].tolist()
-        df_configs = df_configs[df_configs['loja'].isin(permitidas)]
-        if df_configs.empty:
-            st.warning("Sem permissão para lojas Amazon.")
-            return
-
-    # Filtros — checkboxes por loja e logística
-    lojas_unicas = sorted(df_configs['loja'].unique().tolist())
+    asins_unicos = df_configs['asin'].unique().tolist()
     logisticas_unicas = sorted(df_configs['logistica'].unique().tolist())
 
+    # Filtros
     st.caption("Filtrar por loja e logística:")
-    col_filtros = st.columns(len(lojas_unicas) + len(logisticas_unicas) + 1)
+    n_cols = len(AMZ_LOJAS_COLS) + len(logisticas_unicas) + 1
+    fc = st.columns(n_cols)
 
-    lojas_ativas = []
-    for i, lj in enumerate(lojas_unicas):
-        if col_filtros[i].checkbox(lj, True, key=f"amz_lj_{lj}"):
-            lojas_ativas.append(lj)
+    filtros_loja = {}
+    for i, lj in enumerate(AMZ_LOJAS_COLS):
+        filtros_loja[lj] = fc[i].checkbox(lj.replace("AMZ-", ""), True, key=f"amz_f_{lj}")
 
     log_ativas = []
-    offset = len(lojas_unicas)
     for i, lg in enumerate(logisticas_unicas):
-        if col_filtros[offset + i].checkbox(lg, True, key=f"amz_lg_{lg}"):
+        idx_col = len(AMZ_LOJAS_COLS) + i
+        if idx_col < n_cols - 1 and fc[idx_col].checkbox(lg, True, key=f"amz_lg_{lg}"):
             log_ativas.append(lg)
 
-    show_sug = col_filtros[-1].checkbox("💡 Sug.", False, key="amz_sug")
-
-    # Filtrar configs
-    df_filtrado = df_configs[
-        (df_configs['loja'].isin(lojas_ativas)) &
-        (df_configs['logistica'].isin(log_ativas))
-    ]
-
-    if df_filtrado.empty:
-        st.info("Nenhum ASIN para os filtros selecionados.")
-        return
+    show_sug = fc[-1].checkbox("💡 Sug.", False, key="amz_sug")
 
     st.caption(
-        f"{len(df_filtrado)} ASIN(s) | "
-        "Frete DBA: <R$30→R$4,50 | R$30-49,99→R$6,50 | R$50-78,99→R$6,75 | ≥R$79→tabela peso | "
+        "DBA: <R$30→R$4,50 | R$30-49,99→R$6,50 | R$50-78,99→R$6,75 | ≥R$79→tabela peso | "
         "Região: Outras capitais Sul/SE"
     )
 
     # Montar rows
     rows = []
-    for _, c in df_filtrado.iterrows():
-        asin = c['asin']
-        sku = c['sku']
-        loja = c['loja']
-        logistica = c['logistica']
-        custo = c.get('custo_sku', 0) or 0
-        mc_min = normalizar_margem(c.get('margem_minima'))
-        mc_des = normalizar_margem(c.get('margem_desejavel'))
+    for asin in asins_unicos:
+        configs_asin = df_configs[df_configs['asin'] == asin]
+        first = configs_asin.iloc[0]
+        sku = first['sku']
+        custo = first.get('custo_sku', 0) or 0
+        mc_min = normalizar_margem(first.get('margem_minima'))
+        mc_des = normalizar_margem(first.get('margem_desejavel'))
 
-        # Imposto da loja
-        loja_info = amz_lojas[amz_lojas['loja'] == loja]
-        imp_raw = float(loja_info.iloc[0].get('imposto', 0) or 0) if not loja_info.empty else 0
-        imp_dec = imp_raw / 100 if imp_raw > 1 else imp_raw
-
-        # Dimensões e peso
-        larg = c.get('largura')
-        comp = c.get('comprimento')
-        alt = c.get('altura')
-        peso_br = c.get('peso_bruto')
-        peso_cub = round((larg * comp * alt) / 6000, 3) if pd.notna(larg) and pd.notna(comp) and pd.notna(alt) else None
+        larg = first.get('largura') if pd.notna(first.get('largura')) else None
+        comp = first.get('comprimento') if pd.notna(first.get('comprimento')) else None
+        alt = first.get('altura') if pd.notna(first.get('altura')) else None
+        peso_br = first.get('peso_bruto') if pd.notna(first.get('peso_bruto')) else None
+        peso_cub = round((larg * comp * alt) / 6000, 3) if larg and comp and alt else None
         peso_efe = peso_efetivo(larg, comp, alt, peso_br)
 
-        # Comissão do cadastro
-        com_cfg = float(c.get('comissao_percentual', 0) or 0)
-        # Comissão em pct: se < 1, é decimal (0.12 = 12%); se >= 1, já é pct
-        com_pct = com_cfg * 100 if com_cfg < 1 else com_cfg
+        asin_lojas_list = df_asin_lojas[df_asin_lojas['asin'] == asin]['loja'].tolist()
 
-        # Preço salvo (busca por ASIN no campo sku da dim_precos_marketplace)
-        sv = df_precos[
-            (df_precos['sku'] == asin) &
-            (df_precos['loja'] == loja) &
-            (df_precos['logistica'] == logistica)
-        ]
-        preco = float(sv.iloc[0]['preco_venda']) if not sv.empty and pd.notna(sv.iloc[0]['preco_venda']) else None
-        com_ov = sv.iloc[0].get('comissao_percentual_override') if not sv.empty else None
-        if com_ov and pd.notna(com_ov):
-            com_pct = com_ov * 100 if com_ov < 1 else com_ov
+        for log in configs_asin['logistica'].unique():
+            if log not in log_ativas:
+                continue
 
-        # Taxa fixa / Frete
-        is_dba = 'dba' in logistica.lower()
-        is_fba = 'fba' in logistica.lower()
+            cfg = configs_asin[configs_asin['logistica'] == log].iloc[0]
+            com_cfg = float(cfg.get('comissao_percentual', 0) or 0)
+            com_pct = com_cfg * 100 if com_cfg < 1 else com_cfg
 
-        if is_dba:
-            tf = taxa_fixa_dba(preco)
-            # Se >=R$79 e tem peso, calcular frete
-            frete_auto = None
-            if preco and preco >= 79 and peso_efe:
-                frete_auto = buscar_frete_amazon(df_frete_dba, peso_efe, preco)
-                if frete_auto:
-                    tf = frete_auto
-            # Override salvo
+            # Imposto: usar primeira loja marcada
+            imp_dec = 0.10
+            for lj_nome in AMZ_LOJAS_COLS:
+                if lj_nome in asin_lojas_list:
+                    lj_info = amz_lojas[amz_lojas['loja'] == lj_nome]
+                    if not lj_info.empty:
+                        ir = float(lj_info.iloc[0].get('imposto', 0) or 0)
+                        imp_dec = ir / 100 if ir > 1 else ir
+                    break
+
+            sv = df_precos[(df_precos['sku'] == asin) & (df_precos['logistica'] == log)]
+            preco = float(sv.iloc[0]['preco_venda']) if not sv.empty and pd.notna(sv.iloc[0]['preco_venda']) else None
+            com_ov = sv.iloc[0].get('comissao_percentual_override') if not sv.empty else None
+            if com_ov and pd.notna(com_ov):
+                com_pct = com_ov * 100 if com_ov < 1 else com_ov
+
+            is_dba = 'dba' in log.lower()
+            if is_dba:
+                tf = taxa_fixa_dba(preco)
+                if preco and preco >= 79 and peso_efe:
+                    fa = buscar_frete_amazon(df_frete_dba, peso_efe, preco)
+                    if fa:
+                        tf = fa
+            else:
+                frete_est = float(cfg.get('frete_estimado', 0) or 0)
+                fa = buscar_frete_amazon(df_frete_fba, peso_efe, preco) if peso_efe and preco else None
+                tf = frete_est or fa or 0
+
             frete_ov = sv.iloc[0].get('frete_override') if not sv.empty and pd.notna(sv.iloc[0].get('frete_override')) else None
             if frete_ov and pd.notna(frete_ov):
                 tf = float(frete_ov)
-            taxa_ov = sv.iloc[0].get('taxa_fixa_override') if not sv.empty and pd.notna(sv.iloc[0].get('taxa_fixa_override')) else None
-            if taxa_ov and pd.notna(taxa_ov):
-                tf = float(taxa_ov)
-        elif is_fba:
-            # FBA: frete do cadastro ou calculado
-            frete_est = float(c.get('frete_estimado', 0) or 0)
-            frete_auto = None
-            if peso_efe and preco and preco > 0:
-                frete_auto = buscar_frete_amazon(df_frete_fba, peso_efe, preco)
-            tf = frete_est or frete_auto or 0
-            frete_ov = sv.iloc[0].get('frete_override') if not sv.empty and pd.notna(sv.iloc[0].get('frete_override')) else None
-            if frete_ov and pd.notna(frete_ov):
-                tf = float(frete_ov)
-        else:
-            tf = float(c.get('taxa_fixa', 0) or 0)
 
-        # Margem
-        ma, mp = calcular_margem(preco, custo, com_pct / 100, tf, imp_dec)
-        sinal = semaforo(mp, c.get('margem_minima'), c.get('margem_desejavel'))
+            ma, mp = calcular_margem(preco, custo, com_pct / 100, tf, imp_dec)
+            sinal = semaforo(mp, first.get('margem_minima'), first.get('margem_desejavel'))
 
-        row = {
-            'sinal': sinal,
-            'asin': asin,
-            'titulo': (c.get('nome') or '')[:50],
-            'sku_nala': sku,
-            'loja': loja,
-            'logistica': logistica,
-            'custo': custo,
-            'mc_esp': mc_des,
-            'mc_min': mc_min,
-            'largura': larg if pd.notna(larg) else None,
-            'comprimento': comp if pd.notna(comp) else None,
-            'altura': alt if pd.notna(alt) else None,
-            'peso_bruto': peso_br if pd.notna(peso_br) else None,
-            'peso_cubado': peso_cub,
-            'peso_efetivo': round(peso_efe, 3) if peso_efe else None,
-            'preco_venda': preco,
-            'com_pct': round(com_pct, 1),
-            'taxa_frete': round(tf, 2),
-            'imp_pct': round(imp_raw, 1),
-            'mg_pct': mp,
-            'mg_abs': ma,
-        }
+            row = {
+                'sinal': sinal, 'asin': asin,
+                'titulo': (first.get('nome') or '')[:50],
+                'sku_nala': sku, 'logistica': log,
+            }
+            for lj in AMZ_LOJAS_COLS:
+                row[lj] = lj in asin_lojas_list
 
-        if show_sug:
-            # Sugerido usa comissão do ASIN e taxa padrão 6.50
-            row['sug_min'] = preco_sugerido(custo, com_pct / 100, 6.50, imp_dec, mc_min)
-            row['sug_esp'] = preco_sugerido(custo, com_pct / 100, 6.50, imp_dec, mc_des)
+            row.update({
+                'custo': custo, 'mc_esp': mc_des, 'mc_min': mc_min,
+                'largura': larg, 'comprimento': comp, 'altura': alt,
+                'peso_bruto': peso_br, 'peso_cubado': peso_cub,
+                'peso_efetivo': round(peso_efe, 3) if peso_efe else None,
+                'preco_venda': preco, 'com_pct': round(com_pct, 1),
+                'taxa_frete': round(tf, 2), 'imp_pct': round(imp_dec * 100, 1),
+                'mg_pct': mp, 'mg_abs': ma,
+            })
 
-        rows.append(row)
+            if show_sug:
+                row['sug_min'] = preco_sugerido(custo, com_pct / 100, 6.50, imp_dec, mc_min)
+                row['sug_esp'] = preco_sugerido(custo, com_pct / 100, 6.50, imp_dec, mc_des)
+
+            rows.append(row)
 
     df = pd.DataFrame(rows)
     if df.empty:
         st.info("Nenhum dado para exibir.")
         return
 
-    com_preco = (df['preco_venda'].notna() & (df['preco_venda'] > 0)).sum()
+    # Filtrar por flags de loja marcadas no topo
+    lojas_filtro = [lj for lj, ativo in filtros_loja.items() if ativo]
+    if lojas_filtro:
+        mask_loja = df[lojas_filtro].any(axis=1)
+        mask_sem = ~df[AMZ_LOJAS_COLS].any(axis=1)
+        df_show = df[mask_loja | mask_sem].copy()
+    else:
+        df_show = df.copy()
+
+    com_preco = (df_show['preco_venda'].notna() & (df_show['preco_venda'] > 0)).sum()
+    st.caption(f"{len(df_show)} ASIN(s)")
 
     # Column config
     cc = {
@@ -904,8 +920,12 @@ def render_tab_amazon(engine, perfil, usuario):
         'asin': st.column_config.TextColumn("ASIN", disabled=True, width="small"),
         'titulo': st.column_config.TextColumn("Título", disabled=True, width="medium"),
         'sku_nala': st.column_config.TextColumn("SKU", disabled=True, width="small"),
-        'loja': st.column_config.TextColumn("Loja", disabled=True, width="small"),
         'logistica': st.column_config.TextColumn("Log.", disabled=True, width="tiny"),
+    }
+    for lj in AMZ_LOJAS_COLS:
+        cc[lj] = st.column_config.CheckboxColumn(lj.replace("AMZ-", ""), width="tiny")
+
+    cc.update({
         'largura': st.column_config.NumberColumn("L cm", format="%.1f", min_value=0, width="tiny"),
         'comprimento': st.column_config.NumberColumn("C cm", format="%.1f", min_value=0, width="tiny"),
         'altura': st.column_config.NumberColumn("A cm", format="%.1f", min_value=0, width="tiny"),
@@ -915,13 +935,13 @@ def render_tab_amazon(engine, perfil, usuario):
         'preco_venda': st.column_config.NumberColumn("🟠 Preço", format="R$ %.2f", min_value=0, width="small"),
         'com_pct': st.column_config.NumberColumn("Com. %", format="%.1f%%", min_value=0, width="tiny"),
         'taxa_frete': st.column_config.NumberColumn("Taxa/Frete", format="R$ %.2f", min_value=0, width="small",
-                      help="DBA: <R$30→4,50 | R$30-49,99→6,50 | R$50-78,99→6,75 | ≥R$79→frete por peso"),
+                      help="DBA: <R$30→4,50 | >=R$79→frete peso. Editável."),
         'imp_pct': st.column_config.NumberColumn("Imp. %", format="%.1f%%", disabled=True, width="tiny"),
         'mg_pct': st.column_config.NumberColumn("Margem %", format="%.1f%%", disabled=True, width="small"),
         'mg_abs': st.column_config.NumberColumn("Margem R$", format="R$ %.2f", disabled=True, width="small"),
-    }
+    })
 
-    col_order = ['sinal', 'asin', 'titulo', 'sku_nala', 'loja', 'logistica']
+    col_order = ['sinal', 'asin', 'titulo', 'sku_nala', 'logistica'] + AMZ_LOJAS_COLS
 
     if perfil in PERFIS_COM_CUSTO:
         cc['custo'] = st.column_config.NumberColumn("Custo", format="R$ %.2f", disabled=True, width="small")
@@ -941,71 +961,57 @@ def render_tab_amazon(engine, perfil, usuario):
         col_order.append('mg_abs')
 
     edited = st.data_editor(
-        df, column_config=cc, column_order=col_order,
+        df_show, column_config=cc, column_order=col_order,
         use_container_width=True, hide_index=True,
-        num_rows="fixed", height=EDITOR_HEIGHT,
-        key="ed_amazon"
+        num_rows="fixed", height=EDITOR_HEIGHT, key="ed_amazon"
     )
 
     # Métricas
     mg_media = edited['mg_pct'].mean() if edited['mg_pct'].notna().any() else 0
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("ASINs", len(edited))
-    c2.metric("Com preço", int(com_preco))
-    c3.metric("Margem média", f"{mg_media:.1f}%")
-    c4.metric("🟢", (edited['sinal'] == '🟢').sum())
-    c5.metric("🟡", (edited['sinal'] == '🟡').sum())
-    c6.metric("🔴", (edited['sinal'] == '🔴').sum())
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("ASINs", len(edited))
+    m2.metric("Com preço", int(com_preco))
+    m3.metric("Margem média", f"{mg_media:.1f}%")
+    m4.metric("🟢", (edited['sinal'] == '🟢').sum())
+    m5.metric("🟡", (edited['sinal'] == '🟡').sum())
+    m6.metric("🔴", (edited['sinal'] == '🔴').sum())
 
-    # Botões
+    # Salvar
     bc1, bc2, bc3 = st.columns(3)
     with bc1:
-        if st.button("💾 Salvar preços Amazon", key="sv_amz"):
-            saves = []
+        if st.button("💾 Salvar preços + lojas", key="sv_amz"):
+            salvar_asin_lojas_batch(engine, edited)
+            saved = 0
             for _, r in edited.iterrows():
                 pv = r.get('preco_venda')
                 if not pv or pd.isna(pv) or pv <= 0:
                     continue
-                saves.append({
-                    'sku': r['asin'],  # Salva ASIN no campo sku para Amazon
-                    'preco_venda': pv,
-                    'comissao': r.get('com_pct'),
-                    'frete': r.get('taxa_frete'),
-                    'taxa': r.get('taxa_frete'),
-                })
-            # Salvar agrupado por loja/logistica
-            saved_total = 0
-            for _, r in edited.iterrows():
-                pv = r.get('preco_venda')
-                if not pv or pd.isna(pv) or pv <= 0:
-                    continue
+                lojas_m = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
+                loja_s = lojas_m[0] if lojas_m else 'AMAZON'
                 row_saves = [{'sku': r['asin'], 'preco_venda': pv,
                               'comissao': r.get('com_pct'), 'frete': r.get('taxa_frete'),
                               'taxa': r.get('taxa_frete')}]
-                saved_total += salvar_precos(engine, row_saves, "Amazon",
-                                            r['loja'], r['logistica'], usuario)
-            if saved_total > 0:
-                st.success(f"✅ {saved_total} preços salvos!")
-                carregar_precos_salvos.clear()
+                saved += salvar_precos(engine, row_saves, "Amazon", loja_s, r['logistica'], usuario)
+            if saved > 0:
+                st.success(f"✅ {saved} preços + flags salvos!")
             else:
-                st.warning("Nenhum preço válido para salvar.")
+                st.info("Flags salvos. Preencha preços para salvar valores.")
+            carregar_precos_salvos.clear()
+            carregar_asin_lojas.clear()
 
     with bc2:
         botao_download_xlsx(edited[col_order], "dl_amz", "tabela_preco_Amazon.xlsx")
 
     with bc3:
         with st.expander("📤 Upload em massa", expanded=False):
-            cols_t = ["asin", "loja", "logistica", "preco_venda", "comissao_pct", "taxa_frete"]
-            # Template com ASINs existentes
-            df_tmpl = df_filtrado[['asin', 'sku', 'loja', 'logistica']].copy()
+            df_tmpl = df_show[['asin', 'sku_nala', 'logistica'] + AMZ_LOJAS_COLS].copy()
             for c in ['preco_venda', 'comissao_pct', 'taxa_frete']:
                 df_tmpl[c] = None
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine='openpyxl') as w:
                 df_tmpl.to_excel(w, index=False, sheet_name='Amazon')
-            st.download_button("📄 Template Amazon", data=buf.getvalue(),
+            st.download_button("📄 Template", data=buf.getvalue(),
                               file_name="template_Amazon.xlsx", key="tmpl_amz")
-
             arq = st.file_uploader("XLSX preenchido", type=["xlsx"], key="file_amz")
             if arq and st.button("📥 Processar", key="proc_amz"):
                 df_up, err = processar_upload_xlsx(arq, ["asin", "preco_venda"])
@@ -1017,19 +1023,17 @@ def render_tab_amazon(engine, perfil, usuario):
                         pv = r.get('preco_venda')
                         if pd.isna(pv) or not pv or float(pv) <= 0:
                             continue
-                        lj = str(r.get('loja', 'AMAZON')).strip()
                         lg = str(r.get('logistica', 'DBA')).strip()
+                        lojas_m = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
+                        loja_s = lojas_m[0] if lojas_m else 'AMAZON'
                         row_saves = [{'sku': str(r['asin']).strip(), 'preco_venda': float(pv),
                                       'comissao': float(r['comissao_pct']) if pd.notna(r.get('comissao_pct')) else None,
                                       'frete': float(r['taxa_frete']) if pd.notna(r.get('taxa_frete')) else None,
-                                      'taxa': float(r['taxa_frete']) if pd.notna(r.get('taxa_frete')) else None}]
-                        saved += salvar_precos(engine, row_saves, "Amazon", lj, lg, usuario)
+                                      'taxa': None}]
+                        saved += salvar_precos(engine, row_saves, "Amazon", loja_s, lg, usuario)
                     if saved > 0:
-                        st.success(f"✅ {saved} preços importados!")
+                        st.success(f"✅ {saved} importados!")
                         carregar_precos_salvos.clear()
-                    else:
-                        st.warning("Nenhum preço válido no arquivo.")
-
 
 # ============================================================
 # TAB GENÉRICA — Shein, Magalu
