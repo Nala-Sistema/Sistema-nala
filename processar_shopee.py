@@ -2,6 +2,12 @@
 PROCESSADOR SHOPEE - Sistema Nala
 Processa arquivos de vendas da Shopee (.xlsx exportado do painel)
 
+VERSÃO 2.2 (06/04/2026):
+  - FIX: renomear_colunas_shopee agora exclui colunas 'bruta' (Shopee adicionou
+         'Taxa de comissão bruta' e 'Taxa de serviço bruta' ao export, causando
+         duplicata de coluna e KeyError: 0)
+  - FIX: Cashback rename restrito a 'coin cashback' (evita duplicata com 'Compensar Moedas')
+
 VERSÃO 2.1 (18/03/2026):
   - NOVO: Salva pedido_original no banco (pedido real da Shopee)
   - FIX: Barra de progresso agora mostra texto com contagem de pedidos
@@ -187,6 +193,11 @@ def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
     """
     Padroniza nomes de colunas do arquivo Shopee (v2.2).
     Suporta variações em Inglês e Português para evitar erros de mapeamento.
+
+    v2.2 FIX: Shopee passou a exportar colunas 'bruta' (Taxa de comissão bruta,
+    Taxa de serviço bruta). A condição genérica com 'in' renomeava tanto bruta
+    quanto líquida para o mesmo nome, gerando duplicata e KeyError: 0.
+    Agora exclui explicitamente colunas contendo 'bruta'.
     """
     rename_map = {}
     for col in df.columns:
@@ -196,16 +207,16 @@ def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
         if col_norm in ['net commission fee', 'taxa de comissão líquida', 'taxa de comissao liquida']:
             rename_map[col] = 'Net Commission Fee'
             
-        # Mapeamento: Taxa de serviço líquida
-        elif 'taxa de serviço' in col_norm or 'taxa de servico' in col_norm:
+        # Mapeamento: Taxa de serviço líquida (exclui 'bruta' — Shopee passou a exportar ambas)
+        elif ('taxa de serviço' in col_norm or 'taxa de servico' in col_norm) and 'bruta' not in col_norm:
             rename_map[col] = 'Taxa de serviço líquida'
             
         # Mapeamento: ID do Pedido (Garante que espaços não quebrem a detecção)
         elif col_norm == 'id do pedido':
             rename_map[col] = 'ID do pedido'
 
-        # Mapeamento: Cashback (Opcional, para integridade de dados)
-        elif 'coin cashback' in col_norm or 'moedas' in col_norm:
+        # Mapeamento: Cashback — só 'Coin Cashback' (Shopee adicionou 'Compensar Moedas' separado)
+        elif 'coin cashback' in col_norm:
             rename_map[col] = 'Seller Absorbed Coin Cashback'
             
     return df.rename(columns=rename_map)
