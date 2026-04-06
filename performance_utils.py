@@ -1,11 +1,17 @@
 """
 PERFORMANCE UTILS - Sistema Nala
-Versão: 1.0 (21/03/2026)
+Versão: 1.1 (06/04/2026)
 
 Funções auxiliares para o módulo Performance:
 - Modelos de projeção (Linear, Início Forte, Meio Forte, Final Fraco)
 - Queries de vendas, metas, tags, histórico
 - Cálculos de projeção, performance, margem
+
+VERSÃO 1.1 (06/04/2026):
+  - Regra dos 3 Meses: construir_tabela_performance agora inclui anúncios
+    que venderam nos 3 meses anteriores no universo de anúncios, mesmo que
+    não tenham vendas no mês selecionado. Garante que no início do mês a
+    tela não fique vazia e permita preencher metas preventivamente.
 """
 
 import pandas as pd
@@ -554,6 +560,11 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
     """
     Constrói o DataFrame completo de performance para uma loja/mês.
     Retorna DataFrame com todas as colunas para exibição.
+
+    v1.1 — REGRA DOS 3 MESES: O universo de anúncios agora inclui todos os
+    anúncios que tiveram vendas nos 3 meses anteriores, além do mês atual
+    e das metas existentes. Isso garante que no início do mês a tela não
+    fique vazia e permita preencher metas preventivamente.
     """
     is_amazon = 'AMAZON' in marketplace.upper()
     dias_vendas, dias_mes = get_dias_vendas(ano_mes)
@@ -577,7 +588,7 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
     # 6. Histórico (3 meses anteriores)
     historico = buscar_historico_meses(engine, loja, ano_mes, 3, marketplace)
 
-    # Montar lista de anúncios únicos (da realização OU das metas)
+    # Montar lista de anúncios únicos (da realização OU das metas OU do histórico)
     anuncios = set()
     # Primeiro: anúncios do realizado (com SKU correto)
     if not df_real.empty:
@@ -593,6 +604,20 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
             log = None if pd.isna(log) else log
             if (r['codigo_anuncio'], log) not in codigos_existentes:
                 anuncios.add((r['codigo_anuncio'], '', log))
+
+    # ── REGRA DOS 3 MESES (v1.1) ──────────────────────────────
+    # Incluir anúncios que venderam nos 3 meses anteriores,
+    # mesmo que não tenham vendas no mês selecionado nem metas.
+    codigos_existentes = {(a[0], a[2]) for a in anuncios}  # atualiza após metas
+    for mes_key, df_hist in historico.items():
+        if not df_hist.empty:
+            for _, h in df_hist.iterrows():
+                log = h.get('logistica')
+                log = None if pd.isna(log) else log
+                if (h['codigo_anuncio'], log) not in codigos_existentes:
+                    anuncios.add((h['codigo_anuncio'], h.get('sku', ''), log))
+                    codigos_existentes.add((h['codigo_anuncio'], log))
+    # ── FIM REGRA DOS 3 MESES ─────────────────────────────────
 
     if not anuncios:
         return pd.DataFrame()
