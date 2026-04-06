@@ -24,6 +24,7 @@ import pandas as pd
 MODULOS = [
     'inicio', 'performance', 'skus', 'vendas', 'tags',
     'compras', 'config', 'calculadora', 'ia', 'kanban',
+    'tabela_preco', 'ads',
 ]
 
 # Mapa de permissões por perfil
@@ -40,6 +41,8 @@ PERMISSOES = {
         'calculadora':  'completo',
         'ia':           'completo',
         'kanban':       'completo',
+        'tabela_preco': 'completo',
+        'ads':          'completo',
     },
     'CONTROLADORIA': {
         'inicio':       'completo',
@@ -52,6 +55,8 @@ PERMISSOES = {
         'calculadora':  'completo',
         'ia':           'completo',
         'kanban':       'completo',
+        'tabela_preco': 'completo',
+        'ads':          'completo',
     },
     'DIRETOR': {
         'inicio':       'leitura',
@@ -64,6 +69,8 @@ PERMISSOES = {
         'calculadora':  'completo',
         'ia':           'completo',
         'kanban':       'completo',
+        'tabela_preco': 'leitura',
+        'ads':          'leitura',
     },
     'COMPRAS': {
         'inicio':       'completo',
@@ -76,6 +83,8 @@ PERMISSOES = {
         'calculadora':  'completo',
         'ia':           'completo',
         'kanban':       'completo',
+        'tabela_preco': 'completo',
+        'ads':          'completo',
     },
     'GESTOR': {
         'inicio':       'parcial',      # filtrado por loja
@@ -88,6 +97,8 @@ PERMISSOES = {
         'calculadora':  'completo',
         'ia':           'parcial',      # filtrado por loja + sem custos
         'kanban':       'completo',
+        'tabela_preco': 'parcial',      # filtrado por marketplace
+        'ads':          'parcial',      # filtrado por marketplace
     },
 }
 
@@ -109,16 +120,18 @@ COLUNAS_CUSTO_OCULTAS = [
 
 # Mapeamento menu → módulo interno
 MENU_MODULOS = {
-    '🏠 Início':       'inicio',
-    '📊 Performance':  'performance',
-    '📦 SKUs':         'skus',
-    '💰 Vendas':       'vendas',
-    '🏷️ Tags':        'tags',
-    '🛒 Compras':      'compras',
-    '🧮 Calculadora':  'calculadora',
-    '🤖 Nala IA':      'ia',
-    '📋 Kanban':       'kanban',
-    '⚙️ Config':       'config',
+    '🏠 Início':          'inicio',
+    '📊 Performance':     'performance',
+    '📦 SKUs':            'skus',
+    '💰 Vendas':          'vendas',
+    '🏷️ Tags':           'tags',
+    '🛒 Compras':         'compras',
+    '🧮 Calculadora':     'calculadora',
+    '🤖 Nala IA':         'ia',
+    '📋 Kanban':          'kanban',
+    '💲 Tabela de Preço': 'tabela_preco',
+    '📊 Análise de Ads':  'ads',
+    '⚙️ Config':          'config',
 }
 
 

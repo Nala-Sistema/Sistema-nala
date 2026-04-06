@@ -1,6 +1,11 @@
 """
 CONFIGURAÇÕES - Sistema Nala
-Versão: 3.0 (17/03/2026)
+Versão: 3.1 (30/03/2026)
+
+CHANGELOG v3.1:
+  - NOVO: Tab "Frete ML 2026" — tabela editável de frete ML por peso × preço
+  - NOVO: Tab "Frete Amazon" — tabela editável de frete Amazon FBA/DBA por peso × preço
+  - Tabs anteriores mantidas intactas
 
 CHANGELOG v3.0:
   - REWRITE: Tab Amazon completamente refeita
@@ -17,8 +22,10 @@ CHANGELOG v2.1:
 Tabs:
   1. Amazon — Vincular ASINs, taxas, importação massiva
   2. Frete ML (FLEX) — Custo FLEX por loja Mercado Livre
-  3. Impostos & Lojas — Gestão das 14 lojas (imposto + custo_flex)
-  4. Gestão de Usuários — Criar, editar, ativar/desativar usuários
+  3. Frete ML 2026 — Tabela de envio por peso × faixa de preço (editável)
+  4. Frete Amazon — Tabela FBA/DBA por peso × faixa de preço (editável)
+  5. Impostos & Lojas — Gestão das 14 lojas (imposto + custo_flex)
+  6. Gestão de Usuários — Criar, editar, ativar/desativar usuários
 """
 
 import streamlit as st
@@ -52,9 +59,11 @@ def main():
     st.header("⚙️ Configurações Nala")
     engine = get_engine()
 
-    t_amz, t_ml, t_fisc, t_users = st.tabs([
+    t_amz, t_ml, t_frete_ml26, t_frete_amz, t_fisc, t_users = st.tabs([
         "📦 Amazon",
         "🚚 Frete ML (FLEX)",
+        "📦 Frete ML 2026",
+        "📦 Frete Amazon",
         "💰 Impostos & Lojas",
         "👤 Gestão de Usuários"
     ])
@@ -64,6 +73,12 @@ def main():
 
     with t_ml:
         _tab_frete_ml(engine)
+
+    with t_frete_ml26:
+        _tab_frete_ml_2026(engine)
+
+    with t_frete_amz:
+        _tab_frete_amazon_config(engine)
 
     with t_fisc:
         _tab_impostos_lojas(engine)
@@ -549,6 +564,233 @@ def _tab_amazon_importar(engine):
 
         except Exception as e:
             st.error(f"❌ Erro ao processar arquivo: {e}")
+
+
+# ============================================================
+# TAB: FRETE ML 2026 (Tabela de Envio por Peso x Preço)
+# ============================================================
+
+def _tab_frete_ml_2026(engine):
+    """Visualização e edição da tabela de frete ML 2026."""
+
+    st.subheader("📦 Tabela de Frete ML 2026 (Envio por Peso × Preço)")
+
+    usuario_logado = st.session_state.get('usuario', {})
+    role_logado = usuario_logado.get('role', '')
+    pode_editar = role_logado in ('ADMIN', 'CONTROLADORIA', '')
+
+    # Verificar se tabela existe
+    df_check = _query_to_df(engine, "SELECT COUNT(*) as total FROM dim_frete_ml")
+    if df_check.empty or df_check.iloc[0]['total'] == 0:
+        st.warning("⚠️ Tabela dim_frete_ml vazia. Execute o SQL de setup primeiro.")
+        return
+
+    # Seleção de tipo
+    tipo = st.radio(
+        "Tipo de frete:",
+        ["envio_padrao", "frete_gratis_rapido"],
+        format_func=lambda x: "Envio Padrão" if x == "envio_padrao" else "Frete Grátis Rápido (<R$79)",
+        horizontal=True,
+        key="tipo_frete_ml_2026"
+    )
+
+    df = _query_to_df(engine,
+        "SELECT * FROM dim_frete_ml WHERE tipo = %s ORDER BY faixa_peso_min_kg, faixa_preco_min",
+        (tipo,)
+    )
+
+    if df.empty:
+        st.info("Nenhum registro encontrado para este tipo.")
+        return
+
+    st.info(f"📊 {len(df)} faixas cadastradas")
+
+    # Criar visualização matricial (peso x preço)
+    df['faixa_peso'] = df.apply(
+        lambda r: f"{r['faixa_peso_min_kg']:.1f} - {r['faixa_peso_max_kg']:.1f} kg", axis=1
+    )
+    df['faixa_preco'] = df.apply(
+        lambda r: f"R${r['faixa_preco_min']:.0f}-{r['faixa_preco_max']:.0f}", axis=1
+    )
+
+    # Pivot para visualização matricial
+    try:
+        pivot = df.pivot_table(
+            index='faixa_peso', columns='faixa_preco',
+            values='custo_envio', aggfunc='first'
+        )
+        # Ordenar pelo peso mínimo
+        peso_order = df.drop_duplicates('faixa_peso').sort_values('faixa_peso_min_kg')['faixa_peso'].tolist()
+        pivot = pivot.reindex(peso_order)
+        st.dataframe(pivot, use_container_width=True)
+    except Exception:
+        st.dataframe(df[['faixa_peso', 'faixa_preco', 'custo_envio']], use_container_width=True, hide_index=True)
+
+    if not pode_editar:
+        st.info("🔒 Apenas ADMIN e CONTROLADORIA podem editar esta tabela.")
+        return
+
+    # Edição por faixa de peso selecionada
+    st.divider()
+    st.markdown("### ✏️ Editar valores")
+
+    faixas_peso = df.drop_duplicates('faixa_peso').sort_values('faixa_peso_min_kg')
+    faixa_sel = st.selectbox(
+        "Selecione a faixa de peso:",
+        faixas_peso['faixa_peso'].tolist(),
+        key="sel_faixa_peso_ml"
+    )
+
+    if faixa_sel:
+        df_faixa = df[df['faixa_peso'] == faixa_sel][['id', 'faixa_preco', 'custo_envio']].copy()
+
+        edited = st.data_editor(
+            df_faixa,
+            column_config={
+                'id': None,
+                'faixa_preco': st.column_config.TextColumn("Faixa de Preço", disabled=True),
+                'custo_envio': st.column_config.NumberColumn("Custo Envio R$", format="%.2f", min_value=0),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="editor_frete_ml_2026"
+        )
+
+        if st.button("💾 Salvar alterações — Frete ML", key="btn_salvar_frete_ml26", type="primary"):
+            try:
+                conn = engine.raw_connection()
+                cursor = conn.cursor()
+                atualizados = 0
+                for _, row in edited.iterrows():
+                    cursor.execute(
+                        "UPDATE dim_frete_ml SET custo_envio = %s, updated_at = NOW() WHERE id = %s",
+                        (float(row['custo_envio']), int(row['id']))
+                    )
+                    atualizados += cursor.rowcount
+                conn.commit()
+                cursor.close()
+                conn.close()
+                st.success(f"✅ {atualizados} valores atualizados!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao salvar: {e}")
+
+
+# ============================================================
+# TAB: FRETE AMAZON (FBA / DBA por Peso x Preço)
+# ============================================================
+
+def _tab_frete_amazon_config(engine):
+    """Visualização e edição da tabela de frete Amazon."""
+
+    st.subheader("📦 Tabela de Frete Amazon (FBA / DBA)")
+
+    usuario_logado = st.session_state.get('usuario', {})
+    role_logado = usuario_logado.get('role', '')
+    pode_editar = role_logado in ('ADMIN', 'CONTROLADORIA', '')
+
+    # Verificar se tabela existe
+    df_check = _query_to_df(engine, "SELECT COUNT(*) as total FROM dim_frete_amazon")
+    if df_check.empty or df_check.iloc[0]['total'] == 0:
+        st.warning("⚠️ Tabela dim_frete_amazon vazia. Execute o SQL de setup primeiro.")
+        return
+
+    # Seleção de tipo
+    col1, col2 = st.columns(2)
+    with col1:
+        tipo = st.radio("Tipo:", ["FBA", "DBA"], horizontal=True, key="tipo_frete_amz_cfg")
+    with col2:
+        regioes_df = _query_to_df(engine,
+            "SELECT DISTINCT regiao FROM dim_frete_amazon WHERE tipo = %s ORDER BY regiao", (tipo,))
+        regioes = regioes_df['regiao'].tolist() if not regioes_df.empty else ['todas']
+        regiao = st.selectbox("Região:", regioes, key="regiao_frete_amz_cfg")
+
+    df = _query_to_df(engine,
+        """SELECT * FROM dim_frete_amazon 
+           WHERE tipo = %s AND regiao = %s
+           ORDER BY faixa_peso_min_kg, faixa_preco_min""",
+        (tipo, regiao)
+    )
+
+    if df.empty:
+        st.info("Nenhum registro encontrado para esta combinação.")
+        return
+
+    st.info(f"📊 {len(df)} faixas cadastradas — {tipo} / {regiao}")
+
+    # Criar labels legíveis
+    df['faixa_peso'] = df.apply(
+        lambda r: f"{r['faixa_peso_min_kg']*1000:.0f}-{r['faixa_peso_max_kg']*1000:.0f}g"
+            if r['faixa_peso_max_kg'] <= 1
+            else f"{r['faixa_peso_min_kg']:.1f}-{r['faixa_peso_max_kg']:.1f}kg",
+        axis=1
+    )
+    df['faixa_preco'] = df.apply(
+        lambda r: f"R${r['faixa_preco_min']:.0f}-{r['faixa_preco_max']:.0f}", axis=1
+    )
+
+    # Pivot
+    try:
+        pivot = df.pivot_table(
+            index='faixa_peso', columns='faixa_preco',
+            values='tarifa', aggfunc='first'
+        )
+        peso_order = df.drop_duplicates('faixa_peso').sort_values('faixa_peso_min_kg')['faixa_peso'].tolist()
+        pivot = pivot.reindex(peso_order)
+        st.dataframe(pivot, use_container_width=True)
+    except Exception:
+        st.dataframe(df[['faixa_peso', 'faixa_preco', 'tarifa', 'kg_adicional']],
+                     use_container_width=True, hide_index=True)
+
+    if not pode_editar:
+        st.info("🔒 Apenas ADMIN e CONTROLADORIA podem editar esta tabela.")
+        return
+
+    # Edição
+    st.divider()
+    st.markdown("### ✏️ Editar valores")
+
+    faixas_peso = df.drop_duplicates('faixa_peso').sort_values('faixa_peso_min_kg')
+    faixa_sel = st.selectbox(
+        "Selecione a faixa de peso:",
+        faixas_peso['faixa_peso'].tolist(),
+        key="sel_faixa_peso_amz"
+    )
+
+    if faixa_sel:
+        df_faixa = df[df['faixa_peso'] == faixa_sel][['id', 'faixa_preco', 'tarifa', 'kg_adicional']].copy()
+
+        edited = st.data_editor(
+            df_faixa,
+            column_config={
+                'id': None,
+                'faixa_preco': st.column_config.TextColumn("Faixa de Preço", disabled=True),
+                'tarifa': st.column_config.NumberColumn("Tarifa R$", format="%.2f", min_value=0),
+                'kg_adicional': st.column_config.NumberColumn("R$/kg adicional", format="%.2f", min_value=0),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="editor_frete_amz_cfg"
+        )
+
+        if st.button("💾 Salvar alterações — Frete Amazon", key="btn_salvar_frete_amz", type="primary"):
+            try:
+                conn = engine.raw_connection()
+                cursor = conn.cursor()
+                atualizados = 0
+                for _, row in edited.iterrows():
+                    cursor.execute(
+                        "UPDATE dim_frete_amazon SET tarifa = %s, kg_adicional = %s, updated_at = NOW() WHERE id = %s",
+                        (float(row['tarifa']), float(row.get('kg_adicional', 0) or 0), int(row['id']))
+                    )
+                    atualizados += cursor.rowcount
+                conn.commit()
+                cursor.close()
+                conn.close()
+                st.success(f"✅ {atualizados} valores atualizados!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao salvar: {e}")
 
 
 # ============================================================
