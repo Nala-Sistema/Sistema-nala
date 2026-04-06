@@ -1,6 +1,6 @@
 """
 PERFORMANCE - Sistema Nala
-Versão: 1.0 (21/03/2026)
+Versão: 1.3 (06/04/2026)
 
 Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Tabs por marketplace + tab Geral
@@ -8,10 +8,20 @@ Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Projeção com 4 modelos + indicadores visuais de performance
 - Histórico de 3 meses como colunas expandíveis
 - Integração com tags (Curva ABC + Status manual)
+
+VERSÃO 1.3 (06/04/2026):
+  - NOVO: Download de template XLSX com metas por anúncio (pré-preenchido)
+  - NOVO: Upload de planilha XLSX para UPSERT de metas em lote
+  - Regra dos 3 Meses: template e tela listam todos os anúncios com vendas
+    nos últimos 3 meses, garantindo preenchimento preventivo no início do mês
+
+VERSÃO 1.2:
+  - fix duplicatas + dict mapping
 """
 
 import streamlit as st
 import pandas as pd
+import io
 from datetime import date
 from database_utils import get_engine
 from performance_utils import (
@@ -169,17 +179,207 @@ def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo
 
 
 # ============================================================
+# DOWNLOAD / UPLOAD DE METAS POR ANÚNCIO (v1.3)
+# ============================================================
+
+def _gerar_template_metas(df, is_amazon):
+    """
+    Gera XLSX template para download de metas por anúncio.
+    Inclui todos os anúncios do universo (regra 3 meses) com metas
+    pré-preenchidas quando existentes.
+    """
+    cols_template = ['codigo_anuncio', 'sku', 'produto']
+    if is_amazon:
+        cols_template.append('logistica')
+    cols_template += ['meta_qtd', 'observacao']
+
+    df_template = df[cols_template].copy()
+
+    rename_map = {
+        'codigo_anuncio': 'Código Anúncio',
+        'sku': 'SKU',
+        'produto': 'Produto',
+        'logistica': 'Logística',
+        'meta_qtd': 'Meta Qtd',
+        'observacao': 'Observação',
+    }
+    df_template = df_template.rename(columns=rename_map)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_template.to_excel(writer, index=False, sheet_name='Metas')
+        # Ajustar largura das colunas
+        ws = writer.sheets['Metas']
+        col_widths = {
+            'A': 22,  # Código Anúncio
+            'B': 15,  # SKU
+            'C': 35,  # Produto
+        }
+        if is_amazon:
+            col_widths['D'] = 12   # Logística
+            col_widths['E'] = 12   # Meta Qtd
+            col_widths['F'] = 30   # Observação
+        else:
+            col_widths['D'] = 12   # Meta Qtd
+            col_widths['E'] = 30   # Observação
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+    buffer.seek(0)
+    return buffer
+
+
+def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engine):
+    """
+    Processa upload de planilha XLSX com metas por anúncio.
+    Faz UPSERT em dim_metas_anuncio via salvar_metas_anuncio_lote.
+    Grava qualquer codigo_anuncio enviado, mesmo fora do universo de 3 meses.
+    """
+    try:
+        df_upload = pd.read_excel(arquivo)
+    except Exception as e:
+        return -1, f"Erro ao ler arquivo: {e}"
+
+    # Normalizar nomes de colunas
+    rename_back = {
+        'Código Anúncio': 'codigo_anuncio',
+        'Codigo Anuncio': 'codigo_anuncio',
+        'codigo_anuncio': 'codigo_anuncio',
+        'SKU': 'sku',
+        'Produto': 'produto',
+        'Logística': 'logistica',
+        'Logistica': 'logistica',
+        'Meta Qtd': 'meta_qtd',
+        'meta_qtd': 'meta_qtd',
+        'Observação': 'observacao',
+        'Observacao': 'observacao',
+        'observacao': 'observacao',
+    }
+    df_upload = df_upload.rename(columns={
+        c: rename_back[c] for c in df_upload.columns if c in rename_back
+    })
+
+    if 'codigo_anuncio' not in df_upload.columns:
+        return -1, "Coluna 'Código Anúncio' não encontrada no arquivo."
+
+    metas = []
+    for _, row in df_upload.iterrows():
+        cod = str(row.get('codigo_anuncio', '')).strip()
+        if not cod or cod.lower() in ('nan', 'none', ''):
+            continue
+
+        # Meta quantidade — tratar NaN e valores não numéricos
+        meta_val = row.get('meta_qtd', 0)
+        if pd.isna(meta_val):
+            meta_val = 0
+        try:
+            meta_qtd = int(float(meta_val))
+        except (ValueError, TypeError):
+            meta_qtd = 0
+
+        # Observação
+        obs = str(row.get('observacao', '') or '').strip()
+        if obs.lower() in ('nan', 'none'):
+            obs = ''
+
+        # Logística (apenas Amazon)
+        log = None
+        if is_amazon:
+            log_val = str(row.get('logistica', '') or '').strip()
+            if log_val.lower() in ('nan', 'none', ''):
+                log = None
+            else:
+                log = log_val
+
+        metas.append({
+            'loja_origem': loja,
+            'marketplace': marketplace,
+            'codigo_anuncio': cod,
+            'logistica': log,
+            'ano_mes': ano_mes,
+            'meta_quantidade': meta_qtd,
+            'observacao': obs,
+        })
+
+    if not metas:
+        return 0, "Nenhuma meta válida encontrada no arquivo."
+
+    result = salvar_metas_anuncio_lote(engine, metas)
+    if result > 0:
+        return result, f"{result} metas gravadas com sucesso."
+    else:
+        return result, "Erro ao gravar metas no banco."
+
+
+def _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_amazon):
+    """
+    Renderiza seção de Download template e Upload de metas por anúncio.
+    Posicionada acima da tabela editável, dentro de cada tab marketplace/loja.
+    """
+    st.markdown("##### 📋 Metas por Anúncio — Planilha")
+    col_dl, col_ul = st.columns(2)
+
+    # ── DOWNLOAD TEMPLATE ──
+    with col_dl:
+        if not df.empty:
+            buffer = _gerar_template_metas(df, is_amazon)
+            nome_safe = loja.replace(' ', '_').replace('/', '-')
+            nome_arquivo = f"metas_{nome_safe}_{ano_mes}.xlsx"
+            st.download_button(
+                label="⬇️ Download Template Metas",
+                data=buffer,
+                file_name=nome_arquivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_metas_{loja}_{ano_mes}",
+                use_container_width=True,
+            )
+        else:
+            st.info("Sem anúncios para gerar template.")
+
+    # ── UPLOAD METAS ──
+    with col_ul:
+        arquivo_up = st.file_uploader(
+            "⬆️ Upload Metas (XLSX)",
+            type=['xlsx'],
+            key=f"ul_metas_{loja}_{ano_mes}",
+            label_visibility="collapsed",
+        )
+
+    # Botão de processar FORA do file_uploader (evita re-render bug do Streamlit)
+    if arquivo_up is not None:
+        # Guardar nome no session_state para evitar reprocessamento
+        ss_key = f"upload_processado_{loja}_{ano_mes}"
+        if st.button("📤 Processar Upload de Metas", key=f"btn_ul_{loja}_{ano_mes}",
+                      use_container_width=True):
+            with st.spinner("Processando metas..."):
+                result, msg = _processar_upload_metas(
+                    arquivo_up, loja, marketplace, ano_mes, is_amazon, engine
+                )
+            if result > 0:
+                st.success(f"✅ {msg}")
+                st.rerun()
+            elif result == 0:
+                st.warning(f"⚠️ {msg}")
+            else:
+                st.error(f"❌ {msg}")
+
+    st.divider()
+
+
+# ============================================================
 # TABELA DE ANÚNCIOS (EDITÁVEL)
 # ============================================================
 
 def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
     df = construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo)
 
-    if df.empty:
-        st.info("Nenhum anúncio com vendas neste período para esta loja.")
-        return
-
     is_amazon = 'AMAZON' in marketplace.upper()
+
+    # ── Download / Upload de Metas (v1.3) ──
+    _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_amazon)
+
+    if df.empty:
+        st.info("Nenhum anúncio com vendas nos últimos 3 meses para esta loja.")
+        return
 
     # Toggle histórico
     mostrar_hist = st.toggle("📊 Mostrar colunas de histórico", value=False,
@@ -488,7 +688,7 @@ MARKETPLACES = [
 
 def main():
     st.title("📊 Performance Mensal")
-    st.caption("v1.2 — fix duplicatas + dict mapping")
+    st.caption("v1.3 — download/upload metas + regra 3 meses")
 
     engine = get_engine()
     ano_mes = _seletor_mes()
