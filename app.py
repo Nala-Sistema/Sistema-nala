@@ -365,7 +365,7 @@ _MESES_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
 
 
 def _buscar_panorama_lojas(engine):
-    """Busca panorama de vendas por loja: atualização, vendas, faturamento, % comparativo."""
+    """Busca panorama de vendas por loja: atualização, vendas, faturamento, % comparativo por loja."""
     from permissoes import ve_todas_lojas, get_lojas_usuario
 
     hoje = date.today()
@@ -376,10 +376,7 @@ def _buscar_panorama_lojas(engine):
     else:
         primeiro_ant = date(hoje.year, hoje.month - 1, 1)
     ultimo_ant = primeiro_atual - timedelta(days=1)
-
-    # Dia de referência proporcional no mês anterior
-    dia_ref = min(hoje.day, ultimo_ant.day)
-    data_ref_ant = primeiro_ant.replace(day=dia_ref)
+    fallback_ant = primeiro_ant - timedelta(days=1)
 
     try:
         conn = engine.raw_connection()
@@ -396,24 +393,38 @@ def _buscar_panorama_lojas(engine):
                 params_loja = list(lojas)
 
         query = f"""
+            WITH max_dates AS (
+                SELECT loja_origem,
+                       MAX(data_venda) FILTER (WHERE data_venda >= %s) AS max_mes_atual
+                FROM fact_vendas_snapshot
+                WHERE 1=1 {where_loja}
+                GROUP BY loja_origem
+            )
             SELECT
-                loja_origem,
-                MAX(data_venda)                                                                   AS ultima_att,
-                COUNT(*)           FILTER (WHERE data_venda >= %s)                                AS vendas_atual,
-                COALESCE(SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %s), 0)             AS fat_atual,
-                COALESCE(SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %s AND data_venda <= %s), 0)  AS fat_ant_total,
-                COALESCE(SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %s AND data_venda <= %s), 0)  AS fat_ant_prop
-            FROM fact_vendas_snapshot
+                f.loja_origem,
+                MAX(f.data_venda)                                                                        AS ultima_att,
+                md.max_mes_atual,
+                COUNT(*)           FILTER (WHERE f.data_venda >= %s)                                     AS vendas_atual,
+                COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s), 0)                AS fat_atual,
+                COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0) AS fat_ant_total,
+                COALESCE(SUM(f.valor_venda_efetivo) FILTER (
+                    WHERE f.data_venda >= %s
+                      AND f.data_venda <= COALESCE(md.max_mes_atual - INTERVAL '1 month', %s::date)
+                ), 0)                                                                                    AS fat_ant_prop
+            FROM fact_vendas_snapshot f
+            LEFT JOIN max_dates md ON f.loja_origem = md.loja_origem
             WHERE 1=1 {where_loja}
-            GROUP BY loja_origem
-            ORDER BY loja_origem
+            GROUP BY f.loja_origem, md.max_mes_atual
+            ORDER BY f.loja_origem
         """
 
         params = [
-            primeiro_atual,                   # vendas_atual
-            primeiro_atual,                   # fat_atual
-            primeiro_ant, ultimo_ant,         # fat_ant_total
-            primeiro_ant, data_ref_ant,       # fat_ant_prop
+            primeiro_atual,
+        ] + params_loja + [
+            primeiro_atual,
+            primeiro_atual,
+            primeiro_ant, ultimo_ant,
+            primeiro_ant, fallback_ant,
         ] + params_loja
 
         cursor.execute(query, params)
@@ -442,19 +453,24 @@ def _renderizar_panorama(rows, engine):
     def fmt_int(v):
         return f"{int(v):,}".replace(",", ".")
 
-    def fmt_pct(fat_atual, fat_ant_prop):
+    def fmt_pct(fat_atual, fat_ant_prop, max_date_atual):
         fat_atual = float(fat_atual)
         fat_ant_prop = float(fat_ant_prop)
+        if max_date_atual is None:
+            return '<span class="pct-zero">—</span>'
+
+        ref_str = f'<span style="color:#9aa5b4;font-size:0.72rem;display:block;margin-top:1px">até dia {max_date_atual.day:02d}</span>'
+
         if fat_ant_prop == 0:
             if fat_atual > 0:
-                return '<span class="pct-up">▲ novo</span>'
+                return f'<span class="pct-up">▲ novo</span>{ref_str}'
             return '<span class="pct-zero">—</span>'
         pct = (fat_atual / fat_ant_prop - 1) * 100
         if pct > 0:
-            return f'<span class="pct-up">▲ +{pct:.1f}%</span>'
+            return f'<span class="pct-up">▲ +{pct:.1f}%</span>{ref_str}'
         elif pct < 0:
-            return f'<span class="pct-down">▼ {pct:.1f}%</span>'
-        return '<span class="pct-zero">0,0%</span>'
+            return f'<span class="pct-down">▼ {pct:.1f}%</span>{ref_str}'
+        return f'<span class="pct-zero">0,0%</span>{ref_str}'
 
     # Header
     html = f'''<div class="panorama-container">
@@ -466,7 +482,7 @@ def _renderizar_panorama(rows, engine):
         <th style="text-align:right">Vendas {mes_atual}</th>
         <th style="text-align:right">Faturamento {mes_atual}</th>
         <th style="text-align:right">Faturamento {mes_ant}</th>
-        <th style="text-align:right">% vs {mes_ant} (até dia {hoje.day})</th>
+        <th style="text-align:right">% vs {mes_ant}</th>
     </tr></thead><tbody>'''
 
     # Acumuladores para linha total
@@ -475,7 +491,7 @@ def _renderizar_panorama(rows, engine):
     tot_fat_ant = 0
     tot_fat_ant_prop = 0
 
-    for loja, ult_att, vendas, fat_at, fat_ant_t, fat_ant_p in rows:
+    for loja, ult_att, max_mes, vendas, fat_at, fat_ant_t, fat_ant_p in rows:
         ult_str = ult_att.strftime('%d/%m/%Y') if ult_att else '—'
         tot_vendas += int(vendas)
         tot_fat_atual += float(fat_at)
@@ -488,17 +504,29 @@ def _renderizar_panorama(rows, engine):
             <td style="text-align:right">{fmt_int(vendas)}</td>
             <td style="text-align:right">{fmt_brl(fat_at)}</td>
             <td style="text-align:right">{fmt_brl(fat_ant_t)}</td>
-            <td style="text-align:right">{fmt_pct(fat_at, fat_ant_p)}</td>
+            <td style="text-align:right">{fmt_pct(fat_at, fat_ant_p, max_mes)}</td>
         </tr>'''
 
-    # Linha total
+    # Linha total — sem ref_str individual (é agregado)
+    tot_pct_html = '<span class="pct-zero">—</span>'
+    if tot_fat_ant_prop > 0:
+        tot_pct = (tot_fat_atual / tot_fat_ant_prop - 1) * 100
+        if tot_pct > 0:
+            tot_pct_html = f'<span class="pct-up">▲ +{tot_pct:.1f}%</span>'
+        elif tot_pct < 0:
+            tot_pct_html = f'<span class="pct-down">▼ {tot_pct:.1f}%</span>'
+        else:
+            tot_pct_html = '<span class="pct-zero">0,0%</span>'
+    elif tot_fat_atual > 0:
+        tot_pct_html = '<span class="pct-up">▲ novo</span>'
+
     html += f'''<tr class="row-total">
         <td>TOTAL</td>
         <td></td>
         <td style="text-align:right">{fmt_int(tot_vendas)}</td>
         <td style="text-align:right">{fmt_brl(tot_fat_atual)}</td>
         <td style="text-align:right">{fmt_brl(tot_fat_ant)}</td>
-        <td style="text-align:right">{fmt_pct(tot_fat_atual, tot_fat_ant_prop)}</td>
+        <td style="text-align:right">{tot_pct_html}</td>
     </tr>'''
 
     html += '</tbody></table></div>'
