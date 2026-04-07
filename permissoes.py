@@ -52,7 +52,7 @@ PERMISSOES = {
         'tags':         'completo',
         'compras':      'completo',
         'config':       'completo',
-        'calculadora':  'completo',
+        'calculadora':  False,
         'ia':           'completo',
         'kanban':       'completo',
         'tabela_preco': 'completo',
@@ -66,7 +66,7 @@ PERMISSOES = {
         'tags':         'leitura',
         'compras':      'leitura',
         'config':       'leitura',
-        'calculadora':  'completo',
+        'calculadora':  False,
         'ia':           'completo',
         'kanban':       'completo',
         'tabela_preco': 'leitura',
@@ -80,7 +80,7 @@ PERMISSOES = {
         'tags':         'completo',
         'compras':      'completo',
         'config':       False,
-        'calculadora':  'completo',
+        'calculadora':  False,
         'ia':           'completo',
         'kanban':       'completo',
         'tabela_preco': 'completo',
@@ -94,7 +94,7 @@ PERMISSOES = {
         'tags':         'parcial',      # filtrado por loja
         'compras':      False,
         'config':       'parcial',      # só aba de anúncios
-        'calculadora':  'completo',
+        'calculadora':  False,
         'ia':           'parcial',      # filtrado por loja + sem custos
         'kanban':       'completo',
         'tabela_preco': 'parcial',      # filtrado por marketplace

@@ -875,7 +875,7 @@ def render_tab_amazon(engine, perfil, usuario):
 
             row = {
                 'sinal': sinal, 'asin': asin,
-                'titulo': (first.get('nome') or '')[:50],
+                'titulo': str(first['nome'])[:50] if pd.notna(first.get('nome')) else '',
                 'sku_nala': sku, 'logistica': log,
             }
             for lj in AMZ_LOJAS_COLS:
