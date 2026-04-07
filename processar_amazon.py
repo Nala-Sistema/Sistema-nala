@@ -285,7 +285,7 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
 
             vendas.append({
                 'pedido': f"AMZ_{loja}_{data_ini.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}_{sku_amz}",
-                'data': data_ini.strftime("%d/%m/%Y"),
+                'data': data_fim.strftime("%d/%m/%Y"),
                 'sku': sku_original,
                 'sku_amz': sku_amz,
                 'asin': asin,
