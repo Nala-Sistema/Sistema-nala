@@ -515,7 +515,16 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
         key=f"editor_{loja}_{ano_mes}",
         num_rows="fixed",
     )
-
+    # Download XLSX da tabela
+    buffer_dl = io.BytesIO()
+    with pd.ExcelWriter(buffer_dl, engine='openpyxl') as writer:
+        df_display.to_excel(writer, index=False, sheet_name='Performance')
+    buffer_dl.seek(0)
+    nome_dl = f"performance_{loja.replace(' ','_')}_{ano_mes}.xlsx"
+    st.download_button("📥 Download Tabela", buffer_dl, nome_dl,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_perf_{loja}_{ano_mes}")
+  
     # Botão salvar
     if st.button("💾 Salvar Metas e Observações", key=f"btn_salvar_{loja}_{ano_mes}",
                  type="primary", use_container_width=True):

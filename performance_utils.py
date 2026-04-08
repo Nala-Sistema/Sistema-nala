@@ -515,6 +515,13 @@ def buscar_nomes_produtos(engine):
     if df.empty:
         return {}
     return {row['sku']: row['nome'] for _, row in df.iterrows()}
+def buscar_skus_config_amazon(engine):
+    """Retorna dict: {asin: sku} da dim_config_marketplace Amazon."""
+    df = _raw_query(engine,
+        "SELECT DISTINCT asin, sku FROM dim_config_marketplace WHERE marketplace = 'AMAZON' AND ativo = true AND asin IS NOT NULL AND sku IS NOT NULL")
+    if df.empty:
+        return {}
+    return {str(row['asin']).strip(): str(row['sku']).strip() for _, row in df.iterrows()}
 
 
 # ============================================================
@@ -618,7 +625,10 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
                     anuncios.add((h['codigo_anuncio'], h.get('sku', ''), log))
                     codigos_existentes.add((h['codigo_anuncio'], log))
     # ── FIM REGRA DOS 3 MESES ─────────────────────────────────
-
+  
+    # Fallback: SKUs da config Amazon para ASINs sem venda no snapshot
+    config_skus = buscar_skus_config_amazon(engine) if is_amazon else {}
+  
     if not anuncios:
         return pd.DataFrame()
 
@@ -643,7 +653,9 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
         else:
             qtd_real, fat_real, margem_at = 0, 0.0, 0.0
             sku = sku_from_real or ''
-
+        # Fallback: buscar SKU da config Amazon
+        if (not sku or sku in ('', 'None', 'nan')) and is_amazon:
+            sku = config_skus.get(cod_anuncio, '')
         # Meta
         meta_qtd = 0
         obs = ''
