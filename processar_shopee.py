@@ -2,6 +2,13 @@
 PROCESSADOR SHOPEE - Sistema Nala
 Processa arquivos de vendas da Shopee (.xlsx exportado do painel)
 
+VERSÃO 2.3 (08/04/2026):
+  - FIX: Inclui coluna "Ajuste por participação em ação comercial" no cálculo de margem
+         Essa coluna captura descontos PIX e outros ajustes promocionais que a Shopee aplica.
+         Sem ela, margem ficava inflada no valor exato do ajuste.
+         Validado em 4 arquivos (2 lojas, 3 meses, 929 pedidos, 98.9%+ match).
+  - Novo campo ajuste_comercial gravado em desconto_parceiro no banco.
+
 VERSÃO 2.2 (06/04/2026):
   - FIX: renomear_colunas_shopee agora exclui colunas 'bruta' (Shopee adicionou
          'Taxa de comissão bruta' e 'Taxa de serviço bruta' ao export, causando
@@ -19,6 +26,7 @@ REGRAS DE NEGÓCIO:
 - Comissão carrinhos compostos: calculada pela tabela oficial (arquivo repete valor total em cada linha)
 - Imposto: Subtotal × alíquota da loja (dim_lojas)
 - Cupom do vendedor: deduzido da margem quando > 0
+- Ajuste por participação em ação comercial: deduzido da margem (PIX, promos, etc.) — v2.3
 - Frete: IGNORADO (Shopee retém, não passa ao vendedor)
 - Verificação de comissão: alerta quando valor cobrado diverge da tabela vigente
 
@@ -288,6 +296,12 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
         else:
             df['Cupom do vendedor'] = 0.0
 
+        # v2.3: Ajuste por participação em ação comercial (PIX, promos, etc.)
+        if 'Ajuste por participação em ação comercial' in df.columns:
+            df['Ajuste por participação em ação comercial'] = df['Ajuste por participação em ação comercial'].apply(_limpar_numero)
+        else:
+            df['Ajuste por participação em ação comercial'] = 0.0
+
         # --------------------------------------------------
         # 4. FILTRAR REGISTROS INVÁLIDOS
         # --------------------------------------------------
@@ -361,6 +375,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             quantidade      = int(_limpar_numero(row['Quantidade']))
             subtotal        = _limpar_numero(row['Subtotal do produto'])
             cupom_vendedor  = _limpar_numero(row.get('Cupom do vendedor', 0))
+            ajuste_comercial = _limpar_numero(row.get('Ajuste por participação em ação comercial', 0))  # v2.3
 
             if subtotal == 0 and preco_unitario > 0:
                 subtotal = preco_unitario * quantidade
@@ -412,23 +427,24 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             imposto_valor = round(subtotal * (imposto / 100), 2)
 
             resultados.append({
-                'pedido':          pedido_id,
-                'pedido_original': pedido_id,  # v2.1: NOVO — pedido real da Shopee
-                'data':            data_venda,
-                'sku':             sku,
-                'codigo_anuncio':  codigo_anuncio,
-                'qtd':             quantidade,
-                'preco_unit':      preco_unitario,
-                'receita':         subtotal,
-                'tarifa':          round(comissao, 2),
-                'imposto':         imposto_valor,
-                'cupom_vendedor':  cupom_vendedor,
-                'frete':           0.0,
-                'custo':           0.0,       # preenchido após busca no banco
-                'custo_unit':      0.0,
-                'tem_custo':       False,
-                'fonte_comissao':  fonte_comissao,
-                'is_carrinho':     is_carrinho,
+                'pedido':            pedido_id,
+                'pedido_original':   pedido_id,  # v2.1: pedido real da Shopee
+                'data':              data_venda,
+                'sku':               sku,
+                'codigo_anuncio':    codigo_anuncio,
+                'qtd':               quantidade,
+                'preco_unit':        preco_unitario,
+                'receita':           subtotal,
+                'tarifa':            round(comissao, 2),
+                'imposto':           imposto_valor,
+                'cupom_vendedor':    cupom_vendedor,
+                'ajuste_comercial':  ajuste_comercial,  # v2.3: PIX, promos, etc.
+                'frete':             0.0,
+                'custo':             0.0,       # preenchido após busca no banco
+                'custo_unit':        0.0,
+                'tem_custo':         False,
+                'fonte_comissao':    fonte_comissao,
+                'is_carrinho':       is_carrinho,
             })
 
         if not resultados:
@@ -448,12 +464,15 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
 
         # --------------------------------------------------
         # 10. CALCULAR MARGEM
+        # v2.3: Inclui ajuste_comercial na dedução
+        # Fórmula: Subtotal - Comissão - Imposto - Cupom - Ajuste - Custo
         # --------------------------------------------------
         df_proc['margem'] = (
             df_proc['receita']
             - df_proc['tarifa']
             - df_proc['imposto']
             - df_proc['cupom_vendedor']
+            - df_proc['ajuste_comercial']
             - df_proc['custo']
         ).round(2)
 
@@ -498,6 +517,10 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                           arquivo_nome: str, engine):
     """
     Grava vendas da Shopee na tabela fact_vendas_snapshot.
+
+    VERSÃO 2.3:
+    - NOVO: Grava ajuste_comercial em desconto_parceiro
+    - Ajuste_comercial incluído em outros_custos e total_tarifas
 
     VERSÃO 2.1:
     - NOVO: Salva pedido_original no INSERT
@@ -599,15 +622,16 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             skus_invalidos.add(sku)
 
             # Preparar dados financeiros para pendente
-            receita         = float(row['receita'])
-            comissao        = float(row['tarifa'])
-            imposto_val     = float(row['imposto'])
-            cupom_vendedor  = float(row.get('cupom_vendedor', 0.0))
-            frete           = 0.0
-            tarifa_fixa     = 0.0
-            outros_custos   = cupom_vendedor
-            total_tarifas   = comissao + imposto_val + outros_custos
-            valor_liquido   = round(receita - total_tarifas, 2)
+            receita          = float(row['receita'])
+            comissao         = float(row['tarifa'])
+            imposto_val      = float(row['imposto'])
+            cupom_vendedor   = float(row.get('cupom_vendedor', 0.0))
+            ajuste_comercial = float(row.get('ajuste_comercial', 0.0))  # v2.3
+            frete            = 0.0
+            tarifa_fixa      = 0.0
+            outros_custos    = cupom_vendedor + ajuste_comercial        # v2.3: inclui ajuste
+            total_tarifas    = comissao + imposto_val + outros_custos
+            valor_liquido    = round(receita - total_tarifas, 2)
 
             dados_pendente = {
                 'marketplace_origem': marketplace,
@@ -618,7 +642,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 'codigo_anuncio': row.get('codigo_anuncio', ''),
                 'quantidade': int(row['qtd']),
                 'preco_venda': float(row.get('preco_unit', 0)),
-                'desconto_parceiro': 0,
+                'desconto_parceiro': ajuste_comercial,                  # v2.3
                 'desconto_marketplace': 0,
                 'valor_venda_efetivo': receita,
                 'imposto': imposto_val,
@@ -641,20 +665,21 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
         # ---- GRAVAÇÃO NORMAL ----
         try:
             # Valores financeiros
-            receita         = float(row['receita'])
-            comissao        = float(row['tarifa'])
-            imposto_val     = float(row['imposto'])
-            cupom_vendedor  = float(row.get('cupom_vendedor', 0.0))
-            custo_unit      = float(row.get('custo_unit', 0.0))
-            custo_total     = float(row['custo'])
+            receita          = float(row['receita'])
+            comissao         = float(row['tarifa'])
+            imposto_val      = float(row['imposto'])
+            cupom_vendedor   = float(row.get('cupom_vendedor', 0.0))
+            ajuste_comercial = float(row.get('ajuste_comercial', 0.0))  # v2.3
+            custo_unit       = float(row.get('custo_unit', 0.0))
+            custo_total      = float(row['custo'])
 
-            frete           = 0.0
-            tarifa_fixa     = 0.0
-            outros_custos   = cupom_vendedor          # cupom do vendedor sai do resultado
-            total_tarifas   = comissao + imposto_val + outros_custos
-            valor_liquido   = round(receita - total_tarifas, 2)
-            margem_total    = float(row['margem'])
-            margem_pct      = float(row['margem_pct'])
+            frete            = 0.0
+            tarifa_fixa      = 0.0
+            outros_custos    = cupom_vendedor + ajuste_comercial        # v2.3: inclui ajuste
+            total_tarifas    = comissao + imposto_val + outros_custos
+            valor_liquido    = round(receita - total_tarifas, 2)
+            margem_total     = float(row['margem'])
+            margem_pct       = float(row['margem_pct'])
 
             # Savepoint individual — rollback só desta linha em caso de erro
             cursor.execute(f"SAVEPOINT sp_shopee_{idx}")
@@ -668,7 +693,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 row['codigo_anuncio'],
                 int(row['qtd']),
                 float(row['preco_unit']),   # preco_venda = preço unitário acordado
-                0.0,                         # desconto_parceiro (já embutido no preço acordado)
+                ajuste_comercial,            # v2.3: desconto_parceiro = ajuste comercial
                 0.0,                         # desconto_marketplace (cupom Shopee — absorvido pela plataforma)
                 receita,
                 custo_unit,
