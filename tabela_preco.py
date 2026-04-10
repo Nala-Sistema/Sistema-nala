@@ -1,15 +1,17 @@
 """
-tabela_preco.py — Módulo Tabela de Preço (Projeto Nala) v4.0
+tabela_preco.py — Módulo Tabela de Preço (Projeto Nala) v4.1
 Grade de precificação estratégica por marketplace.
 Tabs: ML | Shopee | Amazon | Shein | Magalu | B2B
 
-v4.0 CHANGELOG:
-  - Filtro inteligente de busca (SKU ou nome) em todas as tabs
-  - Preços Referência (mínimo/esperado) para TODOS os tipos de anúncio
-  - Performance: dados carregados 1x com @st.cache_data, session_state
-  - Legenda dos semáforos em card explicativo
-  - Checkbox renomeado para "📊 Preços Referência"
-  - Margem zero → preços referência em amarelo
+v4.1 CHANGELOG:
+  - FIX: Semáforo 🟡 quando mc_min=0 e mc_des=0 (margens não configuradas)
+  - FIX: Preços Referência só calcula se margens > 0
+  - ML: Separação visual entre blocos Clássico e Premium (coluna separadora)
+  - ML: Refs Clássico junto do bloco Clássico, Refs Premium junto do bloco Premium
+  - Amazon: Removido L/C/A/Peso/Cubado (mantém só Efetivo read-only)
+  - Amazon: Removido checkboxes de loja na tabela e filtros no topo
+  - Amazon: Removido Innovare da constante
+  - Amazon: Padronizado "📊 Preços Referência"
 """
 
 import streamlit as st
@@ -27,8 +29,7 @@ from database_utils import get_engine
 TABS_ORDER = ["Mercado Livre", "Shopee", "Amazon", "Shein", "Magalu", "B2B"]
 ML_LOJA_ORDER = ["ML-Nala", "ML-LPT", "ML-YanniRJ", "ML-YanniSP"]
 PERFIS_COM_CUSTO = ["ADMIN", "CONTROLADORIA", "DIRETOR", "COMPRAS"]
-EDITOR_HEIGHT = 595  # ~16 rows
-AMZ_LOJAS_COLS = ["AMZ-Nala", "AMZ-LPT", "AMZ-Innovare", "AMZ-Yanni"]
+EDITOR_HEIGHT = 595
 
 # ============================================================
 # CARGA DE DADOS (cached)
@@ -123,15 +124,6 @@ def carregar_configs_amazon(_engine):
     with _engine.connect() as conn:
         return pd.read_sql(query, conn)
 
-@st.cache_data(ttl=300, show_spinner=False)
-def carregar_asin_lojas(_engine):
-    try:
-        query = text("SELECT asin, loja FROM dim_asin_lojas")
-        with _engine.connect() as conn:
-            return pd.read_sql(query, conn)
-    except Exception:
-        return pd.DataFrame(columns=['asin', 'loja'])
-
 # ============================================================
 # CÁLCULOS
 # ============================================================
@@ -172,8 +164,7 @@ def buscar_frete_amazon(df_frete, peso_kg, preco_venda):
     return None
 
 def taxa_fixa_dba(preco):
-    if preco is None or preco <= 0:
-        return 6.50
+    if preco is None or preco <= 0: return 6.50
     if preco < 30: return 4.50
     elif preco < 50: return 6.50
     elif preco < 79: return 6.75
@@ -187,6 +178,9 @@ def calcular_margem(preco, custo_sku, comissao_pct, taxa_frete, imposto_pct, ext
     return round(margem_abs, 2), round((margem_abs / preco) * 100, 2)
 
 def preco_sugerido(custo_sku, comissao_pct, taxa_frete, imposto_pct, margem_alvo_pct, extra=0):
+    """Só calcula se margem_alvo > 0."""
+    if margem_alvo_pct is None or margem_alvo_pct <= 0:
+        return None
     divisor = 1 - comissao_pct - imposto_pct - (margem_alvo_pct / 100)
     if divisor <= 0:
         return None
@@ -200,12 +194,25 @@ def classificar_tag(qtd):
     else: return "⚠️ Atenção"
 
 def semaforo(margem_pct, mc_min, mc_des):
-    if margem_pct is None: return "⚪"
+    """
+    🟢 Margem >= MC Esperada
+    🟡 Margem entre MC Mínima e Esperada, OU margens não configuradas (ambas=0)
+    🔴 Margem < MC Mínima
+    ⚪ Sem preço
+    """
+    if margem_pct is None:
+        return "⚪"
     mm = (mc_min or 0) * 100 if mc_min and mc_min < 1 else (mc_min or 0)
     md = (mc_des or 0) * 100 if mc_des and mc_des < 1 else (mc_des or 0)
-    if margem_pct < mm: return "🔴"
-    elif margem_pct < md: return "🟡"
-    else: return "🟢"
+    # Se ambas margens são zero → margens não configuradas → amarelo
+    if mm == 0 and md == 0:
+        return "🟡"
+    if margem_pct < mm:
+        return "🔴"
+    elif margem_pct < md:
+        return "🟡"
+    else:
+        return "🟢"
 
 def normalizar_margem(val):
     if val is None or pd.isna(val): return 0
@@ -216,12 +223,10 @@ def normalizar_margem(val):
 # ============================================================
 
 def filtro_busca(key):
-    """Campo de busca inteligente por SKU ou nome."""
     return st.text_input("🔍 Buscar por SKU ou Nome do Produto", key=key,
                          placeholder="Digite parte do SKU ou nome para filtrar...")
 
 def aplicar_filtro(df, termo, col_sku='sku', col_nome='produto'):
-    """Filtra DataFrame por termo de busca."""
     if not termo or len(termo.strip()) < 2:
         return df
     t = termo.strip().lower()
@@ -233,10 +238,9 @@ def aplicar_filtro(df, termo, col_sku='sku', col_nome='produto'):
     return filtered
 
 def legenda_semaforo():
-    """Exibe legenda dos semáforos."""
     st.markdown(
         "🟢 **Margem ≥ MC Esperada** | "
-        "🟡 **Margem entre MC Mínima e Esperada** | "
+        "🟡 **Margem entre Mín/Esp ou margens não configuradas** | "
         "🔴 **Margem < MC Mínima** | "
         "⚪ **Sem preço**"
     )
@@ -299,32 +303,6 @@ def salvar_precos(engine, rows_list, marketplace, loja, logistica, usuario):
         conn.commit()
     return count
 
-def _garantir_tabela_asin_lojas(engine):
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS dim_asin_lojas (
-                    id SERIAL PRIMARY KEY, asin VARCHAR(50) NOT NULL,
-                    loja VARCHAR(100) NOT NULL, UNIQUE(asin, loja))
-            """))
-            conn.commit()
-    except Exception:
-        pass
-
-def salvar_asin_lojas_batch(engine, edited_df):
-    try:
-        with engine.connect() as conn:
-            for _, r in edited_df.iterrows():
-                asin = r['asin']
-                lojas_marcadas = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
-                conn.execute(text("DELETE FROM dim_asin_lojas WHERE asin = :asin"), {"asin": asin})
-                for loja in lojas_marcadas:
-                    conn.execute(text("INSERT INTO dim_asin_lojas (asin, loja) VALUES (:asin, :loja) ON CONFLICT DO NOTHING"),
-                                {"asin": asin, "loja": loja})
-            conn.commit()
-    except Exception:
-        pass
-
 def _upload_precos_widget(engine, df_prod, marketplace, loja, key_prefix, usuario):
     with st.expander("📤 Upload em massa", expanded=False):
         cols_template = ["preco_venda", "comissao_pct", "taxa_fixa", "frete"]
@@ -366,8 +344,7 @@ def render_tab_ml(engine, perfil, usuario):
         permitidas = gl[gl['marketplace'].str.upper().str.contains('MERCADO')]['loja'].tolist()
         ml_lojas = ml_lojas[ml_lojas['loja'].isin(permitidas)]
     if ml_lojas.empty:
-        st.warning("Nenhuma loja ML encontrada ou sem permissão.")
-        return
+        st.warning("Nenhuma loja ML encontrada ou sem permissão."); return
 
     ml_lojas['_order'] = ml_lojas['loja'].apply(lambda x: ML_LOJA_ORDER.index(x) if x in ML_LOJA_ORDER else 99)
     ml_lojas = ml_lojas.sort_values('_order')
@@ -391,15 +368,13 @@ def render_tab_ml(engine, perfil, usuario):
             extra = 6.0 if 'yannisp' in loja.lower().replace('-', '').replace(' ', '') else 0.0
 
             c1, c2, c3 = st.columns(3)
-            show_class = c1.checkbox("Clássico (11,5%)", True, key=f"ml_cl_{loja}")
-            show_prem = c2.checkbox("Premium (16,5%)", True, key=f"ml_pr_{loja}")
+            show_class = c1.checkbox("🔵 Clássico (11,5%)", True, key=f"ml_cl_{loja}")
+            show_prem = c2.checkbox("🟣 Premium (16,5%)", True, key=f"ml_pr_{loja}")
             show_ref = c3.checkbox("📊 Preços Referência", False, key=f"ml_ref_{loja}")
 
             st.caption(f"Imposto {imp_raw:.0f}% | Taxa fixa R$6,75 (≤R$78,99) | ≥R$79 = frete obrigatório"
                        f"{' | +R$6,00 Yanni SP' if extra > 0 else ''}")
             legenda_semaforo()
-
-            # Filtro de busca
             termo = filtro_busca(f"busca_ml_{loja}")
 
             rows = []
@@ -418,8 +393,7 @@ def render_tab_ml(engine, perfil, usuario):
                     s = df_precos[(df_precos['sku'] == sku) & (df_precos['loja'] == loja) & (df_precos['logistica'] == log)]
                     if s.empty: return {}
                     r = s.iloc[0]
-                    return {'preco': r.get('preco_venda'),
-                            'com': r.get('comissao_percentual_override'),
+                    return {'preco': r.get('preco_venda'), 'com': r.get('comissao_percentual_override'),
                             'frete': r.get('frete_override'), 'taxa': r.get('taxa_fixa_override')}
 
                 sv_cl = get_salvo("Clássico")
@@ -440,6 +414,14 @@ def render_tab_ml(engine, perfil, usuario):
                 row.update({'preco_cl': pc, 'com_cl': round(com_cl, 1), 'tf_cl': round(tf_cl or 6.75, 2),
                             'mg_cl': mp_cl, 'mg_abs_cl': ma_cl})
 
+                # Refs Clássico (só se margens > 0)
+                if show_ref:
+                    row['ref_min_cl'] = preco_sugerido(custo, 0.115, 6.75, imp_dec, mc_min, extra)
+                    row['ref_esp_cl'] = preco_sugerido(custo, 0.115, 6.75, imp_dec, mc_des, extra)
+
+                # Coluna separadora
+                row['_sep'] = ""
+
                 # --- Premium ---
                 pp = sv_pr.get('preco')
                 com_pr = (sv_pr.get('com') or 0) * 100 if sv_pr.get('com') else 16.5
@@ -450,25 +432,19 @@ def render_tab_ml(engine, perfil, usuario):
                 row.update({'preco_pr': pp, 'com_pr': round(com_pr, 1), 'tf_pr': round(tf_pr or 6.75, 2),
                             'mg_pr': mp_pr, 'mg_abs_pr': ma_pr})
 
-                row['sinal'] = semaforo(mp_cl, p.get('margem_minima'), p.get('margem_desejavel'))
-
-                # --- Preços Referência para AMBOS ---
+                # Refs Premium (só se margens > 0)
                 if show_ref:
-                    row['ref_min_cl'] = preco_sugerido(custo, 0.115, 6.75, imp_dec, mc_min, extra)
-                    row['ref_esp_cl'] = preco_sugerido(custo, 0.115, 6.75, imp_dec, mc_des, extra)
                     row['ref_min_pr'] = preco_sugerido(custo, 0.165, 6.75, imp_dec, mc_min, extra)
                     row['ref_esp_pr'] = preco_sugerido(custo, 0.165, 6.75, imp_dec, mc_des, extra)
 
+                row['sinal'] = semaforo(mp_cl, p.get('margem_minima'), p.get('margem_desejavel'))
                 rows.append(row)
 
             df = pd.DataFrame(rows)
             if df.empty:
-                st.info("Nenhum produto ativo.")
-                continue
+                st.info("Nenhum produto ativo."); continue
 
-            # Aplicar filtro de busca
             df = aplicar_filtro(df, termo)
-
             com_preco = ((df['preco_cl'].notna() & (df['preco_cl'] > 0)) |
                          (df['preco_pr'].notna() & (df['preco_pr'] > 0))).sum()
 
@@ -481,6 +457,7 @@ def render_tab_ml(engine, perfil, usuario):
                 'tag': st.column_config.TextColumn("🏷️", disabled=True, width="small"),
                 'real_30d': st.column_config.NumberColumn("Real 30d", format="%.1f%%", disabled=True, width="small"),
                 'peso_kg': st.column_config.NumberColumn("Peso kg", format="%.2f", disabled=True, width="small"),
+                '_sep': st.column_config.TextColumn("│", disabled=True, width="tiny"),
             }
             col_order = ['sinal', 'sku', 'produto', 'categoria', 'tag', 'real_30d']
 
@@ -491,38 +468,42 @@ def render_tab_ml(engine, perfil, usuario):
                 col_order += ['custo', 'mc_esp', 'mc_min']
             col_order.append('peso_kg')
 
-            if show_ref:
-                if show_class:
-                    cc['ref_min_cl'] = st.column_config.NumberColumn("Ref.Mín Cl", format="R$ %.2f", disabled=True, width="small")
-                    cc['ref_esp_cl'] = st.column_config.NumberColumn("Ref.Esp Cl", format="R$ %.2f", disabled=True, width="small")
-                    col_order += ['ref_min_cl', 'ref_esp_cl']
-                if show_prem:
-                    cc['ref_min_pr'] = st.column_config.NumberColumn("Ref.Mín Pr", format="R$ %.2f", disabled=True, width="small")
-                    cc['ref_esp_pr'] = st.column_config.NumberColumn("Ref.Esp Pr", format="R$ %.2f", disabled=True, width="small")
-                    col_order += ['ref_min_pr', 'ref_esp_pr']
-
+            # BLOCO CLÁSSICO
             if show_class:
+                if show_ref:
+                    cc['ref_min_cl'] = st.column_config.NumberColumn("🔵Ref.Mín", format="R$ %.2f", disabled=True, width="small")
+                    cc['ref_esp_cl'] = st.column_config.NumberColumn("🔵Ref.Esp", format="R$ %.2f", disabled=True, width="small")
+                    col_order += ['ref_min_cl', 'ref_esp_cl']
                 cc.update({
-                    'preco_cl': st.column_config.NumberColumn("🟠 Preço Cl.", format="R$ %.2f", min_value=0, width="small"),
-                    'com_cl': st.column_config.NumberColumn("Com.Cl%", format="%.1f%%", min_value=0, width="tiny"),
-                    'tf_cl': st.column_config.NumberColumn("Taxa/Frt Cl", format="R$ %.2f", min_value=0, width="small"),
-                    'mg_cl': st.column_config.NumberColumn("Mg.Cl%", format="%.1f%%", disabled=True, width="small"),
+                    'preco_cl': st.column_config.NumberColumn("🟠🔵 Preço Cl.", format="R$ %.2f", min_value=0, width="small"),
+                    'com_cl': st.column_config.NumberColumn("🔵Com%", format="%.1f%%", min_value=0, width="tiny"),
+                    'tf_cl': st.column_config.NumberColumn("🔵Taxa/Frt", format="R$ %.2f", min_value=0, width="small"),
+                    'mg_cl': st.column_config.NumberColumn("🔵Mg%", format="%.1f%%", disabled=True, width="small"),
                 })
                 col_order += ['preco_cl', 'com_cl', 'tf_cl', 'mg_cl']
                 if perfil in PERFIS_COM_CUSTO:
-                    cc['mg_abs_cl'] = st.column_config.NumberColumn("Mg.Cl R$", format="R$ %.2f", disabled=True, width="small")
+                    cc['mg_abs_cl'] = st.column_config.NumberColumn("🔵Mg R$", format="R$ %.2f", disabled=True, width="small")
                     col_order.append('mg_abs_cl')
 
+            # SEPARADOR entre Clássico e Premium
+            if show_class and show_prem:
+                col_order.append('_sep')
+
+            # BLOCO PREMIUM
             if show_prem:
+                if show_ref:
+                    cc['ref_min_pr'] = st.column_config.NumberColumn("🟣Ref.Mín", format="R$ %.2f", disabled=True, width="small")
+                    cc['ref_esp_pr'] = st.column_config.NumberColumn("🟣Ref.Esp", format="R$ %.2f", disabled=True, width="small")
+                    col_order += ['ref_min_pr', 'ref_esp_pr']
                 cc.update({
-                    'preco_pr': st.column_config.NumberColumn("🟠 Preço Pr.", format="R$ %.2f", min_value=0, width="small"),
-                    'com_pr': st.column_config.NumberColumn("Com.Pr%", format="%.1f%%", min_value=0, width="tiny"),
-                    'tf_pr': st.column_config.NumberColumn("Taxa/Frt Pr", format="R$ %.2f", min_value=0, width="small"),
-                    'mg_pr': st.column_config.NumberColumn("Mg.Pr%", format="%.1f%%", disabled=True, width="small"),
+                    'preco_pr': st.column_config.NumberColumn("🟠🟣 Preço Pr.", format="R$ %.2f", min_value=0, width="small"),
+                    'com_pr': st.column_config.NumberColumn("🟣Com%", format="%.1f%%", min_value=0, width="tiny"),
+                    'tf_pr': st.column_config.NumberColumn("🟣Taxa/Frt", format="R$ %.2f", min_value=0, width="small"),
+                    'mg_pr': st.column_config.NumberColumn("🟣Mg%", format="%.1f%%", disabled=True, width="small"),
                 })
                 col_order += ['preco_pr', 'com_pr', 'tf_pr', 'mg_pr']
                 if perfil in PERFIS_COM_CUSTO:
-                    cc['mg_abs_pr'] = st.column_config.NumberColumn("Mg.Pr R$", format="R$ %.2f", disabled=True, width="small")
+                    cc['mg_abs_pr'] = st.column_config.NumberColumn("🟣Mg R$", format="R$ %.2f", disabled=True, width="small")
                     col_order.append('mg_abs_pr')
 
             for c in df.columns:
@@ -666,19 +647,18 @@ def render_tab_shopee(engine, perfil, usuario):
 
 
 # ============================================================
-# TAB AMAZON
+# TAB AMAZON — Simplificada
 # ============================================================
 
 def render_tab_amazon(engine, perfil, usuario):
     st.subheader("📦 Amazon")
-    _garantir_tabela_asin_lojas(engine)
 
     df_configs = carregar_configs_amazon(engine)
     if df_configs.empty:
         st.info("Nenhum ASIN cadastrado em Configurações > Amazon."); return
 
     df_precos = carregar_precos_salvos(engine, "Amazon")
-    df_asin_lojas = carregar_asin_lojas(engine)
+
     try: df_frete_dba = carregar_frete_amazon(engine, 'DBA')
     except: df_frete_dba = pd.DataFrame()
     try: df_frete_fba = carregar_frete_amazon(engine, 'FBA')
@@ -686,21 +666,8 @@ def render_tab_amazon(engine, perfil, usuario):
 
     df_lojas_all = carregar_lojas(engine)
     amz_lojas = df_lojas_all[df_lojas_all['marketplace'].str.upper().str.contains('AMAZON')]
-    logisticas_unicas = sorted(df_configs['logistica'].unique().tolist())
 
-    st.caption("Filtrar:")
-    n_cols = len(AMZ_LOJAS_COLS) + len(logisticas_unicas) + 2
-    fc = st.columns(n_cols)
-    filtros_loja = {}
-    for i, lj in enumerate(AMZ_LOJAS_COLS):
-        filtros_loja[lj] = fc[i].checkbox(lj.replace("AMZ-", ""), True, key=f"amz_f_{lj}")
-    log_ativas = []
-    for i, lg in enumerate(logisticas_unicas):
-        ci = len(AMZ_LOJAS_COLS) + i
-        if ci < n_cols - 2 and fc[ci].checkbox(lg, True, key=f"amz_lg_{lg}"):
-            log_ativas.append(lg)
-    show_ref = fc[-2].checkbox("📊 Ref.", False, key="amz_ref")
-
+    show_ref = st.checkbox("📊 Preços Referência", False, key="amz_ref")
     st.caption("DBA: <R$30→R$4,50 | R$30-49,99→R$6,50 | R$50-78,99→R$6,75 | ≥R$79→tabela peso")
     legenda_semaforo()
     termo = filtro_busca("busca_amz")
@@ -716,25 +683,21 @@ def render_tab_amazon(engine, perfil, usuario):
         comp = first.get('comprimento') if pd.notna(first.get('comprimento')) else None
         alt = first.get('altura') if pd.notna(first.get('altura')) else None
         peso_br = first.get('peso_bruto') if pd.notna(first.get('peso_bruto')) else None
-        peso_cub = round((larg * comp * alt) / 6000, 3) if larg and comp and alt else None
         peso_efe = peso_efetivo(larg, comp, alt, peso_br)
-        asin_lojas_list = df_asin_lojas[df_asin_lojas['asin'] == asin]['loja'].tolist()
         titulo = str(first['nome'])[:50] if pd.notna(first.get('nome')) else ''
 
+        # Imposto: usar loja do config ou padrão 10%
+        loja_cfg = first.get('loja', 'AMAZON')
+        lj_info = amz_lojas[amz_lojas['loja'] == loja_cfg]
+        imp_dec = 0.10
+        if not lj_info.empty:
+            ir = float(lj_info.iloc[0].get('imposto', 0) or 0)
+            imp_dec = ir / 100 if ir > 1 else ir
+
         for log in configs_asin['logistica'].unique():
-            if log not in log_ativas: continue
             cfg = configs_asin[configs_asin['logistica'] == log].iloc[0]
             com_cfg = float(cfg.get('comissao_percentual', 0) or 0)
             com_pct = com_cfg * 100 if com_cfg < 1 else com_cfg
-
-            imp_dec = 0.10
-            for lj_nome in AMZ_LOJAS_COLS:
-                if lj_nome in asin_lojas_list:
-                    lj_info = amz_lojas[amz_lojas['loja'] == lj_nome]
-                    if not lj_info.empty:
-                        ir = float(lj_info.iloc[0].get('imposto', 0) or 0)
-                        imp_dec = ir / 100 if ir > 1 else ir
-                    break
 
             sv = df_precos[(df_precos['sku'] == asin) & (df_precos['logistica'] == log)]
             preco = float(sv.iloc[0]['preco_venda']) if not sv.empty and pd.notna(sv.iloc[0]['preco_venda']) else None
@@ -757,16 +720,12 @@ def render_tab_amazon(engine, perfil, usuario):
             ma, mp = calcular_margem(preco, custo, com_pct / 100, tf, imp_dec)
             sinal = semaforo(mp, first.get('margem_minima'), first.get('margem_desejavel'))
 
-            row = {'sinal': sinal, 'asin': asin, 'titulo': titulo, 'sku_nala': sku, 'logistica': log}
-            for lj in AMZ_LOJAS_COLS:
-                row[lj] = lj in asin_lojas_list
-            row.update({'custo': custo, 'mc_esp': mc_des, 'mc_min': mc_min,
-                        'largura': larg, 'comprimento': comp, 'altura': alt,
-                        'peso_bruto': peso_br, 'peso_cubado': peso_cub,
-                        'peso_efetivo': round(peso_efe, 3) if peso_efe else None,
-                        'preco_venda': preco, 'com_pct': round(com_pct, 1),
-                        'taxa_frete': round(tf, 2), 'imp_pct': round(imp_dec * 100, 1),
-                        'mg_pct': mp, 'mg_abs': ma})
+            row = {'sinal': sinal, 'asin': asin, 'titulo': titulo, 'sku_nala': sku, 'logistica': log,
+                   'custo': custo, 'mc_esp': mc_des, 'mc_min': mc_min,
+                   'peso_efetivo': round(peso_efe, 3) if peso_efe else None,
+                   'preco_venda': preco, 'com_pct': round(com_pct, 1),
+                   'taxa_frete': round(tf, 2), 'imp_pct': round(imp_dec * 100, 1),
+                   'mg_pct': mp, 'mg_abs': ma}
             if show_ref:
                 row['ref_min'] = preco_sugerido(custo, com_pct / 100, tf or 6.50, imp_dec, mc_min)
                 row['ref_esp'] = preco_sugerido(custo, com_pct / 100, tf or 6.50, imp_dec, mc_des)
@@ -775,11 +734,6 @@ def render_tab_amazon(engine, perfil, usuario):
     df = pd.DataFrame(rows)
     if df.empty: st.info("Nenhum dado."); return
 
-    lojas_filtro = [lj for lj, a in filtros_loja.items() if a]
-    if lojas_filtro:
-        mask = df[lojas_filtro].any(axis=1) | ~df[AMZ_LOJAS_COLS].any(axis=1)
-        df = df[mask].copy()
-
     df = aplicar_filtro(df, termo, col_sku='asin', col_nome='titulo')
     com_preco = (df['preco_venda'].notna() & (df['preco_venda'] > 0)).sum()
 
@@ -787,30 +741,22 @@ def render_tab_amazon(engine, perfil, usuario):
           'asin': st.column_config.TextColumn("ASIN", disabled=True, width="small"),
           'titulo': st.column_config.TextColumn("Título", disabled=True, width="medium"),
           'sku_nala': st.column_config.TextColumn("SKU", disabled=True, width="small"),
-          'logistica': st.column_config.TextColumn("Log.", disabled=True, width="tiny")}
-    for lj in AMZ_LOJAS_COLS:
-        cc[lj] = st.column_config.CheckboxColumn(lj.replace("AMZ-", ""), width="tiny")
-    cc.update({
-        'largura': st.column_config.NumberColumn("L cm", format="%.1f", min_value=0, width="tiny"),
-        'comprimento': st.column_config.NumberColumn("C cm", format="%.1f", min_value=0, width="tiny"),
-        'altura': st.column_config.NumberColumn("A cm", format="%.1f", min_value=0, width="tiny"),
-        'peso_bruto': st.column_config.NumberColumn("Peso kg", format="%.3f", min_value=0, width="tiny"),
-        'peso_cubado': st.column_config.NumberColumn("Cubado", format="%.3f", disabled=True, width="tiny"),
-        'peso_efetivo': st.column_config.NumberColumn("Efetivo", format="%.3f", disabled=True, width="tiny"),
-        'preco_venda': st.column_config.NumberColumn("🟠 Preço", format="R$ %.2f", min_value=0, width="small"),
-        'com_pct': st.column_config.NumberColumn("Com.%", format="%.1f%%", min_value=0, width="tiny"),
-        'taxa_frete': st.column_config.NumberColumn("Taxa/Frete", format="R$ %.2f", min_value=0, width="small"),
-        'imp_pct': st.column_config.NumberColumn("Imp.%", format="%.1f%%", disabled=True, width="tiny"),
-        'mg_pct': st.column_config.NumberColumn("Margem%", format="%.1f%%", disabled=True, width="small"),
-        'mg_abs': st.column_config.NumberColumn("Margem R$", format="R$ %.2f", disabled=True, width="small")})
+          'logistica': st.column_config.TextColumn("Log.", disabled=True, width="tiny"),
+          'peso_efetivo': st.column_config.NumberColumn("Peso Efet.", format="%.3f", disabled=True, width="tiny"),
+          'preco_venda': st.column_config.NumberColumn("🟠 Preço", format="R$ %.2f", min_value=0, width="small"),
+          'com_pct': st.column_config.NumberColumn("Com.%", format="%.1f%%", min_value=0, width="tiny"),
+          'taxa_frete': st.column_config.NumberColumn("Taxa/Frete", format="R$ %.2f", min_value=0, width="small"),
+          'imp_pct': st.column_config.NumberColumn("Imp.%", format="%.1f%%", disabled=True, width="tiny"),
+          'mg_pct': st.column_config.NumberColumn("Margem%", format="%.1f%%", disabled=True, width="small"),
+          'mg_abs': st.column_config.NumberColumn("Margem R$", format="R$ %.2f", disabled=True, width="small")}
 
-    col_order = ['sinal', 'asin', 'titulo', 'sku_nala', 'logistica'] + AMZ_LOJAS_COLS
+    col_order = ['sinal', 'asin', 'titulo', 'sku_nala', 'logistica']
     if perfil in PERFIS_COM_CUSTO:
         cc['custo'] = st.column_config.NumberColumn("Custo", format="R$ %.2f", disabled=True, width="small")
         cc['mc_esp'] = st.column_config.NumberColumn("MC Esp%", format="%.0f%%", disabled=True, width="tiny")
         cc['mc_min'] = st.column_config.NumberColumn("MC Mín%", format="%.0f%%", disabled=True, width="tiny")
         col_order += ['custo', 'mc_esp', 'mc_min']
-    col_order += ['largura', 'comprimento', 'altura', 'peso_bruto', 'peso_cubado', 'peso_efetivo']
+    col_order.append('peso_efetivo')
     if show_ref:
         cc['ref_min'] = st.column_config.NumberColumn("Ref.Mín", format="R$ %.2f", disabled=True, width="small")
         cc['ref_esp'] = st.column_config.NumberColumn("Ref.Esp", format="R$ %.2f", disabled=True, width="small")
@@ -829,46 +775,23 @@ def render_tab_amazon(engine, perfil, usuario):
     m4.metric("🟢", (edited['sinal'] == '🟢').sum()); m5.metric("🟡", (edited['sinal'] == '🟡').sum())
     m6.metric("🔴", (edited['sinal'] == '🔴').sum())
 
-    bc1, bc2, bc3 = st.columns(3)
+    bc1, bc2 = st.columns(2)
     with bc1:
-        if st.button("💾 Salvar preços+lojas", key="sv_amz"):
-            salvar_asin_lojas_batch(engine, edited)
+        if st.button("💾 Salvar preços Amazon", key="sv_amz"):
             saved = 0
             for _, r in edited.iterrows():
                 pv = r.get('preco_venda')
                 if not pv or pd.isna(pv) or pv <= 0: continue
-                lojas_m = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
-                loja_s = lojas_m[0] if lojas_m else 'AMAZON'
                 saved += salvar_precos(engine, [{'sku': r['asin'], 'preco_venda': pv,
                     'comissao': r.get('com_pct'), 'frete': r.get('taxa_frete'), 'taxa': r.get('taxa_frete')}],
-                    "Amazon", loja_s, r['logistica'], usuario)
-            st.success(f"✅ {saved} salvos!" if saved > 0 else "Flags salvos.")
-            carregar_precos_salvos.clear(); carregar_asin_lojas.clear()
+                    "Amazon", "AMAZON", r['logistica'], usuario)
+            if saved > 0:
+                st.success(f"✅ {saved} salvos!")
+                carregar_precos_salvos.clear()
+            else:
+                st.warning("Nenhum preço válido.")
     with bc2:
         botao_download_xlsx(edited[col_order], "dl_amz", "tabela_Amazon.xlsx")
-    with bc3:
-        with st.expander("📤 Upload em massa"):
-            df_tmpl = df[['asin', 'sku_nala', 'logistica'] + AMZ_LOJAS_COLS].copy()
-            for c in ['preco_venda', 'comissao_pct', 'taxa_frete']: df_tmpl[c] = None
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as w: df_tmpl.to_excel(w, index=False, sheet_name='Amazon')
-            st.download_button("📄 Template", data=buf.getvalue(), file_name="template_Amazon.xlsx", key="tmpl_amz")
-            arq = st.file_uploader("XLSX preenchido", type=["xlsx"], key="file_amz")
-            if arq and st.button("📥 Processar", key="proc_amz"):
-                df_up, err = processar_upload_xlsx(arq, ["asin", "preco_venda"])
-                if err: st.error(f"❌ {err}")
-                else:
-                    saved = 0
-                    for _, r in df_up.iterrows():
-                        pv = r.get('preco_venda')
-                        if pd.isna(pv) or not pv or float(pv) <= 0: continue
-                        lg = str(r.get('logistica', 'DBA')).strip()
-                        lojas_m = [lj for lj in AMZ_LOJAS_COLS if r.get(lj, False)]
-                        saved += salvar_precos(engine, [{'sku': str(r['asin']).strip(), 'preco_venda': float(pv),
-                            'comissao': float(r['comissao_pct']) if pd.notna(r.get('comissao_pct')) else None,
-                            'frete': float(r['taxa_frete']) if pd.notna(r.get('taxa_frete')) else None, 'taxa': None}],
-                            "Amazon", lojas_m[0] if lojas_m else 'AMAZON', lg, usuario)
-                    if saved > 0: st.success(f"✅ {saved} importados!"); carregar_precos_salvos.clear()
 
 
 # ============================================================
@@ -1070,7 +993,7 @@ def render_tab_b2b(engine, perfil, usuario):
 
 def tabela_preco_page():
     st.title("📊 Tabela de Preço")
-    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v4.0")
+    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v4.1")
 
     usuario_dict = st.session_state.get('usuario', {})
     if not usuario_dict or not usuario_dict.get('role'):
