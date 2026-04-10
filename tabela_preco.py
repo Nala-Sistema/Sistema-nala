@@ -271,6 +271,102 @@ def processar_upload_xlsx(arquivo, colunas_esperadas):
         return None, str(e)
 
 # ============================================================
+# RECÁLCULO EM TEMPO REAL (aplica edições do data_editor)
+# ============================================================
+
+def recalcular_margens(df, editor_key, imp_dec, extra=0, modo='simples'):
+    """
+    Recalcula margens baseado em edições pendentes no st.data_editor.
+    Isso permite que o usuário veja a margem atualizada ao digitar o preço,
+    sem precisar salvar no banco.
+
+    modo='ml' → duas colunas preco_cl/preco_pr
+    modo='shopee' → regra escalonada
+    modo='simples' → uma coluna preco_venda (Amazon, Genérico)
+    modo='b2b' → inclui maquina_pct no cálculo
+    """
+    if editor_key not in st.session_state:
+        return df
+    state = st.session_state[editor_key]
+    edits = state.get("edited_rows", {}) if isinstance(state, dict) else {}
+    if not edits:
+        return df
+
+    df = df.copy()
+    for row_str, changes in edits.items():
+        idx = int(row_str)
+        if idx >= len(df):
+            continue
+        # Aplicar todas as mudanças à linha
+        for col, val in changes.items():
+            if col in df.columns:
+                df.at[df.index[idx], col] = val
+
+        r = df.iloc[idx]
+        custo = r.get('custo', 0) or 0
+        mc_min_val = r.get('mc_min', 0) or 0
+        mc_esp_val = r.get('mc_esp', 0) or 0
+
+        if modo == 'ml':
+            # Recalcular Clássico
+            pc = r.get('preco_cl')
+            if pc and not pd.isna(pc) and pc > 0:
+                com_cl = (r.get('com_cl') or 11.5) / 100
+                tf_cl = r.get('tf_cl') or 6.75
+                ma_cl, mp_cl = calcular_margem(pc, custo, com_cl, tf_cl, imp_dec, extra)
+                df.at[df.index[idx], 'mg_cl'] = mp_cl
+                df.at[df.index[idx], 'mg_abs_cl'] = ma_cl
+                df.at[df.index[idx], 'sinal'] = semaforo(mp_cl, mc_min_val, mc_esp_val)
+
+            # Recalcular Premium
+            pp = r.get('preco_pr')
+            if pp and not pd.isna(pp) and pp > 0:
+                com_pr = (r.get('com_pr') or 16.5) / 100
+                tf_pr = r.get('tf_pr') or 6.75
+                ma_pr, mp_pr = calcular_margem(pp, custo, com_pr, tf_pr, imp_dec, extra)
+                df.at[df.index[idx], 'mg_pr'] = mp_pr
+                df.at[df.index[idx], 'mg_abs_pr'] = ma_pr
+
+        elif modo == 'shopee':
+            preco = r.get('preco_venda')
+            if preco and not pd.isna(preco) and preco > 0:
+                if preco <= 79.99: com, taxa = 20.0, 4.0
+                elif preco <= 99.99: com, taxa = 14.0, 16.0
+                elif preco <= 199.99: com, taxa = 14.0, 20.0
+                else: com, taxa = 14.0, 26.0
+                df.at[df.index[idx], 'com_pct'] = com
+                df.at[df.index[idx], 'taxa_fixa'] = taxa
+                ma, mp = calcular_margem(preco, custo, com / 100, taxa, imp_dec)
+                df.at[df.index[idx], 'mg_pct'] = mp
+                df.at[df.index[idx], 'mg_abs'] = ma
+                df.at[df.index[idx], 'sinal'] = semaforo(mp, mc_min_val, mc_esp_val)
+
+        elif modo == 'b2b':
+            preco = r.get('preco_venda')
+            if preco and not pd.isna(preco) and preco > 0:
+                com_total = ((r.get('com_pct') or 0) + (r.get('maquina_pct') or 0)) / 100
+                row_imp = (r.get('imp_pct') or 0) / 100 if 'imp_pct' in df.columns and pd.notna(r.get('imp_pct')) else imp_dec
+                ma, mp = calcular_margem(preco, custo, com_total, 0, row_imp)
+                df.at[df.index[idx], 'mg_pct'] = mp
+                df.at[df.index[idx], 'mg_abs'] = ma
+                df.at[df.index[idx], 'sinal'] = semaforo(mp, mc_min_val, mc_esp_val)
+
+        else:  # simples (Amazon, Genérico)
+            preco = r.get('preco_venda')
+            if preco and not pd.isna(preco) and preco > 0:
+                com = (r.get('com_pct') or 0) / 100
+                taxa = r.get('taxa_frete') if 'taxa_frete' in df.columns else (r.get('taxa_fixa') or 0)
+                # Usar imposto da linha se disponível (Amazon tem imp variável por ASIN)
+                row_imp = (r.get('imp_pct') or 0) / 100 if 'imp_pct' in df.columns and pd.notna(r.get('imp_pct')) else imp_dec
+                ma, mp = calcular_margem(preco, custo, com, taxa or 0, row_imp, extra)
+                df.at[df.index[idx], 'mg_pct'] = mp
+                df.at[df.index[idx], 'mg_abs'] = ma
+                df.at[df.index[idx], 'sinal'] = semaforo(mp, mc_min_val, mc_esp_val)
+
+    return df
+
+
+# ============================================================
 # SALVAR
 # ============================================================
 
@@ -510,6 +606,9 @@ def render_tab_ml(engine, perfil, usuario):
                 if c not in col_order and c not in cc:
                     cc[c] = None
 
+            # Recalcular margens com edições pendentes
+            df = recalcular_margens(df, f"ed_ml_{loja}", imp_dec, extra, modo='ml')
+
             edited = st.data_editor(df, column_config=cc, column_order=col_order,
                                      use_container_width=True, hide_index=True,
                                      num_rows="fixed", height=EDITOR_HEIGHT, key=f"ed_ml_{loja}")
@@ -631,6 +730,9 @@ def render_tab_shopee(engine, perfil, usuario):
                 col_order += ['ref_min', 'ref_esp']
             col_order += ['preco_venda', 'com_pct', 'taxa_fixa', 'mg_pct']
             if perfil in PERFIS_COM_CUSTO: col_order.append('mg_abs')
+
+            # Recalcular margens com edições pendentes
+            df = recalcular_margens(df, f"ed_sp_{loja}", imp_dec, modo='shopee')
 
             edited = st.data_editor(df, column_config=cc, column_order=col_order,
                                      use_container_width=True, hide_index=True,
@@ -764,6 +866,9 @@ def render_tab_amazon(engine, perfil, usuario):
     col_order += ['preco_venda', 'com_pct', 'taxa_frete', 'imp_pct', 'mg_pct']
     if perfil in PERFIS_COM_CUSTO: col_order.append('mg_abs')
 
+    # Recalcular margens com edições pendentes
+    df = recalcular_margens(df, "ed_amazon", imp_dec, modo='simples')
+
     edited = st.data_editor(df, column_config=cc, column_order=col_order,
                              use_container_width=True, hide_index=True,
                              num_rows="fixed", height=EDITOR_HEIGHT, key="ed_amazon")
@@ -877,6 +982,9 @@ def render_tab_generica(engine, perfil, usuario, marketplace, logisticas_config)
                 col_order += ['preco_venda', 'com_pct', 'taxa_fixa', 'mg_pct']
                 if perfil in PERFIS_COM_CUSTO: col_order.append('mg_abs')
 
+                # Recalcular margens com edições pendentes
+                df = recalcular_margens(df, f"ed_{marketplace}_{lconf['nome']}_{loja}", imp_dec, modo='simples')
+
                 edited = st.data_editor(df, column_config=cc, column_order=col_order,
                                          use_container_width=True, hide_index=True,
                                          num_rows="fixed", height=EDITOR_HEIGHT, key=f"ed_{marketplace}_{lconf['nome']}_{loja}")
@@ -972,6 +1080,9 @@ def render_tab_b2b(engine, perfil, usuario):
             col_order += ['preco_base', 'preco_venda', 'com_pct', 'maquina_pct', 'imp_pct', 'mg_pct']
             if perfil in PERFIS_COM_CUSTO: col_order.append('mg_abs')
 
+            # Recalcular margens com edições pendentes
+            df = recalcular_margens(df, f"ed_b2b_{ci}", imp_dec, modo='b2b')
+
             edited = st.data_editor(df, column_config=cc, column_order=col_order,
                                      use_container_width=True, hide_index=True,
                                      num_rows="fixed", height=EDITOR_HEIGHT, key=f"ed_b2b_{ci}")
@@ -993,7 +1104,7 @@ def render_tab_b2b(engine, perfil, usuario):
 
 def tabela_preco_page():
     st.title("📊 Tabela de Preço")
-    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v4.1")
+    st.caption("Grade de precificação estratégica — simule preços e veja margens por marketplace • v4.2")
 
     usuario_dict = st.session_state.get('usuario', {})
     if not usuario_dict or not usuario_dict.get('role'):
