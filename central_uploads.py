@@ -1,5 +1,10 @@
 """
 CENTRAL DE UPLOADS - Sistema Nala
+VERSAO 3.7 (14/04/2026):
+  - PERF: Cache em leituras de dim_lojas, dim_produtos, dim_tags_anuncio (TTL 5min)
+  - PERF: Vendas Consolidadas com botão "Filtrar" — query pesada só roda no clique
+  - PERF: Widgets de upload resetam automaticamente após GRAVAR (counter key)
+
 VERSAO 3.6 (25/03/2026):
   - NOVO: Botão "Excluir Selecionadas" nas seções de pendentes (SKU + Divergência)
   - FIX: Dicionário de itens na seção Divergência agora passa tarifa_fixa corretamente
@@ -38,6 +43,57 @@ from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 from processar_amazon import processar_arquivo_amazon, gravar_vendas_amazon
 from processar_shein import processar_arquivo_shein, gravar_vendas_shein
 from processar_magalu import processar_arquivo_magalu, gravar_vendas_magalu
+
+
+# ============================================================
+# v3.7: CACHE DE TABELAS DIMENSIONAIS (TTL 5 min)
+# Evita queries repetitivas em dim_lojas, dim_produtos, dim_tags_anuncio
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_dim_lojas():
+    """Retorna DataFrame completo de dim_lojas. Cache 5 min."""
+    engine = get_engine()
+    try:
+        return pd.read_sql("SELECT marketplace, loja, imposto FROM dim_lojas", engine)
+    except Exception:
+        return pd.DataFrame(columns=['marketplace', 'loja', 'imposto'])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_nomes_produtos():
+    """Retorna dict sku → nome de produtos ativos. Cache 5 min."""
+    engine = get_engine()
+    nomes = {}
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
+        for row in cursor.fetchall():
+            nomes[row[0]] = row[1] or ''
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+    return nomes
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_tags_anuncio():
+    """Retorna dict (marketplace, codigo_anuncio) → {curva, tag}. Cache 5 min."""
+    engine = get_engine()
+    tags = {}
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT marketplace, codigo_anuncio, tag_curva, tag_status FROM dim_tags_anuncio")
+        for row in cursor.fetchall():
+            tags[(row[0], row[1])] = {'curva': row[2] or '', 'tag': row[3] or ''}
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+    return tags
 
 
 # ============================================================
@@ -105,12 +161,14 @@ def _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=None, l
 
 # ============================================================
 # v3.5: ENRIQUECER VENDAS COM TAGS (Curva ABC + Tag Manual)
+# v3.7: Usa caches em vez de queries diretas
 # ============================================================
 
 def _enriquecer_com_tags(engine, df):
     """
     Adiciona colunas 'curva', 'tag' e 'produto' ao DataFrame de vendas.
     Usa mapeamento por dict (NÃO merge) para evitar duplicação de linhas.
+    v3.7: Usa _cached_nomes_produtos() e _cached_tags_anuncio().
     """
     n_original = len(df)
 
@@ -128,33 +186,12 @@ def _enriquecer_com_tags(engine, df):
     if mask_magalu.any():
         df.loc[mask_magalu, 'codigo_anuncio'] = df.loc[mask_magalu, 'sku']
 
-    # 1. Nomes dos produtos (dict: sku → nome)
-    nomes = {}
-    try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
-        for row in cursor.fetchall():
-            nomes[row[0]] = row[1] or ''
-        cursor.close()
-        conn.close()
-    except Exception:
-        pass
+    # 1. Nomes dos produtos (cache)
+    nomes = _cached_nomes_produtos()
     df['produto'] = df['sku'].map(nomes).fillna('')
 
-    # 2. Tags (dict: (marketplace, codigo_anuncio) → {curva, tag})
-    tags = {}
-    try:
-        conn = engine.raw_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT marketplace, codigo_anuncio, tag_curva, tag_status FROM dim_tags_anuncio")
-        for row in cursor.fetchall():
-            tags[(row[0], row[1])] = {'curva': row[2] or '', 'tag': row[3] or ''}
-        cursor.close()
-        conn.close()
-    except Exception:
-        pass
-
+    # 2. Tags (cache)
+    tags = _cached_tags_anuncio()
     df['curva'] = df.apply(lambda r: tags.get((r['marketplace_origem'], r['codigo_anuncio']), {}).get('curva', ''), axis=1)
     df['tag'] = df.apply(lambda r: tags.get((r['marketplace_origem'], r['codigo_anuncio']), {}).get('tag', ''), axis=1)
 
@@ -522,21 +559,37 @@ def _salvar_correcao_venda(engine, venda_id, campos_alterados):
 
 
 # ============================================================
+# v3.7: HELPER — Counter para resetar widgets de upload
+# ============================================================
+
+def _get_upload_counter():
+    """Retorna o counter atual para gerar keys únicas nos widgets de upload."""
+    if 'upload_widget_counter' not in st.session_state:
+        st.session_state['upload_widget_counter'] = 0
+    return st.session_state['upload_widget_counter']
+
+
+def _increment_upload_counter():
+    """Incrementa o counter, forçando reset dos widgets de upload no próximo rerun."""
+    st.session_state['upload_widget_counter'] = _get_upload_counter() + 1
+
+
+# ============================================================
 # TAB 1: PROCESSAR UPLOAD
+# v3.7: Usa _cached_dim_lojas() + counter keys para reset
 # ============================================================
 
 def tab_processar_upload(engine):
-    try:
-        df_lojas = pd.read_sql("SELECT marketplace, loja, imposto FROM dim_lojas", engine)
-    except Exception:
-        st.error("⚠️ Erro ao carregar lojas."); return
+    df_lojas = _cached_dim_lojas()
     if df_lojas.empty:
         st.warning("⚠️ Cadastre lojas no módulo Config primeiro."); return
 
+    uc = _get_upload_counter()
+
     col1, col2, col3 = st.columns(3)
-    mktp = col1.selectbox("Marketplace:", sorted(df_lojas['marketplace'].unique()))
+    mktp = col1.selectbox("Marketplace:", sorted(df_lojas['marketplace'].unique()), key=f"up_mktp_{uc}")
     lojas = df_lojas[df_lojas['marketplace'] == mktp]['loja'].tolist()
-    loja = col2.selectbox("Loja:", lojas)
+    loja = col2.selectbox("Loja:", lojas, key=f"up_loja_{uc}")
     imposto = df_lojas[df_lojas['loja'] == loja]['imposto'].values[0]
     st.info(f"📍 {loja} | Imposto: {formatar_percentual(imposto)}")
 
@@ -548,8 +601,8 @@ def tab_processar_upload(engine):
     if mp == 'AMAZON':
         st.markdown("**📅 Período do Relatório (obrigatório para Amazon)**")
         col_d1, col_d2 = st.columns(2)
-        data_ini = col_d1.date_input("Data Início:", value=None, key="periodo_data_ini")
-        data_fim = col_d2.date_input("Data Fim:", value=None, key="periodo_data_fim")
+        data_ini = col_d1.date_input("Data Início:", value=None, key=f"periodo_data_ini_{uc}")
+        data_fim = col_d2.date_input("Data Fim:", value=None, key=f"periodo_data_fim_{uc}")
         if not data_ini or not data_fim:
             st.warning("⚠️ Selecione as datas para continuar."); return
         if data_ini > data_fim:
@@ -565,12 +618,12 @@ def tab_processar_upload(engine):
     if mp == 'MAGALU':
         st.markdown("**📂 A Magalu requer dois relatórios:**")
         col_up1, col_up2 = st.columns(2)
-        arquivo_pedidos = col_up1.file_uploader("📋 Relatório de PEDIDOS (CSV)", type=['csv'], key="mglu_pedidos")
-        arquivo_pacotes = col_up2.file_uploader("📦 Relatório de PACOTES (CSV)", type=['csv'], key="mglu_pacotes")
+        arquivo_pedidos = col_up1.file_uploader("📋 Relatório de PEDIDOS (CSV)", type=['csv'], key=f"mglu_pedidos_{uc}")
+        arquivo_pacotes = col_up2.file_uploader("📦 Relatório de PACOTES (CSV)", type=['csv'], key=f"mglu_pacotes_{uc}")
         arquivo = arquivo_pedidos
         arquivos_ok = arquivo_pedidos is not None and arquivo_pacotes is not None
     else:
-        arquivo = st.file_uploader(f"📂 Upload do arquivo de vendas", type=tipos)
+        arquivo = st.file_uploader(f"📂 Upload do arquivo de vendas", type=tipos, key=f"up_arquivo_{uc}")
         arquivo_pedidos = None; arquivo_pacotes = None
         arquivos_ok = arquivo is not None
 
@@ -692,8 +745,6 @@ def tab_processar_upload(engine):
                     st.error("⚠️ Processador não identificado."); return
 
                 # ─── v3.4: DETECÇÃO DE DEVOLUÇÕES ───
-                # Compara descartes com vendas existentes no banco.
-                # Se pedido existia e agora veio como devolvido/cancelado → move p/ fact_devolucoes
                 devolvidos = 0
                 descartes_list = info.get('descartes', [])
                 if descartes_list:
@@ -722,7 +773,6 @@ def tab_processar_upload(engine):
                 if pendentes > 0: st.warning(f"⏳ {pendentes} pendente(s) — veja tab Vendas Pendentes")
                 if descartadas > 0: st.info(f"🗑️ {descartadas} cancelada(s)/devolvida(s) rastreadas")
                 if atualizados > 0: st.info(f"🔄 {atualizados} registro(s) do período substituídos")
-                # ─── v3.4: Feedback devoluções ───
                 if devolvidos > 0:
                     st.warning(f"↩️ {devolvidos} pedido(s) movido(s) para devoluções (status mudou de entregue → devolvido/cancelado)")
                 if erros > 0: st.warning(f"⚠️ {erros} linha(s) com erro")
@@ -734,16 +784,22 @@ def tab_processar_upload(engine):
                     try: recalcular_curva_abc(engine, dias=30)
                     except: pass
 
+                # v3.7: Limpa preview E incrementa counter para resetar widgets
                 for key in ['df_proc','info','mktp','mp_key','loja','arquivo_nome','data_ini','data_fim']:
                     st.session_state.pop(key, None)
+                _increment_upload_counter()
 
 
 # ============================================================
 # TAB 2: VENDAS CONSOLIDADAS (com correções pontuais v3.4)
+# v3.7: Botão "Filtrar" — query pesada só roda no clique
 # ============================================================
 
 def tab_vendas_consolidadas(engine):
     st.subheader("📊 Vendas Consolidadas")
+
+    # ─── FILTROS (interativos, sem form) ───
+    df_lojas = _cached_dim_lojas()
 
     col1, col2, col3 = st.columns(3)
     periodo = col1.selectbox("Período:", ["Hoje","Ontem","Últimos 7 dias","Últimos 15 dias","Últimos 30 dias","Personalizado"])
@@ -761,7 +817,6 @@ def tab_vendas_consolidadas(engine):
         col3.caption(f"Selecionado: {data_fim.strftime('%d/%m/%Y')}")
 
     col_f1, col_f2 = st.columns(2)
-    df_lojas = pd.read_sql("SELECT DISTINCT marketplace, loja FROM dim_lojas", engine)
     mktp_filtro = col_f1.selectbox("Marketplace:", ["Todos"] + sorted(df_lojas['marketplace'].unique().tolist()))
     lojas_disp = df_lojas[df_lojas['marketplace'] == mktp_filtro]['loja'].tolist() if mktp_filtro != "Todos" else df_lojas['loja'].tolist()
     loja_filtro = col_f2.selectbox("Loja:", ["Todas"] + sorted(lojas_disp))
@@ -788,12 +843,33 @@ def tab_vendas_consolidadas(engine):
     if texto_busca.strip() and not skus_sel:
         st.warning("⚠️ Selecione pelo menos um SKU."); return
 
-    df_vendas = _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=mktp_p, loja=loja_p, skus=skus_p)
-    if df_vendas.empty:
-        st.warning("⚠️ Nenhuma venda encontrada."); return
+    # ─── v3.7: BOTÃO FILTRAR — query pesada só roda aqui ───
+    if st.button("🔍 Filtrar", type="primary", key="btn_filtrar_consolidadas"):
+        with st.spinner("Buscando vendas..."):
+            df_vendas = _buscar_vendas_parametrizada(engine, data_ini, data_fim, marketplace=mktp_p, loja=loja_p, skus=skus_p)
+            if df_vendas.empty:
+                st.session_state.pop('vendas_consolidadas', None)
+                st.session_state.pop('vendas_consolidadas_params', None)
+                st.warning("⚠️ Nenhuma venda encontrada."); return
+            df_vendas = _enriquecer_com_tags(engine, df_vendas)
+            st.session_state['vendas_consolidadas'] = df_vendas
+            st.session_state['vendas_consolidadas_params'] = {
+                'data_ini': data_ini, 'data_fim': data_fim,
+                'mktp_p': mktp_p, 'loja_p': loja_p, 'skus_p': skus_p,
+            }
 
-    # ─── v3.5: ENRIQUECER COM TAGS ───
-    df_vendas = _enriquecer_com_tags(engine, df_vendas)
+    # ─── EXIBIÇÃO: usa dados do session_state ───
+    if 'vendas_consolidadas' not in st.session_state:
+        st.info("Selecione os filtros e clique em **🔍 Filtrar** para carregar as vendas.")
+        return
+
+    df_vendas = st.session_state['vendas_consolidadas']
+    params_cons = st.session_state.get('vendas_consolidadas_params', {})
+    data_ini = params_cons.get('data_ini', hoje)
+    data_fim = params_cons.get('data_fim', hoje)
+    mktp_p = params_cons.get('mktp_p')
+    loja_p = params_cons.get('loja_p')
+    skus_p = params_cons.get('skus_p')
 
     df_cc = df_vendas[df_vendas['custo_total'] > 0]
     df_sc = df_vendas[df_vendas['custo_total'] == 0]
@@ -825,7 +901,6 @@ def tab_vendas_consolidadas(engine):
     df_d['margem_percentual'] = df_d['margem_percentual'].apply(formatar_percentual)
 
     # v3.5: Coluna pedido_original com fallback para numero_pedido
-    # Amazon (relatório agregado) mostra "-"
     if 'pedido_original' in df_d.columns:
         df_d['pedido_original'] = df_d.apply(
             lambda r: str(r['pedido_original']) if pd.notna(r['pedido_original']) and str(r['pedido_original']).strip() not in ('', 'None', 'nan')
@@ -865,7 +940,7 @@ def tab_vendas_consolidadas(engine):
             cols.remove('pedido_original')
             pos = cols.index('loja_origem') + 1
             cols.insert(pos, 'pedido_original')
-            df_e = df_e[cols]  
+            df_e = df_e[cols]
         for col in ['preco_venda','valor_venda_efetivo','custo_unitario','custo_total','imposto','comissao','frete','total_tarifas','valor_liquido','margem_total']:
             if col in df_e.columns: df_e[col] = df_e[col].apply(lambda x: f"{float(x):.2f}".replace('.',','))
         if 'margem_percentual' in df_e.columns: df_e['margem_percentual'] = df_e['margem_percentual'].apply(lambda x: f"{float(x):.2f}".replace('.',','))
@@ -936,6 +1011,8 @@ def tab_vendas_consolidadas(engine):
                 if ok:
                     st.success(f"✅ {msg}")
                     st.session_state.pop('venda_correcao', None)
+                    # Limpa cache de consolidadas para refletir a correção
+                    st.session_state.pop('vendas_consolidadas', None)
                     try: recalcular_curva_abc(engine, dias=30)
                     except: pass
                     st.rerun()
@@ -966,14 +1043,15 @@ def tab_vendas_consolidadas(engine):
                             conn = engine.raw_connection(); cursor = conn.cursor()
                             cursor.execute(f"DELETE FROM fact_vendas_snapshot WHERE id IN ({','.join(['%s']*len(ids))})", ids)
                             conn.commit(); cursor.close(); conn.close()
+                            st.session_state.pop('vendas_consolidadas', None)
                             st.success(f"✅ Excluído!"); st.rerun()
                         except Exception as e: st.error(f"❌ {e}")
                     else: st.warning("Confirme antes.")
         else:
             st.error("⛔ Apaga TODAS as vendas do marketplace!")
-            df_ld = pd.read_sql("SELECT DISTINCT marketplace FROM dim_lojas", engine)
+            df_ld = _cached_dim_lojas()
             c1, c2 = st.columns(2)
-            cd = c1.text_input("Digite 'DELETAR':"); md = c2.selectbox("Marketplace:", [""]+df_ld['marketplace'].tolist())
+            cd = c1.text_input("Digite 'DELETAR':"); md = c2.selectbox("Marketplace:", [""]+sorted(df_ld['marketplace'].unique().tolist()))
             if st.button("🗑️ DELETAR TUDO", type="secondary"):
                 if cd == "DELETAR" and md:
                     try:
@@ -982,6 +1060,7 @@ def tab_vendas_consolidadas(engine):
                         d = cursor.rowcount
                         cursor.execute("DELETE FROM log_uploads WHERE marketplace = %s", (md,))
                         conn.commit(); cursor.close(); conn.close()
+                        st.session_state.pop('vendas_consolidadas', None)
                         st.success(f"✅ {d} vendas deletadas!"); st.rerun()
                     except Exception as e: st.error(f"❌ {e}")
 
@@ -1053,6 +1132,7 @@ def tab_historico_uploads(engine):
                 )
                 if ok:
                     st.success(f"✅ {msg}")
+                    st.session_state.pop('vendas_consolidadas', None)
                     try: recalcular_curva_abc(engine, dias=30)
                     except: pass
                     st.rerun()
@@ -1074,14 +1154,9 @@ def tab_historico_uploads(engine):
         if sel_repr_label:
             sel_r = opcoes_repr[sel_repr_label]
 
-            # Carrega lojas do mesmo marketplace para destino
-            try:
-                df_lojas_mktp = pd.read_sql(
-                    "SELECT loja, imposto FROM dim_lojas WHERE marketplace = %s",
-                    engine, params=(sel_r['marketplace'],)
-                )
-            except:
-                df_lojas_mktp = pd.DataFrame(columns=['loja','imposto'])
+            # v3.7: Usa cache de lojas
+            df_lojas_all = _cached_dim_lojas()
+            df_lojas_mktp = df_lojas_all[df_lojas_all['marketplace'] == sel_r['marketplace']]
 
             if df_lojas_mktp.empty:
                 st.warning("Nenhuma outra loja cadastrada neste marketplace."); return
@@ -1122,6 +1197,7 @@ def tab_historico_uploads(engine):
                     )
                     if ok:
                         st.success(f"✅ {msg}")
+                        st.session_state.pop('vendas_consolidadas', None)
                         try: recalcular_curva_abc(engine, dias=30)
                         except: pass
                         st.rerun()
@@ -1146,7 +1222,6 @@ def tab_historico_uploads(engine):
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Total Devoluções", formatar_quantidade(len(df_dev)))
-                # Precisamos dos valores brutos para somar — refaz query simples
                 try:
                     df_soma = pd.read_sql("SELECT COALESCE(SUM(valor_venda_efetivo),0) as total FROM fact_devolucoes", engine)
                     c2.metric("Valor Total", formatar_valor(df_soma['total'].iloc[0]))
@@ -1316,7 +1391,7 @@ def _exibir_historico(engine):
 
 def main():
     st.title("💰 Central de Vendas")
-    st.caption("v3.6 — excluir pendentes + fix tarifa_fixa divergência")
+    st.caption("v3.7 — cache dimensional + filtrar por botão + reset upload")
     engine = get_engine()
     t1, t2, t3, t4 = st.tabs(["📤 Processar Upload","📊 Vendas Consolidadas","📚 Histórico","⏳ Vendas Pendentes"])
     with t1: tab_processar_upload(engine)
