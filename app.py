@@ -383,13 +383,18 @@ def _buscar_panorama_lojas(engine):
         cursor = conn.cursor()
 
         # Filtro RBAC
-        where_loja = ""
+        # FIX: Duas versões — sem alias para a CTE, com alias "f." para o SELECT principal.
+        # Sem isso, o JOIN entre fact_vendas_snapshot f e max_dates md torna
+        # "loja_origem" ambíguo para perfis GESTOR/DIRETOR (ADMIN não aplica filtro).
+        where_loja_cte = ""
+        where_loja_main = ""
         params_loja = []
         if not ve_todas_lojas():
             lojas = get_lojas_usuario(engine)
             if lojas:
                 placeholders = ', '.join(['%s'] * len(lojas))
-                where_loja = f" AND loja_origem IN ({placeholders})"
+                where_loja_cte = f" AND loja_origem IN ({placeholders})"
+                where_loja_main = f" AND f.loja_origem IN ({placeholders})"
                 params_loja = list(lojas)
 
         query = f"""
@@ -397,7 +402,7 @@ def _buscar_panorama_lojas(engine):
                 SELECT loja_origem,
                        MAX(data_venda) FILTER (WHERE data_venda >= %s) AS max_mes_atual
                 FROM fact_vendas_snapshot
-                WHERE 1=1 {where_loja}
+                WHERE 1=1 {where_loja_cte}
                 GROUP BY loja_origem
             )
             SELECT
@@ -413,7 +418,7 @@ def _buscar_panorama_lojas(engine):
                 ), 0)                                                                                    AS fat_ant_prop
             FROM fact_vendas_snapshot f
             LEFT JOIN max_dates md ON f.loja_origem = md.loja_origem
-            WHERE 1=1 {where_loja}
+            WHERE 1=1 {where_loja_main}
             GROUP BY f.loja_origem, md.max_mes_atual
             ORDER BY f.loja_origem
         """
