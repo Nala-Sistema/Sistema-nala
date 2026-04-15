@@ -538,12 +538,13 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
             return 'background-color: #FEF3C7; font-weight: bold; color: #92400E'
         return 'background-color: #FEE2E2; font-weight: bold; color: #991B1B'
 
-    # Data editor
+    # Data editor (height para ~16 linhas visíveis)
     df_editado = st.data_editor(
         df_display,
         column_config=col_config,
         hide_index=True,
         use_container_width=True,
+        height=600,
         key=f"editor_{loja}_{ano_mes}",
         num_rows="fixed",
     )
