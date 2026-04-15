@@ -1,11 +1,18 @@
 """
 PERFORMANCE UTILS - Sistema Nala
-Versão: 1.1 (06/04/2026)
+Versão: 1.2 (14/04/2026)
 
 Funções auxiliares para o módulo Performance:
 - Modelos de projeção (Linear, Início Forte, Meio Forte, Final Fraco)
 - Queries de vendas, metas, tags, histórico
 - Cálculos de projeção, performance, margem
+
+VERSÃO 1.2 (14/04/2026):
+  - NOVO: buscar_ultimo_dia_vendas — busca MAX(data_venda) por loja/mês
+  - get_dias_vendas aceita data_ref opcional (em vez de sempre usar today)
+  - construir_tabela_performance aceita dias_vendas/dias_mes opcionais
+  - Projeção e performance agora calculados com base nos dias reais de vendas
+    lançadas, não no dia corrente do calendário
 
 VERSÃO 1.1 (06/04/2026):
   - Regra dos 3 Meses: construir_tabela_performance agora inclui anúncios
@@ -110,14 +117,23 @@ def get_mes_anterior(ano_mes_str, meses=1):
     return f"{ano:04d}-{mes:02d}"
 
 
-def get_dias_vendas(ano_mes_str):
-    """Retorna (dias_vendas, dias_mes) para o mês."""
+def get_dias_vendas(ano_mes_str, data_ref=None):
+    """
+    Retorna (dias_vendas, dias_mes) para o mês.
+    Se data_ref fornecida, usa essa data como último dia com vendas
+    em vez de date.today().
+    """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes_str)
-    hoje = date.today()
     dias_mes = ultimo.day
-    if hoje.year == primeiro.year and hoje.month == primeiro.month:
-        dias_vendas = (hoje - primeiro).days + 1
-    elif hoje > ultimo:
+
+    ref = data_ref or date.today()
+    # Garantir que ref é date (não datetime)
+    if isinstance(ref, datetime):
+        ref = ref.date()
+
+    if ref >= primeiro and ref <= ultimo:
+        dias_vendas = (ref - primeiro).days + 1
+    elif ref > ultimo:
         dias_vendas = dias_mes
     else:
         dias_vendas = 0
@@ -183,6 +199,31 @@ def buscar_todas_lojas(engine):
     """Retorna DataFrame com todas as lojas."""
     return _raw_query(engine,
         "SELECT loja, marketplace FROM dim_lojas ORDER BY marketplace, loja")
+
+
+# ============================================================
+# QUERIES — ÚLTIMO DIA DE VENDAS LANÇADAS
+# ============================================================
+
+def buscar_ultimo_dia_vendas(engine, loja, ano_mes):
+    """
+    Retorna a data (date) da última venda lançada no mês para a loja.
+    Retorna None se não houver vendas no mês.
+    """
+    primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
+    df = _raw_query(engine,
+        """SELECT MAX(data_venda) as ultima_data
+           FROM fact_vendas_snapshot
+           WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s""",
+        (loja, primeiro, ultimo))
+    if df.empty or df.iloc[0]['ultima_data'] is None:
+        return None
+    val = df.iloc[0]['ultima_data']
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    return None
 
 
 # ============================================================
@@ -515,6 +556,8 @@ def buscar_nomes_produtos(engine):
     if df.empty:
         return {}
     return {row['sku']: row['nome'] for _, row in df.iterrows()}
+
+
 def buscar_skus_config_amazon(engine):
     """Retorna dict: {asin: sku} da dim_config_marketplace Amazon."""
     df = _raw_query(engine,
@@ -563,10 +606,14 @@ def buscar_resumo_geral(engine, ano_mes):
 # CONSTRUIR DATAFRAME COMPLETO DE PERFORMANCE
 # ============================================================
 
-def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_projecao='Linear'):
+def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_projecao='Linear',
+                                 dias_vendas_override=None, dias_mes_override=None):
     """
     Constrói o DataFrame completo de performance para uma loja/mês.
     Retorna DataFrame com todas as colunas para exibição.
+
+    v1.2 — Aceita dias_vendas_override e dias_mes_override para usar
+    dias baseados na última venda lançada (em vez de date.today()).
 
     v1.1 — REGRA DOS 3 MESES: O universo de anúncios agora inclui todos os
     anúncios que tiveram vendas nos 3 meses anteriores, além do mês atual
@@ -574,7 +621,14 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
     fique vazia e permita preencher metas preventivamente.
     """
     is_amazon = 'AMAZON' in marketplace.upper()
-    dias_vendas, dias_mes = get_dias_vendas(ano_mes)
+
+    # Usar dias override se fornecidos, senão fallback para buscar da loja
+    if dias_vendas_override is not None and dias_mes_override is not None:
+        dias_vendas = dias_vendas_override
+        dias_mes = dias_mes_override
+    else:
+        ultima_data = buscar_ultimo_dia_vendas(engine, loja, ano_mes)
+        dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
 
     # 1. Realizados do mês (vendas - devoluções)
     df_real = buscar_realizados_mes(engine, loja, ano_mes, marketplace)
@@ -625,10 +679,10 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
                     anuncios.add((h['codigo_anuncio'], h.get('sku', ''), log))
                     codigos_existentes.add((h['codigo_anuncio'], log))
     # ── FIM REGRA DOS 3 MESES ─────────────────────────────────
-  
+
     # Fallback: SKUs da config Amazon para ASINs sem venda no snapshot
     config_skus = buscar_skus_config_amazon(engine) if is_amazon else {}
-  
+
     if not anuncios:
         return pd.DataFrame()
 
