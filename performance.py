@@ -1,6 +1,6 @@
 """
 PERFORMANCE - Sistema Nala
-Versão: 1.3 (06/04/2026)
+Versão: 1.5 (14/04/2026)
 
 Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Tabs por marketplace + tab Geral
@@ -8,6 +8,12 @@ Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Projeção com 4 modelos + indicadores visuais de performance
 - Histórico de 3 meses como colunas expandíveis
 - Integração com tags (Curva ABC + Status manual)
+
+VERSÃO 1.5 (14/04/2026):
+  - FIX: dias_vendas agora baseado na última venda lançada por loja
+    (não mais date.today()), afetando projeção e performance
+  - Caption global removido; caption "Vendas lançadas até..." por loja
+  - Help do seletor de modelo agora mostra descrição de todos os modelos
 
 VERSÃO 1.4 (06/04/2026):
   - NOVO: Template XLSX e tabela visual agora mostram vendas do mês anterior
@@ -35,7 +41,8 @@ from performance_utils import (
     buscar_lojas_por_marketplace, buscar_meta_loja, salvar_meta_loja,
     buscar_metas_anuncio, salvar_metas_anuncio_lote,
     buscar_resumo_geral, construir_tabela_performance,
-    buscar_opcoes_tags, buscar_realizados_mes
+    buscar_opcoes_tags, buscar_realizados_mes,
+    buscar_ultimo_dia_vendas,
 )
 
 # ============================================================
@@ -69,6 +76,18 @@ def _bg_performance(val):
     if val >= 70:
         return "background-color: #FEF3C7"
     return "background-color: #FEE2E2"
+
+# ============================================================
+# HELP TEXT PARA MODELOS DE PROJEÇÃO
+# ============================================================
+
+def _help_modelos():
+    """Retorna texto de ajuda com todos os modelos de projeção."""
+    linhas = []
+    for nome, info in MODELOS_PROJECAO.items():
+        pesos = f"S1={info['sem1']:.0%} | S2={info['sem2']:.0%} | S3={info['sem3']:.0%} | S4={info['sem4']:.0%}"
+        linhas.append(f"▸ {nome}: {info['desc']} ({pesos})")
+    return "\n".join(linhas)
 
 # ============================================================
 # SELETOR DE MÊS
@@ -119,7 +138,7 @@ def _render_meta_loja(engine, loja, marketplace, ano_mes):
         idx_mod = modelos.index(modelo_atual) if modelo_atual in modelos else 0
         modelo_sel = st.selectbox(
             "Modelo Projeção", modelos, index=idx_mod,
-            help=MODELOS_PROJECAO[modelos[idx_mod]]['desc'],
+            help=_help_modelos(),
             key=f"modelo_{loja}_{ano_mes}")
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -136,7 +155,18 @@ def _render_meta_loja(engine, loja, marketplace, ano_mes):
 
 def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo):
     """Barra de progresso e indicadores da loja."""
-    dias_vendas, dias_mes = get_dias_vendas(ano_mes)
+    # Buscar último dia com vendas lançadas para esta loja
+    ultima_data = buscar_ultimo_dia_vendas(engine, loja, ano_mes)
+    dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
+
+    # Caption por loja com info de vendas lançadas
+    if ultima_data:
+        dia_fmt = ultima_data.strftime('%d/%m/%Y')
+        st.caption(f"📅 Vendas lançadas até {dia_fmt} — Dia {dias_vendas} de {dias_mes} — {dias_mes - dias_vendas} dias restantes")
+    else:
+        _, dias_mes_total = get_dias_vendas(ano_mes)
+        st.caption(f"📅 Nenhuma venda lançada neste mês — {dias_mes_total} dias no mês")
+
     df_real = buscar_realizados_mes(engine, loja, ano_mes, marketplace)
 
     fat_realizado = float(df_real['fat_realizado'].sum()) if not df_real.empty else 0
@@ -180,7 +210,7 @@ def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo
             else:
                 st.info(f"ℹ️ Distribuição excede a meta da loja em **{_fmt_brl(abs(diff))}**.")
 
-    return modelo
+    return modelo, dias_vendas, dias_mes
 
 
 # ============================================================
@@ -403,8 +433,10 @@ def _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_ama
 # TABELA DE ANÚNCIOS (EDITÁVEL)
 # ============================================================
 
-def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
-    df = construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo)
+def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_vendas, dias_mes):
+    df = construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo,
+                                      dias_vendas_override=dias_vendas,
+                                      dias_mes_override=dias_mes)
 
     is_amazon = 'AMAZON' in marketplace.upper()
 
@@ -524,7 +556,7 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo):
     st.download_button("📥 Download Tabela", buffer_dl, nome_dl,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"dl_perf_{loja}_{ano_mes}")
-  
+
     # Botão salvar
     if st.button("💾 Salvar Metas e Observações", key=f"btn_salvar_{loja}_{ano_mes}",
                  type="primary", use_container_width=True):
@@ -622,13 +654,13 @@ def _render_tab_marketplace(engine, marketplace, ano_mes):
     # Meta da loja
     meta_receita, modelo = _render_meta_loja(engine, loja, marketplace, ano_mes)
 
-    # Resumo
-    _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo)
+    # Resumo (agora retorna dias_vendas e dias_mes baseados na última venda)
+    modelo, dias_vendas, dias_mes = _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo)
 
     st.divider()
 
-    # Tabela de anúncios
-    _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo)
+    # Tabela de anúncios (recebe dias_vendas/dias_mes da loja)
+    _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_vendas, dias_mes)
 
 
 # ============================================================
@@ -639,7 +671,6 @@ def _render_tab_geral(engine, ano_mes):
     st.subheader("📊 Visão Geral — Todas as Lojas")
 
     df_vendas, df_metas, df_dev = buscar_resumo_geral(engine, ano_mes)
-    dias_vendas, dias_mes = get_dias_vendas(ano_mes)
 
     # Montar tabela consolidada
     from performance_utils import buscar_todas_lojas
@@ -648,10 +679,16 @@ def _render_tab_geral(engine, ano_mes):
         st.info("Nenhuma loja cadastrada.")
         return
 
+    _, dias_mes_ref = get_dias_vendas(ano_mes)
+
     rows = []
     for _, loja_row in df_lojas.iterrows():
         loja = loja_row['loja']
         mktp = loja_row['marketplace']
+
+        # Buscar último dia de vendas lançadas para esta loja
+        ultima_data = buscar_ultimo_dia_vendas(engine, loja, ano_mes)
+        dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
 
         # Meta
         meta_receita = 0
@@ -678,7 +715,7 @@ def _render_tab_geral(engine, ano_mes):
 
         fat_liquido = fat_real - fat_dev
 
-        # Projeção
+        # Projeção (usando dias_vendas da loja)
         if dias_vendas > 0 and fat_liquido > 0:
             proj = calcular_projecao(fat_liquido, dias_vendas, dias_mes, modelo)
         else:
@@ -686,9 +723,14 @@ def _render_tab_geral(engine, ano_mes):
 
         perf = calcular_performance(proj, meta_receita)
 
+        # Formatar data da última venda para exibição
+        ult_venda_fmt = ultima_data.strftime('%d/%m') if ultima_data else '—'
+
         rows.append({
             'Loja': loja,
             'Marketplace': mktp,
+            'Últ. Venda': ult_venda_fmt,
+            'Dia': dias_vendas,
             'Meta': meta_receita,
             'Realizado': round(fat_liquido, 2),
             'Projeção': round(proj, 2),
@@ -705,6 +747,7 @@ def _render_tab_geral(engine, ano_mes):
             'Realizado': st.column_config.NumberColumn(format="R$ %.2f"),
             'Projeção': st.column_config.NumberColumn(format="R$ %.2f"),
             '⭐ Performance': st.column_config.NumberColumn(format="%.1f%%"),
+            'Dia': st.column_config.NumberColumn(format="%d"),
         }
         st.dataframe(df_geral, column_config=col_config,
                       hide_index=True, use_container_width=True)
@@ -739,14 +782,10 @@ MARKETPLACES = [
 
 def main():
     st.title("📊 Performance Mensal")
-    st.caption("v1.4 — vendas mês anterior no template + tabela")
+    st.caption("v1.5 — projeção baseada em vendas lançadas")
 
     engine = get_engine()
     ano_mes = _seletor_mes()
-
-    # Info de dias
-    dias_vendas, dias_mes = get_dias_vendas(ano_mes)
-    st.caption(f"📅 Dia {dias_vendas} de {dias_mes} — {dias_mes - dias_vendas} dias restantes")
 
     # Tabs
     tab_names = [m[0] for m in MARKETPLACES]
