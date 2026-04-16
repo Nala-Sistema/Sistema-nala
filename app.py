@@ -562,6 +562,7 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     tot_fat_ant_prop = 0.0
     tot_meta = 0.0
     tot_projetado = 0.0
+    tot_projetado_com_meta = 0.0  # apenas lojas COM meta — usado no cálculo de performance
 
     for loja, ult_att, max_mes, vendas, fat_sel, fat_ant_t, fat_ant_p in rows:
         ult_str = ult_att.strftime('%d/%m/%Y') if ult_att else '—'
@@ -592,6 +593,8 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
 
         tot_meta += meta_receita
         tot_projetado += projetado
+        if meta_receita > 0:
+            tot_projetado_com_meta += projetado
 
         # Formatação
         meta_html = fmt_brl_short(meta_receita) if meta_receita > 0 else '<span class="pct-zero">—</span>'
@@ -624,7 +627,8 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
 
     tot_meta_html = fmt_brl_short(tot_meta) if tot_meta > 0 else '<span class="pct-zero">—</span>'
     tot_proj_html = fmt_brl_short(tot_projetado) if tot_projetado > 0 else '<span class="pct-zero">—</span>'
-    tot_perf = (tot_projetado / tot_meta * 100) if tot_meta > 0 and tot_projetado > 0 else None
+    # Performance total: considera APENAS projetado de lojas que têm meta cadastrada
+    tot_perf = (tot_projetado_com_meta / tot_meta * 100) if tot_meta > 0 and tot_projetado_com_meta > 0 else None
 
     html += f'''<tr class="row-total">
         <td>TOTAL</td>
@@ -641,6 +645,13 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     html += '</tbody></table></div>'
 
     st.markdown(html, unsafe_allow_html=True)
+
+    # Nota explicativa
+    lojas_com_meta = sum(1 for loja, *_ in rows if metas.get(loja, {}).get('meta_receita', 0) > 0)
+    total_lojas = len(rows)
+    if lojas_com_meta > 0 and lojas_com_meta < total_lojas:
+        st.caption(f"ℹ️ Performance total calculada apenas sobre as {lojas_com_meta} loja(s) com meta cadastrada. "
+                   f"Lojas sem meta contribuem para o faturamento e projetado geral, mas não entram no cálculo de performance.")
 
 
 # ============================================================
