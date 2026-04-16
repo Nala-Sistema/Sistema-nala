@@ -79,8 +79,6 @@ st.markdown("""
 
 # ============================================================
 # CONEXÃO COM BANCO — agnóstico ao ambiente
-# Lê exclusivamente do st.secrets["DB_URL"] configurado no Streamlit Cloud.
-# Cada app (Produção / Dev) tem seu próprio Secret apontando pro banco correto.
 # ============================================================
 from database_utils import get_engine
 
@@ -113,10 +111,7 @@ def carregar_modulo(nome_modulo):
 # ============================================================
 
 def _autenticar_usuario(username: str, senha: str, engine) -> dict | None:
-    """
-    Autentica usuário contra dim_usuarios usando bcrypt.
-    Retorna dict com dados do usuário ou None se falhar.
-    """
+    """Autentica usuário contra dim_usuarios usando bcrypt."""
     import bcrypt
 
     try:
@@ -139,13 +134,11 @@ def _autenticar_usuario(username: str, senha: str, engine) -> dict | None:
 
         id_usuario, db_username, password_hash, role, nome = row
 
-        # Verificar senha com bcrypt
         if not bcrypt.checkpw(senha.encode('utf-8'), password_hash.encode('utf-8')):
             cursor.close()
             conn.close()
             return None
 
-        # Buscar lojas permitidas (para GESTOR)
         lojas_permitidas = []
         cursor.execute("""
             SELECT dl.loja
@@ -172,7 +165,6 @@ def _autenticar_usuario(username: str, senha: str, engine) -> dict | None:
 
 
 def _contar_usuarios(engine) -> int:
-    """Conta quantos usuários ativos existem no banco."""
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -182,11 +174,10 @@ def _contar_usuarios(engine) -> int:
         conn.close()
         return total
     except Exception:
-        return -1  # erro = não sabemos
+        return -1
 
 
 def _criar_primeiro_admin(username: str, senha: str, engine) -> bool:
-    """Cria o primeiro usuário ADMIN quando o sistema está vazio."""
     import bcrypt
 
     try:
@@ -210,10 +201,6 @@ def _criar_primeiro_admin(username: str, senha: str, engine) -> bool:
 
 
 def _tela_setup_inicial(engine):
-    """
-    Tela exibida quando não há nenhum usuário no sistema.
-    Permite criar o primeiro ADMIN.
-    """
     col1, col2, col3 = st.columns([1, 1.5, 1])
     with col2:
         st.markdown("<h1 style='text-align:center; color:#d4af37;'>NALA</h1>",
@@ -240,7 +227,6 @@ def _tela_setup_inicial(engine):
 
 
 def _tela_login(engine):
-    """Tela de login do sistema."""
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
         if os.path.exists("logo.png"):
@@ -260,7 +246,6 @@ def _tela_login(engine):
                     st.error("Preencha usuário e senha.")
                 else:
                     usuario = _autenticar_usuario(username, senha, engine)
-
                     if usuario:
                         st.session_state.logado = True
                         st.session_state.usuario = usuario
@@ -269,28 +254,69 @@ def _tela_login(engine):
                         st.error("Acesso negado. Usuário ou senha incorretos.")
 
 
-
 # ============================================================
-# PAINEL DE INÍCIO
+# HELPERS DE MESES
 # ============================================================
 
-def _buscar_metricas_inicio(engine):
-    """Busca métricas reais do mês atual e anterior para o painel."""
-    from permissoes import ve_todas_lojas, get_lojas_usuario, filtrar_query_por_loja
+_MESES_PT = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+             'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro']
 
+
+def _gerar_opcoes_meses(n=12):
+    """Gera dict {label: 'YYYY-MM'} dos últimos N meses para selectbox."""
     hoje = date.today()
-    primeiro_mes = hoje.replace(day=1)
-    if hoje.month == 1:
-        primeiro_ant = date(hoje.year - 1, 12, 1)
-    else:
-        primeiro_ant = date(hoje.year, hoje.month - 1, 1)
-    ultimo_ant = primeiro_mes - timedelta(days=1)
+    opcoes = {}
+    for i in range(n):
+        ano = hoje.year
+        mes = hoje.month - i
+        while mes < 1:
+            mes += 12
+            ano -= 1
+        label = f"{_MESES_PT[mes - 1]} {ano}"
+        valor = f"{ano:04d}-{mes:02d}"
+        opcoes[label] = valor
+    return opcoes
+
+
+def _ano_mes_para_datas(ano_mes):
+    """Retorna (primeiro_dia, ultimo_dia) como date objects."""
+    from calendar import monthrange
+    ano, mes = int(ano_mes[:4]), int(ano_mes[5:7])
+    primeiro = date(ano, mes, 1)
+    _, dias = monthrange(ano, mes)
+    ultimo = date(ano, mes, dias)
+    return primeiro, ultimo
+
+
+def _mes_anterior(ano_mes):
+    """Retorna ano_mes string do mês anterior."""
+    ano, mes = int(ano_mes[:4]), int(ano_mes[5:7])
+    mes -= 1
+    if mes < 1:
+        mes = 12
+        ano -= 1
+    return f"{ano:04d}-{mes:02d}"
+
+
+# ============================================================
+# PAINEL DE INÍCIO — MÉTRICAS
+# ============================================================
+
+def _buscar_metricas_inicio(engine, ano_mes=None):
+    """Busca métricas do mês selecionado e anterior para o painel."""
+    from permissoes import ve_todas_lojas, get_lojas_usuario
+
+    if ano_mes is None:
+        ano_mes = date.today().strftime('%Y-%m')
+
+    primeiro_sel, ultimo_sel = _ano_mes_para_datas(ano_mes)
+    mes_ant = _mes_anterior(ano_mes)
+    primeiro_ant, ultimo_ant = _ano_mes_para_datas(mes_ant)
 
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        # Montar filtro de loja
         where_loja = ""
         params_loja = []
         if not ve_todas_lojas():
@@ -300,15 +326,15 @@ def _buscar_metricas_inicio(engine):
                 where_loja = f" AND loja_origem IN ({placeholders})"
                 params_loja = list(lojas)
 
-        # Mês atual
+        # Mês selecionado
         cursor.execute(f"""
             SELECT COALESCE(SUM(valor_venda_efetivo), 0),
                    COALESCE(COUNT(*), 0),
                    COALESCE(AVG(margem_percentual), 0)
             FROM fact_vendas_snapshot
-            WHERE data_venda >= %s {where_loja}
-        """, [primeiro_mes] + params_loja)
-        fat_atual, ped_atual, margem_atual = cursor.fetchone()
+            WHERE data_venda >= %s AND data_venda <= %s {where_loja}
+        """, [primeiro_sel, ultimo_sel] + params_loja)
+        fat_sel, ped_sel, margem_sel = cursor.fetchone()
 
         # Mês anterior
         cursor.execute(f"""
@@ -327,10 +353,9 @@ def _buscar_metricas_inicio(engine):
         cursor.close()
         conn.close()
 
-        # Calcular variações
-        var_fat = ((float(fat_atual) / float(fat_ant) - 1) * 100) if fat_ant > 0 else 0
-        var_ped = ((int(ped_atual) / int(ped_ant) - 1) * 100) if ped_ant > 0 else 0
-        var_margem = float(margem_atual) - float(margem_ant)
+        var_fat = ((float(fat_sel) / float(fat_ant) - 1) * 100) if fat_ant > 0 else 0
+        var_ped = ((int(ped_sel) / int(ped_ant) - 1) * 100) if ped_ant > 0 else 0
+        var_margem = float(margem_sel) - float(margem_ant)
 
         def fmt_brl(v):
             v = float(v)
@@ -339,11 +364,11 @@ def _buscar_metricas_inicio(engine):
             return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
         return {
-            'faturamento': fmt_brl(fat_atual),
+            'faturamento': fmt_brl(fat_sel),
             'var_fat': f"{var_fat:+.1f}%",
-            'pedidos': f"{int(ped_atual):,}".replace(",", "."),
+            'pedidos': f"{int(ped_sel):,}".replace(",", "."),
             'var_ped': f"{var_ped:+.1f}%",
-            'margem': f"{float(margem_atual):.1f}%",
+            'margem': f"{float(margem_sel):.1f}%",
             'var_margem': f"{var_margem:+.1f}%",
             'skus': str(total_skus),
         }
@@ -360,69 +385,87 @@ def _buscar_metricas_inicio(engine):
 # PANORAMA DE VENDAS POR LOJA
 # ============================================================
 
-_MESES_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
-             'Julho','Agosto','Setembro','Outubro','Novembro','Dezembro']
+def _buscar_metas_panorama(engine, ano_mes):
+    """Busca metas de todas as lojas para o mês. Retorna dict {loja: {meta_receita, modelo}}."""
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT loja_origem, meta_receita, modelo_projecao FROM dim_metas_loja WHERE ano_mes = %s",
+            (ano_mes,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {
+            row[0]: {'meta_receita': float(row[1] or 0), 'modelo': row[2] or 'Linear'}
+            for row in rows
+        }
+    except Exception:
+        return {}
 
 
-def _buscar_panorama_lojas(engine):
-    """Busca panorama de vendas por loja: atualização, vendas, faturamento, % comparativo por loja."""
+def _buscar_panorama_lojas(engine, ano_mes=None):
+    """
+    Busca panorama de vendas por loja para o mês selecionado.
+    Retorna rows: (loja, ult_att, max_mes_sel, vendas_sel, fat_sel, fat_ant_total, fat_ant_prop)
+    """
     from permissoes import ve_todas_lojas, get_lojas_usuario
 
-    hoje = date.today()
-    primeiro_atual = hoje.replace(day=1)
+    if ano_mes is None:
+        ano_mes = date.today().strftime('%Y-%m')
 
-    if hoje.month == 1:
-        primeiro_ant = date(hoje.year - 1, 12, 1)
-    else:
-        primeiro_ant = date(hoje.year, hoje.month - 1, 1)
-    ultimo_ant = primeiro_atual - timedelta(days=1)
+    primeiro_sel, ultimo_sel = _ano_mes_para_datas(ano_mes)
+    mes_ant = _mes_anterior(ano_mes)
+    primeiro_ant, ultimo_ant = _ano_mes_para_datas(mes_ant)
     fallback_ant = primeiro_ant - timedelta(days=1)
 
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        # Filtro RBAC
-        where_loja = ""
+        # Filtro RBAC — duas versões (CTE sem alias, SELECT principal com alias f.)
+        where_loja_cte = ""
+        where_loja_main = ""
         params_loja = []
         if not ve_todas_lojas():
             lojas = get_lojas_usuario(engine)
             if lojas:
                 placeholders = ', '.join(['%s'] * len(lojas))
-                where_loja = f" AND loja_origem IN ({placeholders})"
+                where_loja_cte = f" AND loja_origem IN ({placeholders})"
+                where_loja_main = f" AND f.loja_origem IN ({placeholders})"
                 params_loja = list(lojas)
 
         query = f"""
             WITH max_dates AS (
                 SELECT loja_origem,
-                       MAX(data_venda) FILTER (WHERE data_venda >= %s) AS max_mes_atual
+                       MAX(data_venda) FILTER (WHERE data_venda >= %s AND data_venda <= %s) AS max_mes_sel
                 FROM fact_vendas_snapshot
-                WHERE 1=1 {where_loja}
+                WHERE 1=1 {where_loja_cte}
                 GROUP BY loja_origem
             )
             SELECT
                 f.loja_origem,
-                MAX(f.data_venda)                                                                        AS ultima_att,
-                md.max_mes_atual,
-                COUNT(*)           FILTER (WHERE f.data_venda >= %s)                                     AS vendas_atual,
-                COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s), 0)                AS fat_atual,
+                MAX(f.data_venda)                                                                                AS ultima_att,
+                md.max_mes_sel,
+                COUNT(*)           FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                      AS vendas_sel,
+                COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0) AS fat_sel,
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0) AS fat_ant_total,
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (
                     WHERE f.data_venda >= %s
-                      AND f.data_venda <= COALESCE(md.max_mes_atual - INTERVAL '1 month', %s::date)
-                ), 0)                                                                                    AS fat_ant_prop
+                      AND f.data_venda <= COALESCE(md.max_mes_sel - INTERVAL '1 month', %s::date)
+                ), 0)                                                                                            AS fat_ant_prop
             FROM fact_vendas_snapshot f
             LEFT JOIN max_dates md ON f.loja_origem = md.loja_origem
-            WHERE 1=1 {where_loja}
-            GROUP BY f.loja_origem, md.max_mes_atual
+            WHERE 1=1 {where_loja_main}
+            GROUP BY f.loja_origem, md.max_mes_sel
             ORDER BY f.loja_origem
         """
 
         params = [
-            primeiro_atual,
+            primeiro_sel, ultimo_sel,
         ] + params_loja + [
-            primeiro_atual,
-            primeiro_atual,
+            primeiro_sel, ultimo_sel,
+            primeiro_sel, ultimo_sel,
             primeiro_ant, ultimo_ant,
             primeiro_ant, fallback_ant,
         ] + params_loja
@@ -439,94 +482,160 @@ def _buscar_panorama_lojas(engine):
         return []
 
 
-def _renderizar_panorama(rows, engine):
-    """Renderiza tabela HTML do panorama de vendas por loja."""
-    hoje = date.today()
-    mes_atual = _MESES_PT[hoje.month - 1]
-    mes_ant = _MESES_PT[hoje.month - 2] if hoje.month > 1 else _MESES_PT[11]
+def _renderizar_panorama(rows, metas, ano_mes, engine):
+    """Renderiza tabela HTML do panorama com Meta, Projetado e Performance."""
+    from performance_utils import calcular_projecao, get_dias_vendas
+
+    # Nomes dos meses
+    ano_sel, mes_sel = int(ano_mes[:4]), int(ano_mes[5:7])
+    nome_mes_sel = _MESES_PT[mes_sel - 1]
+    mes_ant_str = _mes_anterior(ano_mes)
+    mes_ant_num = int(mes_ant_str[5:7])
+    nome_mes_ant = _MESES_PT[mes_ant_num - 1]
+
+    _, ultimo_sel = _ano_mes_para_datas(ano_mes)
+    dias_mes = ultimo_sel.day  # total de dias no mês
 
     def fmt_brl(v):
         v = float(v)
         formatted = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"R$ {formatted}"
 
+    def fmt_brl_short(v):
+        v = float(v)
+        if v >= 1000:
+            return f"R$ {v/1000:,.1f}k".replace(",", "X").replace(".", ",").replace("X", ".")
+        return fmt_brl(v)
+
     def fmt_int(v):
         return f"{int(v):,}".replace(",", ".")
 
-    def fmt_pct(fat_atual, fat_ant_prop, max_date_atual):
-        fat_atual = float(fat_atual)
+    def fmt_pct_vs(fat_sel, fat_ant_prop, max_date_sel):
+        fat_sel = float(fat_sel)
         fat_ant_prop = float(fat_ant_prop)
-        if max_date_atual is None:
+        if max_date_sel is None:
             return '<span class="pct-zero">—</span>'
 
-        ref_str = f'<span style="color:#9aa5b4;font-size:0.72rem;display:block;margin-top:1px">até dia {max_date_atual.day:02d}</span>'
+        ref_str = f'<span style="color:#9aa5b4;font-size:0.72rem;display:block;margin-top:1px">até dia {max_date_sel.day:02d}</span>'
 
         if fat_ant_prop == 0:
-            if fat_atual > 0:
+            if fat_sel > 0:
                 return f'<span class="pct-up">▲ novo</span>{ref_str}'
             return '<span class="pct-zero">—</span>'
-        pct = (fat_atual / fat_ant_prop - 1) * 100
+        pct = (fat_sel / fat_ant_prop - 1) * 100
         if pct > 0:
             return f'<span class="pct-up">▲ +{pct:.1f}%</span>{ref_str}'
         elif pct < 0:
             return f'<span class="pct-down">▼ {pct:.1f}%</span>{ref_str}'
         return f'<span class="pct-zero">0,0%</span>{ref_str}'
 
+    def fmt_perf(perf):
+        if perf is None:
+            return '<span class="pct-zero">—</span>'
+        if perf >= 100:
+            return f'<span class="pct-up">🟢 {perf:.1f}%</span>'
+        elif perf >= 80:
+            return f'<span style="color:#e67e22;font-weight:600">🟡 {perf:.1f}%</span>'
+        else:
+            return f'<span class="pct-down">🔴 {perf:.1f}%</span>'
+
     # Header
     html = f'''<div class="panorama-container">
-    <div class="panorama-title">Panorama de Vendas por Loja</div>
+    <div class="panorama-title">Panorama de Vendas por Loja — {nome_mes_sel} {ano_sel}</div>
     <table class="panorama-table">
     <thead><tr>
         <th>Loja</th>
-        <th>Última Atualização</th>
-        <th style="text-align:right">Vendas {mes_atual}</th>
-        <th style="text-align:right">Faturamento {mes_atual}</th>
-        <th style="text-align:right">Faturamento {mes_ant}</th>
-        <th style="text-align:right">% vs {mes_ant}</th>
+        <th>Últ. Att</th>
+        <th style="text-align:right">Fat. {nome_mes_ant}</th>
+        <th style="text-align:right">% vs {nome_mes_ant}</th>
+        <th style="text-align:right">Meta {nome_mes_sel}</th>
+        <th style="text-align:right">Vendas {nome_mes_sel}</th>
+        <th style="text-align:right">Fat. {nome_mes_sel}</th>
+        <th style="text-align:right">Projetado</th>
+        <th style="text-align:right">Performance</th>
     </tr></thead><tbody>'''
 
     # Acumuladores para linha total
     tot_vendas = 0
-    tot_fat_atual = 0
-    tot_fat_ant = 0
-    tot_fat_ant_prop = 0
+    tot_fat_sel = 0.0
+    tot_fat_ant = 0.0
+    tot_fat_ant_prop = 0.0
+    tot_meta = 0.0
+    tot_projetado = 0.0
 
-    for loja, ult_att, max_mes, vendas, fat_at, fat_ant_t, fat_ant_p in rows:
+    for loja, ult_att, max_mes, vendas, fat_sel, fat_ant_t, fat_ant_p in rows:
         ult_str = ult_att.strftime('%d/%m/%Y') if ult_att else '—'
-        tot_vendas += int(vendas)
-        tot_fat_atual += float(fat_at)
+        fat_sel_f = float(fat_sel)
+        vendas_int = int(vendas)
+
+        tot_vendas += vendas_int
+        tot_fat_sel += fat_sel_f
         tot_fat_ant += float(fat_ant_t)
         tot_fat_ant_prop += float(fat_ant_p)
+
+        # Meta e modelo da loja
+        meta_info = metas.get(loja)
+        meta_receita = meta_info['meta_receita'] if meta_info else 0
+        modelo = meta_info['modelo'] if meta_info else 'Linear'
+
+        # Projetado baseado na última data de vendas lançadas para ESTA loja
+        projetado = 0.0
+        if max_mes is not None and fat_sel_f > 0:
+            max_date = max_mes
+            if isinstance(max_date, datetime):
+                max_date = max_date.date()
+            dias_vendas, _ = get_dias_vendas(ano_mes, data_ref=max_date)
+            projetado = calcular_projecao(fat_sel_f, dias_vendas, dias_mes, modelo)
+
+        # Performance = projetado / meta
+        perf = (projetado / meta_receita * 100) if meta_receita > 0 and projetado > 0 else None
+
+        tot_meta += meta_receita
+        tot_projetado += projetado
+
+        # Formatação
+        meta_html = fmt_brl_short(meta_receita) if meta_receita > 0 else '<span class="pct-zero">—</span>'
+        proj_html = fmt_brl_short(projetado) if projetado > 0 else '<span class="pct-zero">—</span>'
 
         html += f'''<tr>
             <td><strong>{loja}</strong></td>
             <td>{ult_str}</td>
-            <td style="text-align:right">{fmt_int(vendas)}</td>
-            <td style="text-align:right">{fmt_brl(fat_at)}</td>
             <td style="text-align:right">{fmt_brl(fat_ant_t)}</td>
-            <td style="text-align:right">{fmt_pct(fat_at, fat_ant_p, max_mes)}</td>
+            <td style="text-align:right">{fmt_pct_vs(fat_sel, fat_ant_p, max_mes)}</td>
+            <td style="text-align:right">{meta_html}</td>
+            <td style="text-align:right">{fmt_int(vendas_int)}</td>
+            <td style="text-align:right">{fmt_brl(fat_sel_f)}</td>
+            <td style="text-align:right">{proj_html}</td>
+            <td style="text-align:right">{fmt_perf(perf)}</td>
         </tr>'''
 
-    # Linha total — sem ref_str individual (é agregado)
+    # ─── Linha TOTAL ───
     tot_pct_html = '<span class="pct-zero">—</span>'
     if tot_fat_ant_prop > 0:
-        tot_pct = (tot_fat_atual / tot_fat_ant_prop - 1) * 100
+        tot_pct = (tot_fat_sel / tot_fat_ant_prop - 1) * 100
         if tot_pct > 0:
             tot_pct_html = f'<span class="pct-up">▲ +{tot_pct:.1f}%</span>'
         elif tot_pct < 0:
             tot_pct_html = f'<span class="pct-down">▼ {tot_pct:.1f}%</span>'
         else:
             tot_pct_html = '<span class="pct-zero">0,0%</span>'
-    elif tot_fat_atual > 0:
+    elif tot_fat_sel > 0:
         tot_pct_html = '<span class="pct-up">▲ novo</span>'
+
+    tot_meta_html = fmt_brl_short(tot_meta) if tot_meta > 0 else '<span class="pct-zero">—</span>'
+    tot_proj_html = fmt_brl_short(tot_projetado) if tot_projetado > 0 else '<span class="pct-zero">—</span>'
+    tot_perf = (tot_projetado / tot_meta * 100) if tot_meta > 0 and tot_projetado > 0 else None
 
     html += f'''<tr class="row-total">
         <td>TOTAL</td>
         <td></td>
-        <td style="text-align:right">{fmt_int(tot_vendas)}</td>
-        <td style="text-align:right">{fmt_brl(tot_fat_atual)}</td>
         <td style="text-align:right">{fmt_brl(tot_fat_ant)}</td>
         <td style="text-align:right">{tot_pct_html}</td>
+        <td style="text-align:right">{tot_meta_html}</td>
+        <td style="text-align:right">{fmt_int(tot_vendas)}</td>
+        <td style="text-align:right">{fmt_brl(tot_fat_sel)}</td>
+        <td style="text-align:right">{tot_proj_html}</td>
+        <td style="text-align:right">{fmt_perf(tot_perf)}</td>
     </tr>'''
 
     html += '</tbody></table></div>'
@@ -558,13 +667,11 @@ def _area_logada(engine):
             st.markdown("<h2 style='color: #d4af37; text-align: center; margin:0;'>NALA</h2>",
                         unsafe_allow_html=True)
 
-        # Badge de ambiente Dev (detectado automaticamente pelo Secret)
         if _is_dev_environment():
             st.warning("⚠️ AMBIENTE DE DESENVOLVIMENTO (TESTES)")
 
         st.markdown("---")
 
-        # Menu dinâmico baseado no perfil
         opcoes_menu = get_opcoes_menu()
         aba = st.radio("Menu Principal:", opcoes_menu)
 
@@ -584,19 +691,34 @@ def _area_logada(engine):
 
         mostrar_badge_filtro_loja()
 
-        m = _buscar_metricas_inicio(engine)
+        # ─── SELETOR DE MÊS ───
+        opcoes_meses = _gerar_opcoes_meses(12)
+        col_mes, col_space = st.columns([1, 3])
+        with col_mes:
+            mes_sel_label = st.selectbox("📅 Mês de referência:",
+                                         list(opcoes_meses.keys()),
+                                         key="painel_mes_ref")
+        ano_mes = opcoes_meses[mes_sel_label]
+        nome_mes = mes_sel_label.split()[0]  # ex: "Abril"
+        mes_ant_num = int(_mes_anterior(ano_mes)[5:7])
+        nome_mes_ant = _MESES_PT[mes_ant_num - 1]
+
+        # ─── MÉTRICAS ───
+        m = _buscar_metricas_inicio(engine, ano_mes)
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Faturamento Mês", m['faturamento'], m['var_fat'])
-        c2.metric("Pedidos Totais", m['pedidos'], m['var_ped'])
+        c1.metric(f"Faturamento {nome_mes}", m['faturamento'], m['var_fat'])
+        c2.metric(f"Pedidos {nome_mes}", m['pedidos'], m['var_ped'])
         c3.metric("Margem Média", m['margem'], m['var_margem'])
         c4.metric("SKUs na Base", m['skus'])
 
         st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
 
-        # Panorama de vendas por loja
-        rows = _buscar_panorama_lojas(engine)
+        # ─── PANORAMA ───
+        rows = _buscar_panorama_lojas(engine, ano_mes)
+        metas_pan = _buscar_metas_panorama(engine, ano_mes)
+
         if rows:
-            _renderizar_panorama(rows, engine)
+            _renderizar_panorama(rows, metas_pan, ano_mes, engine)
         else:
             st.info("Nenhuma venda encontrada para exibir o panorama.")
 
@@ -652,23 +774,16 @@ def _area_logada(engine):
 # ============================================================
 
 def main():
-    # Inicializar session_state
     if 'logado' not in st.session_state:
         st.session_state.logado = False
     if 'usuario' not in st.session_state:
         st.session_state.usuario = {}
 
-    # Engine do banco — lê do st.secrets["DB_URL"] (agnóstico ao ambiente)
     engine = get_engine()
-
-    # Garantir que tabela dim_usuario_lojas existe
     _garantir_tabela_usuario_lojas(engine)
 
-    # Fluxo principal
     if not st.session_state.logado:
-        # Verificar se existem usuários no sistema
         total = _contar_usuarios(engine)
-
         if total == 0:
             _tela_setup_inicial(engine)
         else:
@@ -678,7 +793,6 @@ def main():
 
 
 def _garantir_tabela_usuario_lojas(engine):
-    """Cria tabela dim_usuario_lojas se não existir (auto-migration)."""
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -691,8 +805,6 @@ def _garantir_tabela_usuario_lojas(engine):
                 UNIQUE(id_usuario, id_loja)
             )
         """)
-
-        # Garantir coluna 'nome' em dim_usuarios (pode não existir)
         cursor.execute("""
             DO $$
             BEGIN
@@ -704,12 +816,11 @@ def _garantir_tabela_usuario_lojas(engine):
                 END IF;
             END $$;
         """)
-
         conn.commit()
         cursor.close()
         conn.close()
     except Exception:
-        pass  # Silencioso — se falhar, o login ainda funciona
+        pass
 
 
 if __name__ == "__main__":
