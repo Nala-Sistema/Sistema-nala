@@ -1,6 +1,6 @@
 """
 PERFORMANCE - Sistema Nala
-Versão: 1.5 (14/04/2026)
+Versão: 1.6 (16/04/2026)
 
 Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Tabs por marketplace + tab Geral
@@ -9,25 +9,24 @@ Módulo de acompanhamento de metas mensais por loja e por anúncio.
 - Histórico de 3 meses como colunas expandíveis
 - Integração com tags (Curva ABC + Status manual)
 
+VERSÃO 1.6 (16/04/2026):
+  - NOVO: Metas do mês anterior como default — loja (exibe) e anúncios (grava)
+  - NOVO: Preço médio unitário editável na tabela e no template XLSX
+  - NOVO: Dois downloads — Template Zerado e Template Preenchido
+  - NOVO: Upload aceita coluna Preço Médio e grava como preco_medio_manual
+  - Requer: ALTER TABLE dim_metas_anuncio ADD COLUMN preco_medio_manual NUMERIC(12,2);
+
 VERSÃO 1.5 (14/04/2026):
-  - FIX: dias_vendas agora baseado na última venda lançada por loja
-    (não mais date.today()), afetando projeção e performance
-  - Caption global removido; caption "Vendas lançadas até..." por loja
-  - Help do seletor de modelo agora mostra descrição de todos os modelos
+  - FIX: dias_vendas baseado na última venda lançada por loja
+  - Caption global removido; caption por loja
+  - Help do seletor de modelo com todos os modelos
 
 VERSÃO 1.4 (06/04/2026):
-  - NOVO: Template XLSX e tabela visual agora mostram vendas do mês anterior
-    (Qtd e Fat) como referência para preenchimento de metas
-  - Mês anterior sempre visível na tabela; toggle cobre apenas M-2 e M-3
+  - Vendas mês anterior no template + tabela
 
 VERSÃO 1.3 (06/04/2026):
-  - NOVO: Download de template XLSX com metas por anúncio (pré-preenchido)
-  - NOVO: Upload de planilha XLSX para UPSERT de metas em lote
-  - Regra dos 3 Meses: template e tela listam todos os anúncios com vendas
-    nos últimos 3 meses, garantindo preenchimento preventivo no início do mês
-
-VERSÃO 1.2:
-  - fix duplicatas + dict mapping
+  - Download/upload XLSX de metas por anúncio
+  - Regra dos 3 Meses
 """
 
 import streamlit as st
@@ -42,7 +41,7 @@ from performance_utils import (
     buscar_metas_anuncio, salvar_metas_anuncio_lote,
     buscar_resumo_geral, construir_tabela_performance,
     buscar_opcoes_tags, buscar_realizados_mes,
-    buscar_ultimo_dia_vendas,
+    buscar_ultimo_dia_vendas, auto_copiar_metas_mes_anterior,
 )
 
 # ============================================================
@@ -96,7 +95,6 @@ def _help_modelos():
 def _seletor_mes():
     hoje = date.today()
     mes_atual = get_ano_mes(hoje)
-    # Gerar opções: mês atual + 3 anteriores + 1 próximo
     opcoes = []
     for i in range(-1, 4):
         m = get_mes_anterior(mes_atual, i) if i > 0 else mes_atual if i == 0 else get_ano_mes(
@@ -125,8 +123,25 @@ def _seletor_mes():
 
 def _render_meta_loja(engine, loja, marketplace, ano_mes):
     meta_info = buscar_meta_loja(engine, loja, ano_mes)
-    meta_atual = float(meta_info['meta_receita']) if meta_info else 0.0
-    modelo_atual = meta_info.get('modelo_projecao', 'Linear') if meta_info else 'Linear'
+
+    # Fallback: se não tem meta no mês atual, puxar do mês anterior
+    usando_fallback = False
+    if meta_info is None:
+        mes_ant = get_mes_anterior(ano_mes, 1)
+        meta_info_ant = buscar_meta_loja(engine, loja, mes_ant)
+        if meta_info_ant:
+            meta_atual = float(meta_info_ant['meta_receita'])
+            modelo_atual = meta_info_ant.get('modelo_projecao', 'Linear')
+            usando_fallback = True
+        else:
+            meta_atual = 0.0
+            modelo_atual = 'Linear'
+    else:
+        meta_atual = float(meta_info['meta_receita'])
+        modelo_atual = meta_info.get('modelo_projecao', 'Linear')
+
+    if usando_fallback:
+        st.info("ℹ️ Meta pré-preenchida com o valor do mês anterior. Clique em Salvar Meta para confirmar.")
 
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
@@ -155,11 +170,9 @@ def _render_meta_loja(engine, loja, marketplace, ano_mes):
 
 def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo):
     """Barra de progresso e indicadores da loja."""
-    # Buscar último dia com vendas lançadas para esta loja
     ultima_data = buscar_ultimo_dia_vendas(engine, loja, ano_mes)
     dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
 
-    # Caption por loja com info de vendas lançadas
     if ultima_data:
         dia_fmt = ultima_data.strftime('%d/%m/%Y')
         st.caption(f"📅 Vendas lançadas até {dia_fmt} — Dia {dias_vendas} de {dias_mes} — {dias_mes - dias_vendas} dias restantes")
@@ -201,7 +214,13 @@ def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo
         soma_meta_fat = 0
         for _, m in df_metas.iterrows():
             key = (m['codigo_anuncio'], m.get('logistica') if is_amazon else None)
-            pm = precos.get(key, 0)
+            # Usar preço manual se existir, senão calculado
+            preco_manual = None
+            if 'preco_medio_manual' in m.index:
+                pm_val = m.get('preco_medio_manual')
+                if pm_val is not None and not pd.isna(pm_val) and float(pm_val) > 0:
+                    preco_manual = float(pm_val)
+            pm = preco_manual if preco_manual is not None else precos.get(key, 0)
             soma_meta_fat += int(m['meta_quantidade']) * pm
         diff = meta_receita - soma_meta_fat
         if abs(diff) > 1:
@@ -214,30 +233,35 @@ def _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo
 
 
 # ============================================================
-# DOWNLOAD / UPLOAD DE METAS POR ANÚNCIO (v1.3)
+# DOWNLOAD / UPLOAD DE METAS POR ANÚNCIO
 # ============================================================
 
-def _gerar_template_metas(df, is_amazon):
+def _gerar_template_metas(df, is_amazon, zerado=False):
     """
     Gera XLSX template para download de metas por anúncio.
-    Inclui todos os anúncios do universo (regra 3 meses) com metas
-    pré-preenchidas quando existentes.
-    v1.4: Inclui vendas do mês anterior (Qtd e Fat) como referência.
+    Se zerado=True, Meta Qtd é 0 e Preço Médio vazio (template limpo).
+    Se zerado=False, vem preenchido com os dados da tabela (revisão).
+    v1.6: Inclui coluna Preço Médio editável.
     """
     cols_template = ['codigo_anuncio', 'sku', 'produto']
     if is_amazon:
         cols_template.append('logistica')
 
-    # Vendas do mês anterior como referência (hist_1 = mês mais recente)
+    # Vendas do mês anterior como referência
     has_hist = 'hist_1_qtd' in df.columns
     if has_hist:
         cols_template += ['hist_1_qtd', 'hist_1_fat']
 
-    cols_template += ['meta_qtd', 'observacao']
+    cols_template += ['preco_medio', 'meta_qtd', 'observacao']
 
     df_template = df[cols_template].copy()
 
-    # Descobrir label do mês anterior para nome das colunas
+    if zerado:
+        df_template['meta_qtd'] = 0
+        df_template['preco_medio'] = None
+        df_template['observacao'] = ''
+
+    # Label do mês anterior
     mes_ant_label = 'Mês Ant.'
     if has_hist and 'hist_1_mes' in df.columns and not df.empty:
         mes_ant_label = df['hist_1_mes'].iloc[0]
@@ -249,6 +273,7 @@ def _gerar_template_metas(df, is_amazon):
         'logistica': 'Logística',
         'hist_1_qtd': f'{mes_ant_label} Qtd',
         'hist_1_fat': f'{mes_ant_label} Fat.',
+        'preco_medio': 'Preço Médio',
         'meta_qtd': 'Meta Qtd',
         'observacao': 'Observação',
     }
@@ -257,35 +282,27 @@ def _gerar_template_metas(df, is_amazon):
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         df_template.to_excel(writer, index=False, sheet_name='Metas')
-        # Ajustar largura das colunas
         ws = writer.sheets['Metas']
         if is_amazon:
             col_widths = {
-                'A': 22,  # Código Anúncio
-                'B': 15,  # SKU
-                'C': 35,  # Produto
-                'D': 12,  # Logística
-                'E': 14,  # Mês Ant. Qtd
-                'F': 16,  # Mês Ant. Fat.
-                'G': 12,  # Meta Qtd
-                'H': 30,  # Observação
+                'A': 22, 'B': 15, 'C': 35, 'D': 12,
             }
+            next_col = ord('E')
         else:
             col_widths = {
-                'A': 22,  # Código Anúncio
-                'B': 15,  # SKU
-                'C': 35,  # Produto
-                'D': 14,  # Mês Ant. Qtd
-                'E': 16,  # Mês Ant. Fat.
-                'F': 12,  # Meta Qtd
-                'G': 30,  # Observação
+                'A': 22, 'B': 15, 'C': 35,
             }
-        if not has_hist:
-            # Sem histórico: remover colunas de mês anterior do mapa
-            if is_amazon:
-                col_widths = {'A': 22, 'B': 15, 'C': 35, 'D': 12, 'E': 12, 'F': 30}
-            else:
-                col_widths = {'A': 22, 'B': 15, 'C': 35, 'D': 12, 'E': 30}
+            next_col = ord('D')
+
+        if has_hist:
+            col_widths[chr(next_col)] = 14      # Mês Ant. Qtd
+            col_widths[chr(next_col + 1)] = 16  # Mês Ant. Fat.
+            next_col += 2
+
+        col_widths[chr(next_col)] = 14      # Preço Médio
+        col_widths[chr(next_col + 1)] = 12  # Meta Qtd
+        col_widths[chr(next_col + 2)] = 30  # Observação
+
         for col_letter, width in col_widths.items():
             ws.column_dimensions[col_letter].width = width
     buffer.seek(0)
@@ -295,15 +312,13 @@ def _gerar_template_metas(df, is_amazon):
 def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engine):
     """
     Processa upload de planilha XLSX com metas por anúncio.
-    Faz UPSERT em dim_metas_anuncio via salvar_metas_anuncio_lote.
-    Grava qualquer codigo_anuncio enviado, mesmo fora do universo de 3 meses.
+    v1.6: Aceita coluna Preço Médio e grava como preco_medio_manual.
     """
     try:
         df_upload = pd.read_excel(arquivo)
     except Exception as e:
         return -1, f"Erro ao ler arquivo: {e}"
 
-    # Normalizar nomes de colunas
     rename_back = {
         'Código Anúncio': 'codigo_anuncio',
         'Codigo Anuncio': 'codigo_anuncio',
@@ -312,6 +327,9 @@ def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engi
         'Produto': 'produto',
         'Logística': 'logistica',
         'Logistica': 'logistica',
+        'Preço Médio': 'preco_medio',
+        'Preco Medio': 'preco_medio',
+        'preco_medio': 'preco_medio',
         'Meta Qtd': 'meta_qtd',
         'meta_qtd': 'meta_qtd',
         'Observação': 'observacao',
@@ -331,7 +349,7 @@ def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engi
         if not cod or cod.lower() in ('nan', 'none', ''):
             continue
 
-        # Meta quantidade — tratar NaN e valores não numéricos
+        # Meta quantidade
         meta_val = row.get('meta_qtd', 0)
         if pd.isna(meta_val):
             meta_val = 0
@@ -339,6 +357,17 @@ def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engi
             meta_qtd = int(float(meta_val))
         except (ValueError, TypeError):
             meta_qtd = 0
+
+        # Preço médio manual
+        preco_val = row.get('preco_medio')
+        preco_manual = None
+        if preco_val is not None and not pd.isna(preco_val):
+            try:
+                preco_manual = float(preco_val)
+                if preco_manual <= 0:
+                    preco_manual = None
+            except (ValueError, TypeError):
+                preco_manual = None
 
         # Observação
         obs = str(row.get('observacao', '') or '').strip()
@@ -362,6 +391,7 @@ def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engi
             'ano_mes': ano_mes,
             'meta_quantidade': meta_qtd,
             'observacao': obs,
+            'preco_medio_manual': preco_manual,
         })
 
     if not metas:
@@ -377,27 +407,43 @@ def _processar_upload_metas(arquivo, loja, marketplace, ano_mes, is_amazon, engi
 def _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_amazon):
     """
     Renderiza seção de Download template e Upload de metas por anúncio.
-    Posicionada acima da tabela editável, dentro de cada tab marketplace/loja.
+    v1.6: Dois botões de download (zerado + preenchido).
     """
     st.markdown("##### 📋 Metas por Anúncio — Planilha")
-    col_dl, col_ul = st.columns(2)
 
-    # ── DOWNLOAD TEMPLATE ──
-    with col_dl:
+    col_dl_z, col_dl_p, col_ul = st.columns(3)
+
+    # ── DOWNLOAD TEMPLATE ZERADO ──
+    with col_dl_z:
         if not df.empty:
-            buffer = _gerar_template_metas(df, is_amazon)
+            buffer_z = _gerar_template_metas(df, is_amazon, zerado=True)
             nome_safe = loja.replace(' ', '_').replace('/', '-')
-            nome_arquivo = f"metas_{nome_safe}_{ano_mes}.xlsx"
             st.download_button(
-                label="⬇️ Download Template Metas",
-                data=buffer,
-                file_name=nome_arquivo,
+                label="⬇️ Template Zerado",
+                data=buffer_z,
+                file_name=f"metas_zerado_{nome_safe}_{ano_mes}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_metas_{loja}_{ano_mes}",
+                key=f"dl_metas_z_{loja}_{ano_mes}",
                 use_container_width=True,
             )
         else:
-            st.info("Sem anúncios para gerar template.")
+            st.info("Sem anúncios.")
+
+    # ── DOWNLOAD TEMPLATE PREENCHIDO ──
+    with col_dl_p:
+        if not df.empty:
+            buffer_p = _gerar_template_metas(df, is_amazon, zerado=False)
+            nome_safe = loja.replace(' ', '_').replace('/', '-')
+            st.download_button(
+                label="⬇️ Template Preenchido",
+                data=buffer_p,
+                file_name=f"metas_preenchido_{nome_safe}_{ano_mes}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_metas_p_{loja}_{ano_mes}",
+                use_container_width=True,
+            )
+        else:
+            st.info("Sem anúncios.")
 
     # ── UPLOAD METAS ──
     with col_ul:
@@ -408,10 +454,7 @@ def _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_ama
             label_visibility="collapsed",
         )
 
-    # Botão de processar FORA do file_uploader (evita re-render bug do Streamlit)
     if arquivo_up is not None:
-        # Guardar nome no session_state para evitar reprocessamento
-        ss_key = f"upload_processado_{loja}_{ano_mes}"
         if st.button("📤 Processar Upload de Metas", key=f"btn_ul_{loja}_{ano_mes}",
                       use_container_width=True):
             with st.spinner("Processando metas..."):
@@ -440,14 +483,14 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
 
     is_amazon = 'AMAZON' in marketplace.upper()
 
-    # ── Download / Upload de Metas (v1.3) ──
+    # ── Download / Upload de Metas ──
     _render_download_upload_metas(engine, df, loja, marketplace, ano_mes, is_amazon)
 
     if df.empty:
         st.info("Nenhum anúncio com vendas nos últimos 3 meses para esta loja.")
         return
 
-    # Toggle histórico (M-2 e M-3 — mês anterior já aparece sempre)
+    # Toggle histórico (M-2 e M-3)
     mostrar_hist = st.toggle("📊 Mostrar colunas de histórico (M-2 e M-3)", value=False,
                              key=f"hist_{loja}_{ano_mes}")
 
@@ -461,13 +504,13 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
         cols_principais.append('logistica')
     cols_principais += ['curva', 'tag', 'margem_ant', 'margem_atual']
 
-    # Vendas do mês anterior sempre visíveis (v1.4)
+    # Vendas do mês anterior sempre visíveis
     cols_mes_ant = []
     if 'hist_1_qtd' in df.columns:
         cols_mes_ant = ['hist_1_qtd', 'hist_1_fat']
 
     cols_principais += cols_mes_ant
-    cols_principais += ['meta_qtd', 'meta_fat', 'qtd_realizado', 'fat_realizado',
+    cols_principais += ['preco_medio', 'meta_qtd', 'meta_fat', 'qtd_realizado', 'fat_realizado',
                         'performance', 'proj_qtd', 'proj_fat', 'observacao']
 
     # Histórico M-2 e M-3 (toggle)
@@ -475,7 +518,6 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
     if mostrar_hist:
         for i in range(2, 4):
             if f'hist_{i}_qtd' in df.columns:
-                mes_label = df[f'hist_{i}_mes'].iloc[0] if f'hist_{i}_mes' in df.columns and len(df) > 0 else f'M-{i}'
                 cols_hist += [f'hist_{i}_qtd', f'hist_{i}_fat']
 
     df_display = df[cols_principais + cols_hist].copy()
@@ -485,6 +527,7 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
         'codigo_anuncio': 'Anúncio', 'sku': 'SKU', 'produto': 'Produto',
         'logistica': 'Logística', 'curva': 'Curva', 'tag': 'Tag',
         'margem_ant': 'Margem Ant.%', 'margem_atual': 'Margem Atual%',
+        'preco_medio': 'Preço Médio',
         'meta_qtd': 'Meta Qtd', 'meta_fat': 'Meta Fat.',
         'qtd_realizado': 'Real. Qtd', 'fat_realizado': 'Real. Fat.',
         'performance': '⭐ Perf.%', 'proj_qtd': 'Proj. Qtd', 'proj_fat': 'Proj. Fat.',
@@ -507,6 +550,7 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
         'Tag': st.column_config.SelectboxColumn(options=opcoes_tags_display, width="small"),
         'Margem Ant.%': st.column_config.NumberColumn(format="%.1f%%", disabled=True),
         'Margem Atual%': st.column_config.NumberColumn(format="%.1f%%", disabled=True),
+        'Preço Médio': st.column_config.NumberColumn(format="R$ %.2f", min_value=0, step=0.01),
         'Meta Qtd': st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
         'Meta Fat.': st.column_config.NumberColumn(format="R$ %.2f", disabled=True),
         'Real. Qtd': st.column_config.NumberColumn(format="%d", disabled=True),
@@ -528,16 +572,6 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
         if fat_col in df_display.columns:
             col_config[fat_col] = st.column_config.NumberColumn(format="R$ %.2f", disabled=True)
 
-    # Aplicar cores na coluna performance via styling
-    def style_perf(val):
-        if pd.isna(val) or val is None:
-            return ''
-        if val >= 100:
-            return 'background-color: #D1FAE5; font-weight: bold; color: #065F46'
-        if val >= 70:
-            return 'background-color: #FEF3C7; font-weight: bold; color: #92400E'
-        return 'background-color: #FEE2E2; font-weight: bold; color: #991B1B'
-
     # Data editor (height para ~16 linhas visíveis)
     df_editado = st.data_editor(
         df_display,
@@ -548,6 +582,7 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
         key=f"editor_{loja}_{ano_mes}",
         num_rows="fixed",
     )
+
     # Download XLSX da tabela
     buffer_dl = io.BytesIO()
     with pd.ExcelWriter(buffer_dl, engine='openpyxl') as writer:
@@ -565,11 +600,10 @@ def _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_ven
 
 
 def _salvar_edicoes(engine, df_original, df_editado, loja, marketplace, ano_mes, is_amazon, rename_map):
-    """Salva meta_qtd, observacao e tag editados."""
+    """Salva meta_qtd, preco_medio_manual, observacao e tag editados."""
     metas_para_salvar = []
     tags_para_salvar = []
 
-    # Mapear colunas de volta
     inv_rename = {v: k for k, v in rename_map.items()}
 
     for idx in range(len(df_editado)):
@@ -577,8 +611,18 @@ def _salvar_edicoes(engine, df_original, df_editado, loja, marketplace, ano_mes,
         logistica = df_original.iloc[idx].get('logistica') if is_amazon else None
 
         # Meta quantidade
-        meta_col = 'Meta Qtd'
-        meta_qtd = int(df_editado.iloc[idx].get(meta_col, 0) or 0)
+        meta_qtd = int(df_editado.iloc[idx].get('Meta Qtd', 0) or 0)
+
+        # Preço médio editado
+        preco_editado = df_editado.iloc[idx].get('Preço Médio')
+        preco_manual = None
+        if preco_editado is not None and not pd.isna(preco_editado):
+            try:
+                preco_manual = float(preco_editado)
+                if preco_manual <= 0:
+                    preco_manual = None
+            except (ValueError, TypeError):
+                preco_manual = None
 
         # Observação
         obs = str(df_editado.iloc[idx].get('Observação', '') or '')
@@ -591,9 +635,10 @@ def _salvar_edicoes(engine, df_original, df_editado, loja, marketplace, ano_mes,
             'ano_mes': ano_mes,
             'meta_quantidade': meta_qtd,
             'observacao': obs,
+            'preco_medio_manual': preco_manual,
         })
 
-        # Tag (salvar em dim_tags_anuncio)
+        # Tag
         tag_nova = str(df_editado.iloc[idx].get('Tag', '') or '')
         tag_original = str(df_original.iloc[idx].get('tag', '') or '')
         if tag_nova != tag_original:
@@ -647,20 +692,24 @@ def _render_tab_marketplace(engine, marketplace, ano_mes):
         st.warning(f"Nenhuma loja cadastrada para {marketplace}.")
         return
 
-    # Seletor de loja (em vez de mostrar todas de uma vez)
     loja = st.selectbox("🏪 Selecione a loja:", lojas, key=f"sel_loja_{marketplace}")
 
     st.markdown(f"### 🏪 {loja}")
 
+    # Auto-copiar metas do mês anterior (se mês sem metas)
+    copiou = auto_copiar_metas_mes_anterior(engine, loja, marketplace, ano_mes)
+    if copiou:
+        st.toast(f"📋 Metas do mês anterior copiadas para {loja}", icon="📋")
+
     # Meta da loja
     meta_receita, modelo = _render_meta_loja(engine, loja, marketplace, ano_mes)
 
-    # Resumo (agora retorna dias_vendas e dias_mes baseados na última venda)
+    # Resumo (retorna dias_vendas e dias_mes da loja)
     modelo, dias_vendas, dias_mes = _render_resumo_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo)
 
     st.divider()
 
-    # Tabela de anúncios (recebe dias_vendas/dias_mes da loja)
+    # Tabela de anúncios
     _render_tabela_anuncios(engine, loja, marketplace, ano_mes, modelo, dias_vendas, dias_mes)
 
 
@@ -673,21 +722,17 @@ def _render_tab_geral(engine, ano_mes):
 
     df_vendas, df_metas, df_dev = buscar_resumo_geral(engine, ano_mes)
 
-    # Montar tabela consolidada
     from performance_utils import buscar_todas_lojas
     df_lojas = buscar_todas_lojas(engine)
     if df_lojas.empty:
         st.info("Nenhuma loja cadastrada.")
         return
 
-    _, dias_mes_ref = get_dias_vendas(ano_mes)
-
     rows = []
     for _, loja_row in df_lojas.iterrows():
         loja = loja_row['loja']
         mktp = loja_row['marketplace']
 
-        # Buscar último dia de vendas lançadas para esta loja
         ultima_data = buscar_ultimo_dia_vendas(engine, loja, ano_mes)
         dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
 
@@ -716,7 +761,6 @@ def _render_tab_geral(engine, ano_mes):
 
         fat_liquido = fat_real - fat_dev
 
-        # Projeção (usando dias_vendas da loja)
         if dias_vendas > 0 and fat_liquido > 0:
             proj = calcular_projecao(fat_liquido, dias_vendas, dias_mes, modelo)
         else:
@@ -724,7 +768,6 @@ def _render_tab_geral(engine, ano_mes):
 
         perf = calcular_performance(proj, meta_receita)
 
-        # Formatar data da última venda para exibição
         ult_venda_fmt = ultima_data.strftime('%d/%m') if ultima_data else '—'
 
         rows.append({
@@ -742,7 +785,6 @@ def _render_tab_geral(engine, ano_mes):
     df_geral = pd.DataFrame(rows)
 
     if not df_geral.empty:
-        # Estilizar
         col_config = {
             'Meta': st.column_config.NumberColumn(format="R$ %.2f"),
             'Realizado': st.column_config.NumberColumn(format="R$ %.2f"),
@@ -753,7 +795,6 @@ def _render_tab_geral(engine, ano_mes):
         st.dataframe(df_geral, column_config=col_config,
                       hide_index=True, use_container_width=True)
 
-        # Totais
         total_meta = df_geral['Meta'].sum()
         total_real = df_geral['Realizado'].sum()
         total_proj = df_geral['Projeção'].sum()
@@ -783,7 +824,7 @@ MARKETPLACES = [
 
 def main():
     st.title("📊 Performance Mensal")
-    st.caption("v1.5 — projeção baseada em vendas lançadas")
+    st.caption("v1.6 — metas mês anterior + preço médio editável")
 
     engine = get_engine()
     ano_mes = _seletor_mes()
