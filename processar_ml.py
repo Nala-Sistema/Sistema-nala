@@ -2,6 +2,21 @@
 PROCESSADOR MERCADO LIVRE - Sistema Nala
 Processa arquivos de vendas do Mercado Livre
 
+VERSÃO 3.2 (16/04/2026):
+  - NOVO: Lê coluna "Descontos e bônus" do relatório ML → mapeada como descontos_bonus
+  - NOVO: Para TODOS os tipos de entrega: outros_custos = -descontos_bonus (valor negativo
+          = reembolso/redução de custo). Frete bruto mantido inalterado para reconciliação.
+  - NOVO: Margem atualizada: receita - tarifa - imposto - frete + descontos_bonus - custo
+  - NOVO: _processar_carrinhos() distribui descontos_bonus proporcionalmente para filhas
+  - FIX: Flex CARRINHO — custo_flex era aplicado por filha em vez de por pacote.
+          Agora custo_flex é distribuído pelo proporcao de cada filha (_proporcao_frete).
+          Exemplo: pacote 3 itens → frete 12,90/3 = 4,30 por filha (antes: 3×12,90 = 38,70).
+  - FIX: soma_liquido do check de divergência de carrinho Flex agora exclui frete
+          (igual a vendas simples Flex — frete é custo externo, não consta no total_brl ML).
+  - NOVO: Vendas simples não-Flex com divergência > R$5 vs Total (BRL) → pendentes financeiras
+          (antes: apenas aviso na tela; agora: mesmo comportamento dos carrinhos)
+  - NOVO: gravar_vendas_ml() inclui outros_custos no total_tarifas e valor_liquido
+
 VERSÃO 3.1 (18/03/2026):
   - FIX: Batch commit a cada 500 registros para evitar timeout do Neon
   - NOVO: Salva pedido_original no banco (pedido real do ML)
@@ -49,7 +64,7 @@ CUSTO_FLEX_ML_PADRAO = 12.90
 # Status que indicam venda inválida (normalizado, sem acentos)
 PALAVRAS_DESCARTE = ['cancelad', 'devolv', 'devoluc', 'reembolso', 'mediacao']
 
-# Tolerância para divergência financeira em carrinhos (R$)
+# Tolerância para divergência financeira em carrinhos e vendas simples (R$)
 TOLERANCIA_DIVERGENCIA = 5.00
 
 # v3.1: Batch commit size para evitar timeout do Neon
@@ -133,7 +148,8 @@ def renomear_colunas_ml(df):
     """
     Renomeia colunas do ML para nomes padronizados.
     Usa normalização de acentos para evitar falhas de mapeamento.
-    
+
+    VERSÃO 3.2: Adicionado mapeamento de descontos_bonus ("Descontos e bônus").
     VERSÃO 3.0: Adicionado mapeamento de preco_unit_anuncio.
     """
     rename_map = {}
@@ -179,6 +195,10 @@ def renomear_colunas_ml(df):
         elif 'preco' in col_norm and 'unitario' in col_norm and 'anuncio' in col_norm:
             rename_map[col] = 'preco_unit_anuncio'
 
+        # NOVO v3.2: Descontos e bônus (reembolso ML — flex ou campanha)
+        elif 'desconto' in col_norm and 'bonus' in col_norm:
+            rename_map[col] = 'descontos_bonus'
+
     return df.rename(columns=rename_map)
 
 
@@ -189,10 +209,12 @@ def _processar_carrinhos(df):
     Lógica:
     1. Identifica linhas mestra pelo campo status contendo 'Pacote de N produtos'
     2. As N linhas subsequentes são as filhas (têm SKU, preço unitário, mas sem financeiros)
-    3. Distribui receita/tarifas da mestra proporcionalmente pelo peso de cada filha
+    3. Distribui receita/tarifas/descontos_bonus da mestra proporcionalmente pelo peso de cada filha
     4. Peso = preco_unit_anuncio × quantidade
     5. Copia forma_entrega da mestra para as filhas
     6. Verifica divergência financeira por grupo (tolerância R$ 5,00)
+
+    VERSÃO 3.2: Distribui descontos_bonus proporcionalmente para as filhas.
 
     Retorna:
         df modificado com colunas auxiliares:
@@ -233,6 +255,8 @@ def _processar_carrinhos(df):
         total_brl_mestra = limpar_numero(row.get('total_brl', 0))
         forma_entrega_mestra = str(row.get('forma_entrega', ''))
         pedido_mestra = str(row.get('pedido', ''))
+        # v3.2: descontos_bonus da mestra também será distribuído
+        descontos_bonus_mestra = abs(limpar_numero(row.get('descontos_bonus', 0)))
 
         # Coletar filhas (as N linhas seguintes)
         filhas_info = []
@@ -291,6 +315,11 @@ def _processar_carrinhos(df):
                 df.at[fidx, 'forma_entrega'] = forma_entrega_mestra
                 df.at[fidx, '_carrinho_grupo'] = pedido_mestra
                 df.at[fidx, '_total_brl_carrinho'] = total_brl_mestra
+                # v3.2: distribuir descontos_bonus proporcionalmente
+                df.at[fidx, 'descontos_bonus'] = descontos_bonus_mestra * proporcao
+                # v3.2 FIX Flex carrinho: guardar proporcao para dividir custo_flex
+                # entre as filhas (1 pacote = 1 entrega, custo_flex não é por item)
+                df.at[fidx, '_proporcao_frete'] = proporcao
 
         # Avançar além das filhas
         idx += 1 + filhas_reais
@@ -303,8 +332,15 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     """
     Processa arquivo Excel do Mercado Livre.
 
+    VERSÃO 3.2:
+    - NOVO: Lê e aplica "Descontos e bônus" para todos os tipos de entrega
+    - NOVO: outros_custos = -descontos_bonus (negativo); frete mantido bruto
+    - NOVO: Divergência simples não-Flex > R$5 → pendentes financeiras
+    - NOVO: Flex não valida contra Total (BRL)
+    - Mantido: Toda lógica v3.1 intacta
+
     VERSÃO 3.1:
-    - NOVO: pedido_original = pedido real do ML
+    - NOVO: pedido_original = numero real do pedido ML
     - Mantido: Toda lógica v3.0 intacta
 
     VERSÃO 3.0:
@@ -320,6 +356,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         - descartes: lista de dicts com dados das vendas descartadas
         - carrinhos_encontrados: quantidade de carrinhos processados
         - pendentes_carrinho: lista de vendas com divergência financeira
+          (inclui carrinhos com divergência E vendas simples com divergência)
     """
 
     # 1. DETECTAR HEADER
@@ -358,7 +395,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
     # 7. PROCESSAR VENDAS
     vendas = []
     descartes = []
-    pendentes_carrinho = []
+    pendentes_carrinho = []  # inclui carrinhos com divergência E vendas simples com divergência
     skus_sem_custo = set()
     linhas_descartadas = 0
     avisos_divergencia = []
@@ -432,10 +469,27 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # ---- DETECTAR FLEX ----
             is_flex = 'flex' in forma_entrega
 
+            # ---- v3.2: LER DESCONTOS E BÔNUS ----
+            # Para Flex: reembolso ML pelo custo da entrega
+            # Para não-Flex: redução de tarifa por campanha promocional
+            # Em ambos os casos: vai para outros_custos como valor negativo
+            descontos_bonus = abs(limpar_numero(row.get('descontos_bonus', 0)))
+            outros_custos_val = -descontos_bonus if descontos_bonus > 0 else 0.0
+
             # ---- CALCULAR FRETE E IMPOSTO ----
             if is_flex:
-                # FLEX: Custo líquido (transportadora - cliente pagou)
-                custo_frete = custo_flex - receita_envio
+                # FLEX: frete bruto mantido para reconciliação futura com faturamento ML
+                # v3.2 FIX: para carrinhos Flex, custo_flex é do PACOTE inteiro (1 entrega),
+                # não por item. _proporcao_frete distribui o custo entre as filhas.
+                # Vendas simples Flex: _proporcao_frete = 1.0 (custo_flex cheio).
+                try:
+                    proporcao_frete_raw = row.get('_proporcao_frete', None)
+                    proporcao_frete = float(proporcao_frete_raw) if (
+                        proporcao_frete_raw is not None and not pd.isna(proporcao_frete_raw)
+                    ) else 1.0
+                except (TypeError, ValueError):
+                    proporcao_frete = 1.0
+                custo_frete = custo_flex * proporcao_frete
                 imposto_val = 0.0  # SEM imposto no FLEX
             else:
                 # NORMAL: Frete líquido
@@ -450,21 +504,29 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # ---- CALCULAR CUSTO TOTAL ----
             custo_total = custo_unit * qtd
 
-            # ---- MARGEM = receita - tarifa - imposto - frete - custo ----
-            margem = receita - tarifa - imposto_val - custo_frete - custo_total
+            # ---- MARGEM = receita - tarifa - imposto - frete + descontos_bonus - custo ----
+            # v3.2: descontos_bonus aumenta a margem (é um crédito do ML)
+            margem = receita - tarifa - imposto_val - custo_frete + descontos_bonus - custo_total
             margem_pct = (margem / receita * 100) if receita > 0 else 0
 
-            # ---- VALIDAÇÃO contra Total (BRL) — vendas normais (sem carrinho) ----
+            # ---- VALIDAÇÃO FINANCEIRA vs Total (BRL) ----
+            # v3.2: Flex NÃO valida (frete é externo ao sistema ML)
+            # v3.2: Não-Flex simples com divergência > R$5 → pendentes (não só aviso)
             carrinho_grupo = str(row.get('_carrinho_grupo', ''))
             total_brl_carrinho = float(row.get('_total_brl_carrinho', 0))
 
-            if carrinho_grupo == '' and total_brl > 0:
-                # Venda simples: validar individualmente
-                # Total (BRL) do ML = receita - tarifa - frete (NÃO inclui imposto)
-                valor_calculado = receita - tarifa - custo_frete
+            venda_com_divergencia = False
+
+            if not is_flex and carrinho_grupo == '' and total_brl > 0:
+                # Não-Flex simples: valor que ML paga ao vendedor
+                # Total (BRL) = receita - tarifa - frete_ml + descontos_bonus
+                valor_calculado = receita - tarifa - custo_frete + descontos_bonus
                 divergencia = abs(valor_calculado - total_brl)
 
                 if divergencia > TOLERANCIA_DIVERGENCIA:
+                    # v3.2: vai para pendentes financeiras (não só aviso)
+                    venda_com_divergencia = True
+                    motivo_div = f"Divergência financeira - venda simples (diff R$ {divergencia:.2f})"
                     avisos_divergencia.append({
                         'pedido': str(row.get('pedido', '')),
                         'calculado': valor_calculado,
@@ -490,6 +552,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 'tarifa': tarifa,
                 'imposto': imposto_val,
                 'frete': custo_frete,
+                'outros_custos': outros_custos_val,  # v3.2: NOVO (negativo)
                 'custo': custo_total,
                 'margem': margem,
                 'margem_pct': margem_pct,
@@ -500,16 +563,23 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 '_carrinho_grupo': carrinho_grupo,
             }
 
-            # ---- AGRUPAR VENDAS DE CARRINHO PARA CHECK DE DIVERGÊNCIA ----
-            if carrinho_grupo != '':
+            # ---- ROTEAMENTO: divergência simples → pendentes, demais → vendas/carrinhos ----
+            if venda_com_divergencia:
+                # v3.2: divergência financeira em venda simples → pendentes
+                venda['_motivo_pendente'] = motivo_div
+                pendentes_carrinho.append(venda)
+
+            elif carrinho_grupo != '':
+                # ---- AGRUPAR VENDAS DE CARRINHO PARA CHECK DE DIVERGÊNCIA ----
                 if carrinho_grupo not in carrinho_vendas_temp:
                     carrinho_vendas_temp[carrinho_grupo] = {
                         'vendas': [],
                         'total_brl_mestra': total_brl_carrinho,
                     }
                 carrinho_vendas_temp[carrinho_grupo]['vendas'].append(venda)
+
             else:
-                # Venda simples: adicionar direto
+                # Venda simples sem divergência: adicionar direto
                 vendas.append(venda)
 
         except Exception as e:
@@ -522,12 +592,23 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
         total_brl_mestra = dados_grupo['total_brl_mestra']
 
         # Somar valor líquido calculado de todas as filhas
-        # NOTA: Total (BRL) do ML = receita - tarifa - frete (NÃO inclui imposto)
-        # Imposto é cálculo interno nosso, não entra na comparação
-        soma_liquido = sum(
-            v['receita'] - v['tarifa'] - v['frete']
-            for v in vendas_grupo
-        )
+        # NOTA: Total (BRL) do ML = receita - tarifa - frete + descontos_bonus (NÃO inclui imposto)
+        # v3.2 FIX: para Flex carrinhos, frete NÃO entra (custo externo ao ML —
+        # assim como vendas simples Flex pulam a validação contra total_brl).
+        is_flex_group = any(v.get('is_flex', False) for v in vendas_grupo)
+
+        if is_flex_group:
+            # Flex: frete é custo externo, não aparece no total_brl da mestra
+            soma_liquido = sum(
+                v['receita'] - v['tarifa'] - v['outros_custos']
+                for v in vendas_grupo
+            )
+        else:
+            # Não-Flex: frete ML compõe o total_brl normalmente
+            soma_liquido = sum(
+                v['receita'] - v['tarifa'] - v['frete'] - v['outros_custos']
+                for v in vendas_grupo
+            )
 
         # Verificar divergência contra total_brl da mestra
         if total_brl_mestra != 0:
@@ -578,7 +659,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
 
     # 13. LIMPAR COLUNAS TEMPORÁRIAS
     if not df_result.empty:
-        colunas_temp = ['_data_obj', '_custo_unit', '_carrinho_grupo']
+        colunas_temp = ['_data_obj', '_custo_unit', '_carrinho_grupo', '_proporcao_frete']
         colunas_existentes = [c for c in colunas_temp if c in df_result.columns]
         df_result = df_result.drop(columns=colunas_existentes)
 
@@ -589,6 +670,13 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                      descartes=None, pendentes_carrinho=None):
     """
     Grava vendas do ML no banco com validação de SKU e barra de progresso.
+
+    VERSÃO 3.2:
+    - NOVO: Lê outros_custos do df (negativo = descontos_bonus)
+    - NOVO: total_tarifas inclui outros_custos (tarifa + frete + outros_custos)
+    - NOVO: valor_liquido recalculado com total_tarifas atualizado
+    - NOVO: INSERT usa outros_custos real (não mais hardcoded 0)
+    - Mantido: Toda lógica v3.1 intacta
 
     VERSÃO 3.1:
     - FIX: Batch commit a cada 500 registros (evita timeout Neon em uploads grandes)
@@ -694,13 +782,13 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             erros += 1
 
     # ============================================================
-    # 5B. PROCESSAR PENDENTES DE CARRINHO (NOVO v3.0)
+    # 5B. PROCESSAR PENDENTES (carrinhos com divergência + v3.2: vendas simples com divergência)
     # ============================================================
     for pend in pendentes_carrinho:
         try:
             item_atual += 1
             progress_bar.progress(min(item_atual / total_itens, 1.0))
-            status_text.text(f"Processando pendentes carrinho... {item_atual} de {total_itens}")
+            status_text.text(f"Processando pendentes... {item_atual} de {total_itens}")
 
             sku = str(pend.get('sku', '')).strip()
             pedido = str(pend.get('pedido', '')).strip()
@@ -718,9 +806,12 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             tarifa = float(pend.get('tarifa', 0))
             imposto_val = float(pend.get('imposto', 0))
             frete = float(pend.get('frete', 0))
+            # v3.2: outros_custos do pendente (negativo)
+            outros_custos_pend = float(pend.get('outros_custos', 0))
             qtd = int(pend.get('qtd', 1))
             preco_venda = receita / qtd if qtd > 0 else receita
-            total_tarifas = tarifa + frete
+            # v3.2: total_tarifas inclui outros_custos
+            total_tarifas = tarifa + frete + outros_custos_pend
             valor_liquido = receita - total_tarifas - imposto_val
             codigo_anuncio = str(pend.get('codigo_anuncio', '')).strip()
 
@@ -740,7 +831,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                 'comissao': tarifa,
                 'frete': frete,
                 'tarifa_fixa': 0,
-                'outros_custos': 0,
+                'outros_custos': outros_custos_pend,  # v3.2: valor negativo
                 'total_tarifas': total_tarifas,
                 'valor_liquido': valor_liquido,
                 'arquivo_origem': arquivo_nome,
@@ -772,7 +863,8 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             pass
 
     # ============================================================
-    # 5C. PROCESSAR VENDAS NORMAIS (loop existente mantido)
+    # 5C. PROCESSAR VENDAS NORMAIS
+    # v3.2: outros_custos real no INSERT; total_tarifas e valor_liquido atualizados
     # v3.1: batch commit + pedido_original no INSERT
     # ============================================================
 
@@ -826,9 +918,12 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                 tarifa = float(row['tarifa'])
                 imposto_val = float(row['imposto'])
                 frete = float(row['frete'])
+                # v3.2: outros_custos do row (negativo)
+                outros_custos_val = float(row.get('outros_custos', 0))
                 qtd = int(row['qtd'])
                 preco_venda = receita / qtd if qtd > 0 else receita
-                total_tarifas = tarifa + frete
+                # v3.2: total_tarifas inclui outros_custos
+                total_tarifas = tarifa + frete + outros_custos_val
                 valor_liquido = receita - total_tarifas - imposto_val
                 codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
 
@@ -848,7 +943,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                     'comissao': tarifa,
                     'frete': frete,
                     'tarifa_fixa': 0,
-                    'outros_custos': 0,
+                    'outros_custos': outros_custos_val,  # v3.2: valor negativo
                     'total_tarifas': total_tarifas,
                     'valor_liquido': valor_liquido,
                     'arquivo_origem': arquivo_nome,
@@ -879,22 +974,26 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             # Pegar código anúncio do row
             codigo_anuncio = str(row.get('codigo_anuncio', '')).strip()
 
+            # v3.2: outros_custos real (negativo = descontos_bonus)
+            outros_custos_val = float(row.get('outros_custos', 0))
+
             # Calcular valores derivados
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
-            total_tarifas = tarifa + frete
+            # v3.2: total_tarifas inclui outros_custos (negativo reduz o total)
+            total_tarifas = tarifa + frete + outros_custos_val
             valor_liquido = receita - total_tarifas - imposto_val
 
             # SAVEPOINT: se der erro nessa venda, só desfaz ela
             cursor.execute(f"SAVEPOINT venda_{idx}")
 
-            # v3.1: INSERT com pedido_original
+            # v3.2: INSERT com outros_custos real (não mais hardcoded 0)
             cursor.execute(sql, (
                 marketplace, loja, pedido, pedido_original, data_venda, sku,
                 codigo_anuncio,
                 qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto_val, tarifa,
-                frete, 0, 0, total_tarifas, valor_liquido,
+                frete, 0, outros_custos_val, total_tarifas, valor_liquido,
                 margem, margem_pct, arquivo_nome
             ))
 
