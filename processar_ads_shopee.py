@@ -671,12 +671,36 @@ def calcular_tacos(engine, loja_ads, skus, periodo_inicio, periodo_fim):
         gmv_ads, receita_direta, tacos, acos, pct_organico
     Ou {'erro': str} em caso de falha.
     """
-    # Normalizar skus em lista
-    if isinstance(skus, str):
+    # Normalizar skus em lista (robusto a NaN, None, int, float, lista, tupla, set)
+    if skus is None:
+        skus_lista = []
+    elif isinstance(skus, str):
         skus_lista = [skus]
+    elif isinstance(skus, (list, tuple, set)):
+        skus_lista = list(skus)
     else:
-        skus_lista = list(skus) if skus else []
-    skus_lista = [str(s).strip() for s in skus_lista if s and str(s).strip()]
+        # Valor escalar não-string (pode ser NaN, número, Decimal, etc.)
+        try:
+            if pd.isna(skus):
+                skus_lista = []
+            else:
+                skus_lista = [str(skus)]
+        except Exception:
+            skus_lista = []
+
+    # Limpar: remover None/NaN/vazios/strings inválidas
+    def _sku_valido(s):
+        if s is None:
+            return False
+        try:
+            if pd.isna(s):
+                return False
+        except Exception:
+            pass
+        txt = str(s).strip()
+        return bool(txt) and txt.lower() not in ('nan', 'none', 'nat', '<na>')
+
+    skus_lista = [str(s).strip() for s in skus_lista if _sku_valido(s)]
 
     if not skus_lista:
         return {'erro': 'Nenhum SKU informado'}
