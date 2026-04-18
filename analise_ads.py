@@ -100,7 +100,8 @@ def modulo_ads(engine):
     st.caption("Meta TACOS: máximo 3%")
     tab_shopee, tab_amazon, tab_outros = st.tabs(["🟠 Shopee", "📦 Amazon", "🔜 Outros"])
     with tab_shopee:
-        _tab_shopee(engine)
+        from analise_ads_shopee import modulo_ads_shopee
+        modulo_ads_shopee(engine)   # ← chama a versão nova
     with tab_amazon:
         st.info("Módulo Amazon Ads em desenvolvimento.")
     with tab_outros:
