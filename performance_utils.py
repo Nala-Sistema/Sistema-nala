@@ -400,14 +400,15 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         """
     else:
         sql_vendas = """
-            SELECT codigo_anuncio, MAX(sku) as sku, NULL as logistica,
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   MAX(sku) as sku, NULL as logistica,
                    SUM(quantidade)::float as qtd_vendas,
                    SUM(valor_venda_efetivo)::float as fat_vendas,
                    AVG(margem_percentual)::float as margem_atual
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-            GROUP BY codigo_anuncio
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
         """
 
     df_v = _raw_query(engine, sql_vendas, (loja, primeiro, ultimo))
@@ -429,13 +430,14 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         """
     else:
         sql_dev = """
-            SELECT codigo_anuncio, NULL as logistica,
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   NULL as logistica,
                    SUM(quantidade)::float as qtd_dev,
                    SUM(valor_venda_efetivo)::float as fat_dev
             FROM fact_devolucoes
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-            GROUP BY codigo_anuncio
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
         """
     df_d = _raw_query(engine, sql_dev, (loja, primeiro, ultimo))
 
@@ -488,15 +490,20 @@ def buscar_historico_meses(engine, loja, ano_mes_ref, meses_atras=3, marketplace
 
         if is_amazon:
             group_cols = "codigo_anuncio, sku, logistica"
+            cod_select = "codigo_anuncio"
+            cod_filter = "codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''"
         else:
-            group_cols = "codigo_anuncio, sku"
+            group_cols = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku), sku"
+            cod_select = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio"
+            cod_filter = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL"
 
         sql = f"""
-            SELECT {group_cols},
+            SELECT {cod_select if not is_amazon else 'codigo_anuncio'}, sku,
+                   {'logistica,' if is_amazon else ''}
                    SUM(quantidade) as qtd, SUM(valor_venda_efetivo) as fat
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+              AND {cod_filter}
             GROUP BY {group_cols}
         """
         df = _raw_query(engine, sql, (loja, primeiro, ultimo))
@@ -526,15 +533,17 @@ def buscar_preco_medio_mes_anterior(engine, loja, ano_mes_ref, marketplace=None)
 
     if is_amazon:
         group_cols = "codigo_anuncio, logistica"
+        cod_filter = "codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''"
     else:
-        group_cols = "codigo_anuncio"
+        group_cols = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)"
+        cod_filter = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL"
 
     sql = f"""
-        SELECT {group_cols},
+        SELECT {group_cols + ' as codigo_anuncio' if not is_amazon else group_cols},
                SUM(valor_venda_efetivo) / NULLIF(SUM(quantidade), 0) as preco_medio
         FROM fact_vendas_snapshot
         WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+          AND {cod_filter}
         GROUP BY {group_cols}
     """
     df = _raw_query(engine, sql, (loja, primeiro, ultimo))
@@ -563,14 +572,17 @@ def buscar_margem_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
 
     if is_amazon:
         group_cols = "codigo_anuncio, logistica"
+        cod_filter = "codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''"
     else:
-        group_cols = "codigo_anuncio"
+        group_cols = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)"
+        cod_filter = "COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL"
 
     sql = f"""
-        SELECT {group_cols}, AVG(margem_percentual) as margem_media
+        SELECT {group_cols + ' as codigo_anuncio' if not is_amazon else group_cols},
+               AVG(margem_percentual) as margem_media
         FROM fact_vendas_snapshot
         WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+          AND {cod_filter}
         GROUP BY {group_cols}
     """
     df = _raw_query(engine, sql, (loja, primeiro, ultimo))
@@ -649,7 +661,6 @@ def buscar_resumo_geral(engine, ano_mes):
                SUM(v.valor_venda_efetivo) as fat_realizado
         FROM fact_vendas_snapshot v
         WHERE v.data_venda >= %s AND v.data_venda <= %s
-          AND v.codigo_anuncio IS NOT NULL AND TRIM(v.codigo_anuncio) != ''
         GROUP BY v.loja_origem, v.marketplace_origem
     """
     df_vendas = _raw_query(engine, sql, (primeiro, ultimo))
