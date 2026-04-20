@@ -619,11 +619,11 @@ def buscar_opcoes_tags(engine, tipo='anuncio'):
 # ============================================================
 
 def buscar_nomes_produtos(engine):
-    """Retorna dict: {sku: nome}"""
-    df = _raw_query(engine, "SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
+    """Retorna dict: {sku: nome} — inclui todos os produtos (ativos e inativos)."""
+    df = _raw_query(engine, "SELECT TRIM(sku) as sku, nome FROM dim_produtos WHERE sku IS NOT NULL")
     if df.empty:
         return {}
-    return {row['sku']: row['nome'] for _, row in df.iterrows()}
+    return {str(row['sku']).strip(): row['nome'] for _, row in df.iterrows()}
 
 
 def buscar_skus_config_amazon(engine):
@@ -827,7 +827,7 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
             if mes_key not in hist_data:
                 hist_data[mes_key] = {'qtd': 0, 'fat': 0.0}
 
-        nome_produto = nomes.get(sku, '')
+        nome_produto = nomes.get(str(sku).strip(), '')
 
         row = {
             'codigo_anuncio': cod_anuncio,
