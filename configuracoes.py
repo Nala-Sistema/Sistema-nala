@@ -1,6 +1,19 @@
 """
 CONFIGURAÇÕES - Sistema Nala
-Versão: 3.1 (30/03/2026)
+Versão: 3.2 (20/04/2026)
+
+CHANGELOG v3.2:
+  - FIX CRÍTICO: Tab "Impostos & Lojas" trocou TRUNCATE+INSERT por UPDATE cirúrgico
+    - ANTES: TRUNCATE TABLE dim_lojas falhava com "cannot truncate a table referenced
+      in a foreign key constraint" (dim_usuario_lojas referencia dim_lojas.id).
+      Se não houvesse a FK, o TRUNCATE resetaria IDs e destruiria silenciosamente
+      as atribuições de gestores → lojas.
+    - AGORA: UPDATE por (marketplace, loja) mantém o id intacto; se a loja não
+      existir (primeira instalação), faz INSERT. Vínculos de gestores preservados.
+  - Tab "Impostos & Lojas" agora usa num_rows="fixed" (lojas não se adicionam/removem
+    por esta tela — apenas se editam impostos e custo_flex).
+  - Demais tabs (Amazon, Frete ML, Frete ML 2026, Frete Amazon, Gestão de Usuários):
+    SEM ALTERAÇÕES.
 
 CHANGELOG v3.1:
   - NOVO: Tab "Frete ML 2026" — tabela editável de frete ML por peso × preço
@@ -881,11 +894,17 @@ O frete FLEX é quando o Mercado Livre usa uma transportadora terceirizada para 
 
 
 # ============================================================
-# TAB 3: IMPOSTOS & LOJAS — sem mudanças
+# TAB 3: IMPOSTOS & LOJAS — v3.2 (FIX CRÍTICO: UPDATE cirúrgico)
 # ============================================================
 
 def _tab_impostos_lojas(engine):
-    """Gestão das 14 lojas — imposto e custo_flex."""
+    """Gestão das 14 lojas — imposto e custo_flex.
+
+    v3.2: Não usa mais TRUNCATE (que quebra FK com dim_usuario_lojas e
+    destruiria silenciosamente atribuições de gestores se a FK fosse removida).
+    Agora faz UPDATE cirúrgico por (marketplace, loja), com fallback INSERT
+    apenas se a loja ainda não existir (primeira instalação).
+    """
 
     st.subheader("Gerenciamento das 14 Lojas")
 
@@ -916,13 +935,14 @@ def _tab_impostos_lojas(engine):
         df_lojas['custo_flex'] = 0.00
     df_lojas['custo_flex'] = df_lojas['custo_flex'].fillna(0.00)
 
-    st.info("Ajuste as alíquotas e custo FLEX, depois clique em salvar.")
+    st.info("Ajuste as alíquotas e custo FLEX, depois clique em salvar. "
+            "Esta tela não adiciona/remove lojas — use o banco diretamente se precisar.")
 
     df_editado = st.data_editor(
         df_lojas,
         column_config={
-            'marketplace': st.column_config.TextColumn("Marketplace"),
-            'loja': st.column_config.TextColumn("Loja"),
+            'marketplace': st.column_config.TextColumn("Marketplace", disabled=True),
+            'loja': st.column_config.TextColumn("Loja", disabled=True),
             'imposto': st.column_config.NumberColumn("Imposto (%)", format="%.2f", min_value=0.0),
             'custo_flex': st.column_config.NumberColumn(
                 "Custo FLEX (R$)", format="%.2f", min_value=0.0,
@@ -930,7 +950,7 @@ def _tab_impostos_lojas(engine):
             ),
         },
         use_container_width=True,
-        num_rows="dynamic",
+        num_rows="fixed",  # v3.2: bloqueia adicionar/remover linhas
         hide_index=True,
         key="editor_lojas_fiscal"
     )
@@ -940,23 +960,54 @@ def _tab_impostos_lojas(engine):
             conn = engine.raw_connection()
             cursor = conn.cursor()
 
-            cursor.execute("TRUNCATE TABLE dim_lojas")
+            atualizados = 0
+            inseridos = 0
+            erros = []
 
             for _, row in df_editado.iterrows():
-                val_imposto = float(str(row['imposto']).replace(',', '.')) if row['imposto'] else 0.0
-                val_flex = float(str(row['custo_flex']).replace(',', '.')) if row['custo_flex'] else 0.0
+                try:
+                    val_imposto = float(str(row['imposto']).replace(',', '.')) if row['imposto'] is not None else 0.0
+                    val_flex = float(str(row['custo_flex']).replace(',', '.')) if row['custo_flex'] is not None else 0.0
+                    mkp = row['marketplace']
+                    loja = row['loja']
 
-                cursor.execute(
-                    "INSERT INTO dim_lojas (marketplace, loja, imposto, custo_flex) VALUES (%s, %s, %s, %s)",
-                    (row['marketplace'], row['loja'], val_imposto, val_flex)
-                )
+                    # UPDATE cirúrgico — preserva id, não quebra FKs
+                    cursor.execute(
+                        """UPDATE dim_lojas 
+                           SET imposto = %s, custo_flex = %s 
+                           WHERE marketplace = %s AND loja = %s""",
+                        (val_imposto, val_flex, mkp, loja)
+                    )
+
+                    if cursor.rowcount > 0:
+                        atualizados += cursor.rowcount
+                    else:
+                        # Fallback: loja ainda não existe no banco (primeira instalação)
+                        cursor.execute(
+                            """INSERT INTO dim_lojas (marketplace, loja, imposto, custo_flex) 
+                               VALUES (%s, %s, %s, %s)""",
+                            (mkp, loja, val_imposto, val_flex)
+                        )
+                        inseridos += 1
+
+                except Exception as e_row:
+                    erros.append(f"{row.get('marketplace', '?')} / {row.get('loja', '?')}: {str(e_row)[:150]}")
 
             conn.commit()
             cursor.close()
             conn.close()
 
-            st.success(f"✅ {len(df_editado)} lojas salvas com sucesso!")
-            st.rerun()
+            if atualizados > 0:
+                st.success(f"✅ {atualizados} loja(s) atualizada(s)!")
+            if inseridos > 0:
+                st.info(f"➕ {inseridos} loja(s) inserida(s) (não existiam no banco).")
+            if erros:
+                st.warning(f"⚠️ {len(erros)} linha(s) com erro:")
+                for e in erros[:10]:
+                    st.write(f"• {e}")
+            if (atualizados + inseridos) > 0 and not erros:
+                st.rerun()
+
         except Exception as e:
             st.error(f"Erro: {e}")
 
