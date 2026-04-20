@@ -258,7 +258,6 @@ def _gerar_template_metas(df, is_amazon, zerado=False):
 
     if zerado:
         df_template['meta_qtd'] = 0
-        df_template['preco_medio'] = None
         df_template['observacao'] = ''
 
     # Label do mês anterior
