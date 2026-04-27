@@ -1,21 +1,22 @@
 """
 analise_ads_shopee.py — Módulo de Análise de Ads da Shopee
-Sistema Nala — Parte 3A (núcleo funcional)
+Sistema Nala — Parte 3A + 3B (completo)
 
-Conteúdo desta entrega:
+Conteúdo:
   - Tab Upload: preview com banner destacado das datas detectadas
-  - Tab Dashboard TACOS: query corrigida + tradução loja + dias pago/orgânico
-  - Tab Match SKU: data_editor inline com múltiplos SKUs (até 3 por anúncio)
+  - Tab Dashboard TACOS: query corrigida + tradução loja + dias pago/orgânico +
+    botão "🤖 Gerar Insights com IA" (Gemini com 7 regras e faixas calibradas)
+  - Tab Match SKU: data_editor inline + download/upload XLSX (a_preencher/matches_ativos)
   - Tab Histórico: preservado
-
-Parte 3B (posterior): download/upload xlsx, botão "Gerar Insights com IA".
 
 Regras do projeto:
   - raw_connection() + cursor em TODAS as queries (nunca pd.read_sql com engine)
   - SAVEPOINT por linha em loops de INSERT/UPDATE
   - Formatação BR: R$ 1.234,56 | dd/mm/aaaa | 18,50%
+  - Chave da IA: st.secrets["GEMINI_API_KEY"]
 """
 
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -25,6 +26,12 @@ from processar_ads_shopee import (
     buscar_skus_match, atualizar_matches_sku, calcular_tacos,
     data_fim_efetiva, LOJA_ADS_PARA_ORIGEM
 )
+
+try:
+    import google.generativeai as genai
+    GEMINI_DISPONIVEL = True
+except Exception:
+    GEMINI_DISPONIVEL = False
 
 
 # ============================================================
@@ -140,6 +147,392 @@ def _query_scalar(engine, query, params=None):
                 conn.close()
             except Exception:
                 pass
+
+
+# ============================================================
+# HELPERS DE XLSX (download/upload de matches)
+# ============================================================
+
+def _gerar_xlsx_matches(engine, loja_nome):
+    """
+    Gera XLSX com 2 abas:
+      - 'a_preencher'     → anúncios SEM match ativo hoje (usuário preenche SKUs)
+      - 'matches_ativos'  → todos os matches vigentes hoje (editáveis)
+
+    Retorna: bytes do xlsx (para st.download_button)
+    """
+    hoje = date.today()
+
+    # Anúncios totais da loja
+    df_anuncios = _query_df(engine, """
+        SELECT DISTINCT nome_anuncio, id_produto
+        FROM fact_ads_shopee
+        WHERE loja = %s
+        ORDER BY nome_anuncio
+    """, [loja_nome])
+
+    # Matches ativos hoje
+    df_ativos = _query_df(engine, """
+        SELECT nome_produto_ads, id_produto_ads, sku, data_inicio
+        FROM dim_ads_produto_sku
+        WHERE marketplace = 'Shopee'
+          AND loja = %s
+          AND data_inicio <= %s
+          AND (data_fim IS NULL OR data_fim >= %s)
+        ORDER BY nome_produto_ads, data_inicio DESC, sku
+    """, [loja_nome, hoje, hoje])
+
+    # Conjunto de anúncios que já têm ao menos 1 match ativo
+    anuncios_com_match = set(df_ativos['nome_produto_ads'].tolist()) if not df_ativos.empty else set()
+
+    # ---- ABA 1: a_preencher ----
+    linhas_preencher = []
+    for _, r in df_anuncios.iterrows():
+        if r['nome_anuncio'] not in anuncios_com_match:
+            linhas_preencher.append({
+                'nome_anuncio': r['nome_anuncio'],
+                'id_produto': str(r.get('id_produto', '') or ''),
+                'sku_1': '',
+                'sku_2': '',
+                'sku_3': '',
+            })
+    df_preencher = pd.DataFrame(linhas_preencher) if linhas_preencher else pd.DataFrame(
+        columns=['nome_anuncio', 'id_produto', 'sku_1', 'sku_2', 'sku_3']
+    )
+
+    # ---- ABA 2: matches_ativos ----
+    # Agrupar por anúncio: até MAX_SKUS_POR_ANUNCIO colunas de SKU
+    linhas_ativos = []
+    if not df_ativos.empty:
+        agrupado = df_ativos.groupby('nome_produto_ads', sort=False)
+        for nome, grupo in agrupado:
+            id_p = grupo['id_produto_ads'].iloc[0] if 'id_produto_ads' in grupo.columns else ''
+            skus = grupo['sku'].tolist()[:MAX_SKUS_POR_ANUNCIO]
+            data_inicio_min = grupo['data_inicio'].min()
+            linha = {
+                'nome_anuncio': nome,
+                'id_produto': str(id_p or ''),
+                'sku_atual_1': skus[0] if len(skus) >= 1 else '',
+                'sku_atual_2': skus[1] if len(skus) >= 2 else '',
+                'sku_atual_3': skus[2] if len(skus) >= 3 else '',
+                'novo_sku_1': '',
+                'novo_sku_2': '',
+                'novo_sku_3': '',
+                'data_inicio_mais_antiga': fmt_data_br(data_inicio_min),
+            }
+            linhas_ativos.append(linha)
+    df_ativos_export = pd.DataFrame(linhas_ativos) if linhas_ativos else pd.DataFrame(columns=[
+        'nome_anuncio', 'id_produto',
+        'sku_atual_1', 'sku_atual_2', 'sku_atual_3',
+        'novo_sku_1', 'novo_sku_2', 'novo_sku_3',
+        'data_inicio_mais_antiga'
+    ])
+
+    # ---- Montar XLSX em memória ----
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_preencher.to_excel(writer, sheet_name='a_preencher', index=False)
+        df_ativos_export.to_excel(writer, sheet_name='matches_ativos', index=False)
+
+        # Aba de instruções
+        instrucoes = pd.DataFrame({
+            'Instruções de uso': [
+                '1. Aba "a_preencher": anúncios SEM SKU vinculado. Preencha sku_1, sku_2, sku_3.',
+                '2. Aba "matches_ativos": anúncios COM SKU vinculado hoje.',
+                '   Para ALTERAR os SKUs de um anúncio, preencha novo_sku_1/2/3.',
+                '   - Se preencher, o sistema FECHA os SKUs atuais em CURRENT_DATE',
+                '     e ABRE novos registros com data_inicio = CURRENT_DATE.',
+                '   - Se deixar novo_sku_1/2/3 em branco, MANTÉM como está.',
+                '3. Não altere as colunas nome_anuncio nem id_produto.',
+                '4. Salve o arquivo e faça upload na tela "Upload de matches".',
+                '5. Deixe campos em branco para remover um SKU (quando aplicável).',
+            ]
+        })
+        instrucoes.to_excel(writer, sheet_name='instrucoes', index=False)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def _processar_upload_xlsx_matches(engine, loja_nome, arquivo_xlsx):
+    """
+    Lê o XLSX enviado pelo usuário e aplica as mudanças em dim_ads_produto_sku.
+
+    Regras:
+      - Aba 'a_preencher': para cada linha com sku_1/2/3 preenchidos, cria match
+        novo com data_inicio = CURRENT_DATE.
+      - Aba 'matches_ativos': para cada linha com novo_sku_1/2/3 preenchidos,
+        fecha os atuais (data_fim = CURRENT_DATE) e abre novos
+        (data_inicio = CURRENT_DATE). Se novo_sku_* em branco, ignora.
+
+    Retorna: (adicionados, alterados, ignorados, erros)
+    """
+    try:
+        xls = pd.ExcelFile(arquivo_xlsx)
+    except Exception as e:
+        return 0, 0, 0, [f"Não foi possível abrir o XLSX: {str(e)[:100]}"]
+
+    adicionados = 0
+    alterados = 0
+    ignorados = 0
+    erros = []
+
+    def _coletar_skus(row, prefix):
+        """Coleta sku_prefix_1..3 limpos, únicos, em ordem"""
+        lista = []
+        seen = set()
+        for i in (1, 2, 3):
+            col = f'{prefix}_{i}'
+            if col not in row.index:
+                continue
+            val = row[col]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            txt = str(val).strip()
+            if not txt or txt.lower() in ('nan', 'none'):
+                continue
+            if txt not in seen:
+                seen.add(txt)
+                lista.append(txt)
+        return lista
+
+    # ---- ABA a_preencher ----
+    if 'a_preencher' in xls.sheet_names:
+        df_ap = pd.read_excel(xls, sheet_name='a_preencher')
+        for idx, row in df_ap.iterrows():
+            nome = str(row.get('nome_anuncio', '') or '').strip()
+            id_prod = str(row.get('id_produto', '') or '').strip()
+            if not nome:
+                continue
+            skus_novos = _coletar_skus(row, 'sku')
+            if not skus_novos:
+                ignorados += 1
+                continue
+            ok = atualizar_matches_sku(engine, loja_nome, nome, id_prod, skus_novos)
+            if ok:
+                _sync_fact_sku_match(engine, loja_nome, nome, skus_novos[0])
+                adicionados += 1
+            else:
+                erros.append(f"[a_preencher] {nome[:40]}: falha ao gravar")
+
+    # ---- ABA matches_ativos ----
+    if 'matches_ativos' in xls.sheet_names:
+        df_ma = pd.read_excel(xls, sheet_name='matches_ativos')
+        for idx, row in df_ma.iterrows():
+            nome = str(row.get('nome_anuncio', '') or '').strip()
+            id_prod = str(row.get('id_produto', '') or '').strip()
+            if not nome:
+                continue
+            novos = _coletar_skus(row, 'novo_sku')
+            if not novos:
+                ignorados += 1
+                continue
+            atuais = _coletar_skus(row, 'sku_atual')
+            if sorted(atuais) == sorted(novos):
+                ignorados += 1
+                continue
+            ok = atualizar_matches_sku(engine, loja_nome, nome, id_prod, novos)
+            if ok:
+                _sync_fact_sku_match(engine, loja_nome, nome, novos[0])
+                alterados += 1
+            else:
+                erros.append(f"[matches_ativos] {nome[:40]}: falha ao gravar")
+
+    return adicionados, alterados, ignorados, erros
+
+
+# ============================================================
+# HELPERS DE IA (Gemini)
+# ============================================================
+
+# Faixas calibradas com dados reais dez/2025–abr/2026
+_FAIXAS_PROMPT = """
+**Faixas ACOS:**
+- 0–8%: Excelente → manter, considerar aumentar budget se TACOS bom
+- 8–15%: Saudável → manter e monitorar
+- 15–25%: Alerta → avaliar % orgânico; se > 50%, pode ser aceitável
+- 25–50%: Crítico → reduzir budget ou pausar
+- >50%: Drenar → pausar imediatamente (exceto Fase 1+2 com prazo)
+
+**Faixas TACOS:**
+- 0–3%: Excelente
+- 3–8%: Saudável
+- 8–15%: Elevado → avaliar dependência
+- >15%: Insustentável
+
+**Faixas CVR:**
+- >5%: Excelente
+- 2–5%: Normal
+- 1–2%: Baixo → verificar preço/fotos/reviews
+- <1%: Problema grave → pausar ads, otimizar página
+
+**Faixas % Orgânico:**
+- >70%: Forte
+- 40–70%: Equilibrado
+- 10–40%: Dependente
+- <10%: Viciado em ads
+
+**7 Regras de decisão (em ordem de prioridade):**
+1. ENCERRAR: investimento > R$30 E conversões = 0 E dias ativos > 7 → PAUSAR
+2. DRENAGEM: ACOS > 25% E % orgânico < 30% → ALERTA VERMELHO
+3. FASE 1+2 ACEITÁVEL SE: TACOS < 8% E % orgânico > 60%
+4. CANIBALIZAÇÃO: % orgânico atual < % orgânico baseline − 30pp E TACOS subiu
+5. CVR CRÍTICO: CVR < 0,5% E cliques > 500 → problema de página
+6. ESTRELA: ACOS < 10% E TACOS < 5% E % orgânico > 40% → aumentar budget 10–20%
+7. ORGÂNICO PURO: receita > R$500/quinzena E investimento = 0 → sinalizar como ativo
+"""
+
+
+def _coletar_dados_para_ia(engine, loja_nome, dt_inicio, dt_fim):
+    """
+    Retorna lista de dicts (um por anúncio) com as métricas necessárias para a IA.
+    """
+    df_ads = _query_df(engine, """
+        SELECT nome_anuncio, id_produto, status_anuncio,
+               data_inicio_anuncio, data_fim_anuncio,
+               metodo_lance, impressoes, cliques, ctr,
+               conversoes_diretas, taxa_conversao_direta,
+               itens_vendidos_diretos, receita_direta,
+               despesas, gmv, acos_direto, roas_direto,
+               sku_match
+        FROM fact_ads_shopee
+        WHERE loja = %s
+          AND periodo_inicio = %s
+          AND periodo_fim = %s
+        ORDER BY despesas DESC
+    """, [loja_nome, dt_inicio, dt_fim])
+
+    if df_ads.empty:
+        return []
+
+    dados = []
+    for _, ad in df_ads.iterrows():
+        lista_skus = buscar_skus_match(engine, loja_nome, ad['nome_anuncio'])
+        tacos_data = None
+        if lista_skus:
+            tacos_data = calcular_tacos(engine, loja_nome, lista_skus, dt_inicio, dt_fim)
+            if tacos_data and 'erro' in tacos_data:
+                tacos_data = None
+
+        # Dias ads efetivos
+        fim_efetivo = data_fim_efetiva(ad.get('data_fim_anuncio'), dt_fim)
+        inicio = ad.get('data_inicio_anuncio')
+        if inicio is not None and not pd.isna(inicio):
+            inicio_efetivo = max(inicio, dt_inicio)
+        else:
+            inicio_efetivo = dt_inicio
+        if fim_efetivo and inicio_efetivo and fim_efetivo >= inicio_efetivo:
+            dias_ads = (fim_efetivo - inicio_efetivo).days + 1
+        else:
+            dias_ads = 0
+
+        dados.append({
+            'produto': str(ad['nome_anuncio'])[:80],
+            'skus_vinculados': ', '.join(lista_skus) if lista_skus else 'NÃO VINCULADO',
+            'status': str(ad.get('status_anuncio', '')),
+            'metodo_lance': str(ad.get('metodo_lance', '')),
+            'investimento': float(ad['despesas'] or 0),
+            'gmv_painel': float(ad['gmv'] or 0),
+            'receita_direta': float(ad['receita_direta'] or 0),
+            'acos_direto_pct': float(ad['acos_direto'] or 0),
+            'roas_direto': float(ad['roas_direto'] or 0),
+            'cliques': int(ad['cliques'] or 0),
+            'impressoes': int(ad['impressoes'] or 0),
+            'ctr_pct': float(ad['ctr'] or 0),
+            'conversoes_diretas': int(ad['conversoes_diretas'] or 0),
+            'cvr_direta_pct': float(ad['taxa_conversao_direta'] or 0),
+            'itens_vendidos_diretos': int(ad['itens_vendidos_diretos'] or 0),
+            'dias_ads_efetivos': dias_ads,
+            'tacos_pct': tacos_data['tacos'] if tacos_data else None,
+            'pct_organico': tacos_data['pct_organico'] if tacos_data else None,
+            'receita_total_sku': tacos_data['receita_total'] if tacos_data else None,
+            'qtd_total_sku': tacos_data['qtd_total'] if tacos_data else None,
+        })
+    return dados
+
+
+def _montar_prompt_ia(loja_nome, dt_inicio, dt_fim, dados_periodo, dt_ini_comp, dt_fim_comp, dados_comp):
+    """Monta o prompt completo para a IA analista."""
+    linhas = [
+        "Você é um Senior Market Intelligence Auditor especialista em Shopee Ads.",
+        "Analise os dados da loja **{loja}** para o período **{di} a {df}**.".format(
+            loja=loja_nome,
+            di=fmt_data_br(dt_inicio), df=fmt_data_br(dt_fim)
+        ),
+        "",
+        "Responda em **PORTUGUÊS DO BRASIL** com a seguinte estrutura:",
+        "1. **Resumo geral da loja** (3–5 linhas)",
+        "2. **Ranking por TACOS** (pior → melhor) — use bullets",
+        "3. **Lista de ações** (Pausar / Reduzir / Manter / Escalar) — um bullet por anúncio com ação clara",
+        "4. **Comparação com período anterior** (se fornecido abaixo)",
+        "",
+        "Use formatação em markdown. Valores em R$ com formato BR (R$ 1.234,56) e percentuais com vírgula (13,57%).",
+        "",
+        "---",
+        _FAIXAS_PROMPT,
+        "",
+        "---",
+        "### Dados do período analisado",
+        "",
+    ]
+    if not dados_periodo:
+        linhas.append("_(sem dados no período)_")
+    else:
+        for i, d in enumerate(dados_periodo, 1):
+            linhas.append(
+                f"**{i}. {d['produto']}** | SKU(s): {d['skus_vinculados']} | Status: {d['status']}\n"
+                f"   - Método: {d['metodo_lance']} | Dias ads efetivos: {d['dias_ads_efetivos']}\n"
+                f"   - Investimento: R$ {d['investimento']:.2f} | GMV painel: R$ {d['gmv_painel']:.2f} "
+                f"| Receita direta: R$ {d['receita_direta']:.2f}\n"
+                f"   - ACOS direto: {d['acos_direto_pct']:.2f}% | ROAS direto: {d['roas_direto']:.2f}\n"
+                f"   - Impressões: {d['impressoes']} | Cliques: {d['cliques']} | CTR: {d['ctr_pct']:.2f}%\n"
+                f"   - Conversões diretas: {d['conversoes_diretas']} | CVR direta: {d['cvr_direta_pct']:.2f}%\n"
+                f"   - Itens vendidos diretos: {d['itens_vendidos_diretos']}\n"
+                f"   - TACOS calculado: {('%.2f%%' % d['tacos_pct']) if d['tacos_pct'] is not None else 'N/A (sem SKU vinculado)'}\n"
+                f"   - % Orgânico: {('%.2f%%' % d['pct_organico']) if d['pct_organico'] is not None else 'N/A'}\n"
+                f"   - Receita total SKU: {('R$ %.2f' % d['receita_total_sku']) if d['receita_total_sku'] is not None else 'N/A'}\n"
+            )
+
+    if dados_comp is not None and dt_ini_comp and dt_fim_comp:
+        linhas.append("")
+        linhas.append("---")
+        linhas.append(
+            f"### Dados do período anterior para comparação "
+            f"({fmt_data_br(dt_ini_comp)} a {fmt_data_br(dt_fim_comp)})"
+        )
+        linhas.append("")
+        if not dados_comp:
+            linhas.append("_(sem dados no período de comparação)_")
+        else:
+            for i, d in enumerate(dados_comp, 1):
+                linhas.append(
+                    f"**{i}. {d['produto']}** — Invest: R$ {d['investimento']:.2f} | "
+                    f"ACOS: {d['acos_direto_pct']:.2f}% | "
+                    f"TACOS: {('%.2f%%' % d['tacos_pct']) if d['tacos_pct'] is not None else 'N/A'} | "
+                    f"% Orgânico: {('%.2f%%' % d['pct_organico']) if d['pct_organico'] is not None else 'N/A'} | "
+                    f"Receita direta: R$ {d['receita_direta']:.2f}"
+                )
+
+    return "\n".join(linhas)
+
+
+def _chamar_gemini(prompt):
+    """Chama o Gemini e retorna o texto da resposta, ou mensagem de erro."""
+    if not GEMINI_DISPONIVEL:
+        return "❌ Biblioteca google-generativeai não está instalada."
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", None)
+    except Exception:
+        api_key = None
+    if not api_key:
+        return "❌ `GEMINI_API_KEY` não configurada em `st.secrets`."
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"❌ Erro ao chamar o Gemini: {str(e)[:300]}"
 
 
 # ============================================================
@@ -546,6 +939,82 @@ def _shopee_dashboard(engine):
         if not tem_alerta:
             st.success("Nenhum alerta crítico no período.")
 
+        # Persistir contexto do último cálculo para o bloco da IA
+        st.session_state['dash_ads_ultimo_calc'] = {
+            'loja_nome': loja_nome,
+            'dt_inicio': dt_inicio,
+            'dt_fim': dt_fim,
+        }
+
+    # ---- BLOCO DA IA (fora do "if CALCULAR", mas dependente do último cálculo) ----
+    ultimo = st.session_state.get('dash_ads_ultimo_calc')
+    if ultimo and ultimo.get('loja_nome') == loja_nome and ultimo.get('dt_inicio') == dt_inicio and ultimo.get('dt_fim') == dt_fim:
+        st.divider()
+        _bloco_ia_insights(engine, loja_nome, dt_inicio, dt_fim)
+
+
+def _bloco_ia_insights(engine, loja_nome, dt_inicio, dt_fim):
+    """Renderiza o botão e painel de insights da IA."""
+    st.markdown("### 🤖 Insights com IA")
+    st.caption(
+        "Análise automática com Gemini usando as 7 regras de decisão calibradas. "
+        "Opcionalmente, escolha um período anterior para comparação."
+    )
+
+    # Sugestão padrão de período anterior: mesma janela imediatamente antes
+    dias_janela = (dt_fim - dt_inicio).days + 1
+    sug_fim = dt_inicio - timedelta(days=1)
+    sug_ini = sug_fim - timedelta(days=dias_janela - 1)
+
+    comparar = st.checkbox(
+        "🔁 Comparar com período anterior",
+        value=False,
+        key="ia_comparar",
+        help=f"Sugestão: {fmt_data_br(sug_ini)} a {fmt_data_br(sug_fim)} (mesma janela de {dias_janela} dias)"
+    )
+    dt_ini_comp = None
+    dt_fim_comp = None
+    if comparar:
+        col1, col2 = st.columns(2)
+        with col1:
+            dt_ini_comp = st.date_input("Início comparação", value=sug_ini, key="ia_dt_ini")
+        with col2:
+            dt_fim_comp = st.date_input("Fim comparação", value=sug_fim, key="ia_dt_fim")
+
+    if st.button("🤖 Gerar Insights com IA", key="ia_gerar", type="primary"):
+        if not GEMINI_DISPONIVEL:
+            st.error("Biblioteca `google-generativeai` não está instalada no ambiente.")
+            return
+        with st.spinner("Coletando dados..."):
+            dados_periodo = _coletar_dados_para_ia(engine, loja_nome, dt_inicio, dt_fim)
+            dados_comp = None
+            if comparar and dt_ini_comp and dt_fim_comp:
+                dados_comp = _coletar_dados_para_ia(engine, loja_nome, dt_ini_comp, dt_fim_comp)
+
+        if not dados_periodo:
+            st.warning("Nenhum dado encontrado no período principal para analisar.")
+            return
+
+        with st.spinner("Montando prompt..."):
+            prompt = _montar_prompt_ia(
+                loja_nome, dt_inicio, dt_fim,
+                dados_periodo, dt_ini_comp, dt_fim_comp, dados_comp
+            )
+
+        with st.spinner("Consultando Gemini..."):
+            resposta = _chamar_gemini(prompt)
+
+        st.session_state['ia_ultima_resposta'] = resposta
+        st.session_state['ia_ultimo_prompt'] = prompt
+
+    # Exibir última resposta se houver
+    resposta = st.session_state.get('ia_ultima_resposta')
+    if resposta:
+        st.markdown("---")
+        st.markdown(resposta)
+        with st.expander("🔎 Ver prompt enviado à IA (debug)"):
+            st.code(st.session_state.get('ia_ultimo_prompt', ''), language='markdown')
+
 
 # ============================================================
 # TAB 3: MATCH SKU (múltiplos SKUs por anúncio, com data_editor)
@@ -596,6 +1065,53 @@ def _shopee_match_sku(engine):
     c1.metric("Total de anúncios", len(df_anuncios))
     c2.metric("Com SKU vinculado", com_match)
     c3.metric("Sem vínculo", sem_match)
+
+    # ---- BLOCO XLSX: download para preenchimento + upload ----
+    with st.expander("📎 Trabalhar via planilha (XLSX)", expanded=False):
+        st.caption(
+            "Baixe o XLSX com 2 abas: **`a_preencher`** (anúncios sem SKU) e "
+            "**`matches_ativos`** (vigentes hoje). Preencha fora do sistema e faça upload "
+            "de volta — novos matches entram com `data_inicio = hoje` e antigos (alterados) "
+            "fecham com `data_fim = hoje`."
+        )
+        colx1, colx2 = st.columns(2)
+        with colx1:
+            if st.button("📥 Gerar XLSX para preenchimento", key="match_xlsx_gen"):
+                with st.spinner("Gerando XLSX..."):
+                    xlsx_bytes = _gerar_xlsx_matches(engine, loja_nome)
+                st.session_state[f'match_xlsx_bytes_{loja_nome}'] = xlsx_bytes
+
+            xlsx_bytes = st.session_state.get(f'match_xlsx_bytes_{loja_nome}')
+            if xlsx_bytes:
+                nome_arq = f"matches_ads_{loja_nome.replace(' ', '_')}_{date.today().strftime('%Y%m%d')}.xlsx"
+                st.download_button(
+                    "⬇️ Baixar XLSX gerado",
+                    data=xlsx_bytes,
+                    file_name=nome_arq,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="match_xlsx_dl",
+                )
+
+        with colx2:
+            arq_up = st.file_uploader(
+                "📤 Upload de matches preenchidos",
+                type=['xlsx'], key="match_xlsx_up", accept_multiple_files=False
+            )
+            if arq_up and st.button("💾 Processar upload", key="match_xlsx_proc", type="primary"):
+                with st.spinner("Processando upload..."):
+                    adic, alter, ign, errs = _processar_upload_xlsx_matches(
+                        engine, loja_nome, arq_up
+                    )
+                if adic:
+                    st.success(f"✅ {adic} vínculo(s) novo(s) adicionado(s).")
+                if alter:
+                    st.success(f"✅ {alter} vínculo(s) alterado(s) (antigo fechado, novo aberto hoje).")
+                if ign:
+                    st.info(f"ℹ️ {ign} linha(s) ignorada(s) (sem alteração ou campos em branco).")
+                if errs:
+                    st.error(f"❌ {len(errs)} erro(s):")
+                    for e in errs[:10]:
+                        st.caption(e)
 
     st.divider()
 

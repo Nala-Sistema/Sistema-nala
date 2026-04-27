@@ -1,27 +1,30 @@
 """
 PERFORMANCE UTILS - Sistema Nala
-Versão: 1.3 (16/04/2026)
+Versão: 1.4 (19/04/2026)
 
 Funções auxiliares para o módulo Performance:
 - Modelos de projeção (Linear, Início Forte, Meio Forte, Final Fraco)
 - Queries de vendas, metas, tags, histórico
 - Cálculos de projeção, performance, margem
 
+VERSÃO 1.4 (19/04/2026):
+  - FIX: Nomes de produtos faltando — reordenação da construção do set
+    de anúncios: real → histórico → metas (antes: real → metas → histórico).
+    Metas com SKU vazio não bloqueiam mais o SKU do histórico.
+  - FIX: buscar_nomes_produtos sem filtro de status + TRIM no SKU
+  - FIX: COALESCE(codigo_anuncio, sku) para marketplaces sem código
+    de anúncio (Magalu, etc.)
+  - FIX: buscar_resumo_geral sem filtro de codigo_anuncio
+  - NOVO: buscar_skus_config_marketplace genérico (todos marketplaces)
+
 VERSÃO 1.3 (16/04/2026):
-  - NOVO: auto_copiar_metas_mes_anterior — grava metas do mês anterior no
-    mês atual automaticamente na primeira abertura (loja e anúncios)
-  - NOVO: preco_medio_manual em dim_metas_anuncio — preço editável pelo
-    usuário; quando NULL, usa o preço médio calculado do mês anterior
-  - salvar_metas_anuncio_lote agora grava preco_medio_manual
+  - auto_copiar_metas_mes_anterior, preco_medio_manual
 
 VERSÃO 1.2 (14/04/2026):
-  - NOVO: buscar_ultimo_dia_vendas — busca MAX(data_venda) por loja/mês
-  - get_dias_vendas aceita data_ref opcional (em vez de sempre usar today)
-  - construir_tabela_performance aceita dias_vendas/dias_mes opcionais
+  - buscar_ultimo_dia_vendas, get_dias_vendas com data_ref
 
 VERSÃO 1.1 (06/04/2026):
-  - Regra dos 3 Meses: construir_tabela_performance agora inclui anúncios
-    que venderam nos 3 meses anteriores no universo de anúncios.
+  - Regra dos 3 Meses
 """
 
 import pandas as pd
@@ -33,7 +36,6 @@ from database_utils import get_engine
 # MODELOS DE PROJEÇÃO
 # ============================================================
 
-# Peso por semana do mês (soma = 1.0)
 MODELOS_PROJECAO = {
     'Linear':        {'sem1': 0.25, 'sem2': 0.25, 'sem3': 0.25, 'sem4': 0.25,
                       'desc': 'Vendas distribuídas igualmente ao longo do mês'},
@@ -46,10 +48,6 @@ MODELOS_PROJECAO = {
 }
 
 def pct_esperado_ate_dia(dia_atual, dias_mes, modelo='Linear'):
-    """
-    Retorna a fração (0.0 a 1.0) de vendas esperada até o dia_atual
-    dado o modelo de projeção selecionado.
-    """
     if dia_atual <= 0:
         return 0.0
     if dia_atual >= dias_mes:
@@ -74,7 +72,6 @@ def pct_esperado_ate_dia(dia_atual, dias_mes, modelo='Linear'):
 
 
 def calcular_projecao(realizado, dia_atual, dias_mes, modelo='Linear'):
-    """Projeta valor total do mês baseado no realizado e modelo."""
     pct = pct_esperado_ate_dia(dia_atual, dias_mes, modelo)
     if pct <= 0:
         return 0.0
@@ -82,7 +79,6 @@ def calcular_projecao(realizado, dia_atual, dias_mes, modelo='Linear'):
 
 
 def calcular_performance(projecao, meta):
-    """Retorna % de performance (projeção / meta)."""
     if not meta or meta <= 0:
         return None
     return (projecao / meta) * 100
@@ -93,14 +89,12 @@ def calcular_performance(projecao, meta):
 # ============================================================
 
 def get_ano_mes(dt=None):
-    """Retorna string 'YYYY-MM' para a data."""
     if dt is None:
         dt = date.today()
     return dt.strftime('%Y-%m')
 
 
 def get_primeiro_ultimo_dia(ano_mes_str):
-    """Retorna (primeiro_dia, ultimo_dia) como date objects."""
     ano, mes = int(ano_mes_str[:4]), int(ano_mes_str[5:7])
     primeiro = date(ano, mes, 1)
     _, ultimo_dia = monthrange(ano, mes)
@@ -109,7 +103,6 @@ def get_primeiro_ultimo_dia(ano_mes_str):
 
 
 def get_mes_anterior(ano_mes_str, meses=1):
-    """Retorna ano_mes N meses atrás."""
     ano, mes = int(ano_mes_str[:4]), int(ano_mes_str[5:7])
     for _ in range(meses):
         mes -= 1
@@ -120,18 +113,11 @@ def get_mes_anterior(ano_mes_str, meses=1):
 
 
 def get_dias_vendas(ano_mes_str, data_ref=None):
-    """
-    Retorna (dias_vendas, dias_mes) para o mês.
-    Se data_ref fornecida, usa essa data como último dia com vendas
-    em vez de date.today().
-    """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes_str)
     dias_mes = ultimo.day
-
     ref = data_ref or date.today()
     if isinstance(ref, datetime):
         ref = ref.date()
-
     if ref >= primeiro and ref <= ultimo:
         dias_vendas = (ref - primeiro).days + 1
     elif ref > ultimo:
@@ -142,7 +128,6 @@ def get_dias_vendas(ano_mes_str, data_ref=None):
 
 
 def _raw_query(engine, sql, params=None):
-    """Executa query e retorna DataFrame."""
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -165,7 +150,6 @@ def _raw_query(engine, sql, params=None):
 
 
 def _raw_execute(engine, sql, params=None):
-    """Executa DML e faz commit."""
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -189,7 +173,6 @@ def _raw_execute(engine, sql, params=None):
 # ============================================================
 
 def buscar_lojas_por_marketplace(engine, marketplace):
-    """Retorna lista de lojas de um marketplace."""
     df = _raw_query(engine,
         "SELECT loja FROM dim_lojas WHERE marketplace = %s ORDER BY loja",
         (marketplace,))
@@ -197,7 +180,6 @@ def buscar_lojas_por_marketplace(engine, marketplace):
 
 
 def buscar_todas_lojas(engine):
-    """Retorna DataFrame com todas as lojas."""
     return _raw_query(engine,
         "SELECT loja, marketplace FROM dim_lojas ORDER BY marketplace, loja")
 
@@ -207,10 +189,6 @@ def buscar_todas_lojas(engine):
 # ============================================================
 
 def buscar_ultimo_dia_vendas(engine, loja, ano_mes):
-    """
-    Retorna a data (date) da última venda lançada no mês para a loja.
-    Retorna None se não houver vendas no mês.
-    """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
     df = _raw_query(engine,
         """SELECT MAX(data_venda) as ultima_data
@@ -232,7 +210,6 @@ def buscar_ultimo_dia_vendas(engine, loja, ano_mes):
 # ============================================================
 
 def buscar_meta_loja(engine, loja, ano_mes):
-    """Busca meta de uma loja em um mês."""
     df = _raw_query(engine,
         "SELECT * FROM dim_metas_loja WHERE loja_origem = %s AND ano_mes = %s",
         (loja, ano_mes))
@@ -242,7 +219,6 @@ def buscar_meta_loja(engine, loja, ano_mes):
 
 
 def salvar_meta_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo='Linear', usuario=None):
-    """Salva/atualiza meta de loja (UPSERT)."""
     sql = """
         INSERT INTO dim_metas_loja (loja_origem, marketplace, ano_mes, meta_receita, modelo_projecao, usuario_definiu, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, NOW())
@@ -260,19 +236,12 @@ def salvar_meta_loja(engine, loja, marketplace, ano_mes, meta_receita, modelo='L
 # ============================================================
 
 def buscar_metas_anuncio(engine, loja, ano_mes):
-    """Busca todas as metas de anúncios de uma loja em um mês."""
     return _raw_query(engine,
         "SELECT * FROM dim_metas_anuncio WHERE loja_origem = %s AND ano_mes = %s",
         (loja, ano_mes))
 
 
 def salvar_metas_anuncio_lote(engine, metas_list):
-    """
-    Salva metas de anúncios em lote.
-    metas_list = [{'loja_origem', 'marketplace', 'codigo_anuncio', 'logistica',
-                   'ano_mes', 'meta_quantidade', 'observacao',
-                   'preco_medio_manual' (opcional)}, ...]
-    """
     sql = """
         INSERT INTO dim_metas_anuncio
             (loja_origem, marketplace, codigo_anuncio, logistica, ano_mes,
@@ -322,12 +291,6 @@ def salvar_metas_anuncio_lote(engine, metas_list):
 # ============================================================
 
 def auto_copiar_metas_mes_anterior(engine, loja, marketplace, ano_mes):
-    """
-    Se o mês atual não tem metas de anúncio para esta loja,
-    copia automaticamente as metas do mês anterior.
-    Retorna True se copiou, False se já existiam metas.
-    NÃO copia preco_medio_manual (deixa NULL para usar o calculado do novo mês).
-    """
     df_atual = _raw_query(engine,
         "SELECT COUNT(*) as cnt FROM dim_metas_anuncio WHERE loja_origem = %s AND ano_mes = %s",
         (loja, ano_mes))
@@ -382,7 +345,7 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
     """
     Busca vendas realizadas por anúncio no mês, descontando devoluções.
     Para Amazon: agrupa por codigo_anuncio + logistica.
-    Para outros: agrupa APENAS por codigo_anuncio (evita duplicatas).
+    Para outros: COALESCE(codigo_anuncio, sku) como fallback.
     """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
     is_amazon = marketplace and 'AMAZON' in marketplace.upper()
@@ -400,14 +363,15 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         """
     else:
         sql_vendas = """
-            SELECT codigo_anuncio, MAX(sku) as sku, NULL as logistica,
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   MAX(sku) as sku, NULL as logistica,
                    SUM(quantidade)::float as qtd_vendas,
                    SUM(valor_venda_efetivo)::float as fat_vendas,
                    AVG(margem_percentual)::float as margem_atual
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-            GROUP BY codigo_anuncio
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
         """
 
     df_v = _raw_query(engine, sql_vendas, (loja, primeiro, ultimo))
@@ -417,6 +381,7 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
             if c in df_v.columns:
                 df_v[c] = pd.to_numeric(df_v[c], errors='coerce').fillna(0)
 
+    # Devoluções
     if is_amazon:
         sql_dev = """
             SELECT codigo_anuncio, tipo_logistica as logistica,
@@ -429,13 +394,14 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
         """
     else:
         sql_dev = """
-            SELECT codigo_anuncio, NULL as logistica,
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   NULL as logistica,
                    SUM(quantidade)::float as qtd_dev,
                    SUM(valor_venda_efetivo)::float as fat_dev
             FROM fact_devolucoes
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-            GROUP BY codigo_anuncio
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
         """
     df_d = _raw_query(engine, sql_dev, (loja, primeiro, ultimo))
 
@@ -476,10 +442,6 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
 # ============================================================
 
 def buscar_historico_meses(engine, loja, ano_mes_ref, meses_atras=3, marketplace=None):
-    """
-    Busca vendas agrupadas por anúncio para N meses anteriores.
-    Retorna dict: {'YYYY-MM': DataFrame, ...}
-    """
     is_amazon = marketplace and 'AMAZON' in marketplace.upper()
     resultado = {}
     for i in range(1, meses_atras + 1):
@@ -487,18 +449,25 @@ def buscar_historico_meses(engine, loja, ano_mes_ref, meses_atras=3, marketplace
         primeiro, ultimo = get_primeiro_ultimo_dia(mes)
 
         if is_amazon:
-            group_cols = "codigo_anuncio, sku, logistica"
+            sql = """
+                SELECT codigo_anuncio, sku, logistica,
+                       SUM(quantidade) as qtd, SUM(valor_venda_efetivo) as fat
+                FROM fact_vendas_snapshot
+                WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+                  AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+                GROUP BY codigo_anuncio, sku, logistica
+            """
         else:
-            group_cols = "codigo_anuncio, sku"
+            sql = """
+                SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                       sku,
+                       SUM(quantidade) as qtd, SUM(valor_venda_efetivo) as fat
+                FROM fact_vendas_snapshot
+                WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+                  AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+                GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku), sku
+            """
 
-        sql = f"""
-            SELECT {group_cols},
-                   SUM(quantidade) as qtd, SUM(valor_venda_efetivo) as fat
-            FROM fact_vendas_snapshot
-            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-            GROUP BY {group_cols}
-        """
         df = _raw_query(engine, sql, (loja, primeiro, ultimo))
         if not df.empty:
             if 'qtd' in df.columns:
@@ -516,27 +485,29 @@ def buscar_historico_meses(engine, loja, ano_mes_ref, meses_atras=3, marketplace
 # ============================================================
 
 def buscar_preco_medio_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
-    """
-    Retorna dict: {(codigo_anuncio, logistica): preco_medio, ...}
-    Preço médio = receita / quantidade do mês anterior.
-    """
     mes_ant = get_mes_anterior(ano_mes_ref, 1)
     primeiro, ultimo = get_primeiro_ultimo_dia(mes_ant)
     is_amazon = marketplace and 'AMAZON' in marketplace.upper()
 
     if is_amazon:
-        group_cols = "codigo_anuncio, logistica"
+        sql = """
+            SELECT codigo_anuncio, logistica,
+                   SUM(valor_venda_efetivo) / NULLIF(SUM(quantidade), 0) as preco_medio
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio, logistica
+        """
     else:
-        group_cols = "codigo_anuncio"
+        sql = """
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   SUM(valor_venda_efetivo) / NULLIF(SUM(quantidade), 0) as preco_medio
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
+        """
 
-    sql = f"""
-        SELECT {group_cols},
-               SUM(valor_venda_efetivo) / NULLIF(SUM(quantidade), 0) as preco_medio
-        FROM fact_vendas_snapshot
-        WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-        GROUP BY {group_cols}
-    """
     df = _raw_query(engine, sql, (loja, primeiro, ultimo))
     if df.empty:
         return {}
@@ -556,23 +527,28 @@ def buscar_preco_medio_mes_anterior(engine, loja, ano_mes_ref, marketplace=None)
 # ============================================================
 
 def buscar_margem_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
-    """Retorna dict: {(codigo_anuncio, logistica): margem_media, ...}"""
     mes_ant = get_mes_anterior(ano_mes_ref, 1)
     primeiro, ultimo = get_primeiro_ultimo_dia(mes_ant)
     is_amazon = marketplace and 'AMAZON' in marketplace.upper()
 
     if is_amazon:
-        group_cols = "codigo_anuncio, logistica"
+        sql = """
+            SELECT codigo_anuncio, logistica, AVG(margem_percentual) as margem_media
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
+            GROUP BY codigo_anuncio, logistica
+        """
     else:
-        group_cols = "codigo_anuncio"
+        sql = """
+            SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
+                   AVG(margem_percentual) as margem_media
+            FROM fact_vendas_snapshot
+            WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
+              AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku)
+        """
 
-    sql = f"""
-        SELECT {group_cols}, AVG(margem_percentual) as margem_media
-        FROM fact_vendas_snapshot
-        WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
-          AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
-        GROUP BY {group_cols}
-    """
     df = _raw_query(engine, sql, (loja, primeiro, ultimo))
     if df.empty:
         return {}
@@ -589,7 +565,6 @@ def buscar_margem_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
 # ============================================================
 
 def buscar_tags_anuncios_dict(engine, marketplace=None):
-    """Retorna dict: {(marketplace, codigo_anuncio): {tag_curva, tag_status, observacoes}}"""
     sql = "SELECT marketplace, codigo_anuncio, tag_curva, tag_status, observacoes FROM dim_tags_anuncio"
     params = ()
     if marketplace:
@@ -607,7 +582,6 @@ def buscar_tags_anuncios_dict(engine, marketplace=None):
 
 
 def buscar_opcoes_tags(engine, tipo='anuncio'):
-    """Retorna lista de tags ativas do cardápio."""
     df = _raw_query(engine,
         "SELECT nome_tag, cor FROM dim_tags_opcoes WHERE tipo = %s AND ativo = TRUE ORDER BY nome_tag",
         (tipo,))
@@ -619,20 +593,37 @@ def buscar_opcoes_tags(engine, tipo='anuncio'):
 # ============================================================
 
 def buscar_nomes_produtos(engine):
-    """Retorna dict: {sku: nome}"""
-    df = _raw_query(engine, "SELECT sku, nome FROM dim_produtos WHERE status = 'Ativo'")
+    """Retorna dict: {sku: nome} — inclui todos os produtos (ativos e inativos)."""
+    df = _raw_query(engine, "SELECT TRIM(sku) as sku, nome FROM dim_produtos WHERE sku IS NOT NULL")
     if df.empty:
         return {}
-    return {row['sku']: row['nome'] for _, row in df.iterrows()}
+    return {str(row['sku']).strip(): row['nome'] for _, row in df.iterrows()}
 
 
-def buscar_skus_config_amazon(engine):
-    """Retorna dict: {asin: sku} da dim_config_marketplace Amazon."""
-    df = _raw_query(engine,
-        "SELECT DISTINCT asin, sku FROM dim_config_marketplace WHERE marketplace = 'AMAZON' AND ativo = true AND asin IS NOT NULL AND sku IS NOT NULL")
+def buscar_skus_config_marketplace(engine, marketplace):
+    """
+    Retorna dict: {codigo_anuncio: sku} da dim_config_marketplace.
+    Para Amazon usa ASIN como chave; para outros usa codigo_anuncio.
+    Fallback genérico para encontrar SKU de anúncios sem vendas recentes.
+    """
+    is_amazon = 'AMAZON' in marketplace.upper()
+    if is_amazon:
+        df = _raw_query(engine,
+            """SELECT DISTINCT asin as cod, sku
+               FROM dim_config_marketplace
+               WHERE marketplace = %s AND ativo = true
+                 AND asin IS NOT NULL AND sku IS NOT NULL""",
+            (marketplace,))
+    else:
+        df = _raw_query(engine,
+            """SELECT DISTINCT codigo_anuncio as cod, sku
+               FROM dim_config_marketplace
+               WHERE marketplace = %s AND ativo = true
+                 AND codigo_anuncio IS NOT NULL AND sku IS NOT NULL""",
+            (marketplace,))
     if df.empty:
         return {}
-    return {str(row['asin']).strip(): str(row['sku']).strip() for _, row in df.iterrows()}
+    return {str(row['cod']).strip(): str(row['sku']).strip() for _, row in df.iterrows()}
 
 
 # ============================================================
@@ -640,7 +631,6 @@ def buscar_skus_config_amazon(engine):
 # ============================================================
 
 def buscar_resumo_geral(engine, ano_mes):
-    """Busca resumo de performance por loja para a tab Geral."""
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
 
     sql = """
@@ -649,7 +639,6 @@ def buscar_resumo_geral(engine, ano_mes):
                SUM(v.valor_venda_efetivo) as fat_realizado
         FROM fact_vendas_snapshot v
         WHERE v.data_venda >= %s AND v.data_venda <= %s
-          AND v.codigo_anuncio IS NOT NULL AND TRIM(v.codigo_anuncio) != ''
         GROUP BY v.loja_origem, v.marketplace_origem
     """
     df_vendas = _raw_query(engine, sql, (primeiro, ultimo))
@@ -678,9 +667,9 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
     """
     Constrói o DataFrame completo de performance para uma loja/mês.
 
-    v1.3 — preco_medio_manual: quando existe no banco, usa o preço manual;
-    caso contrário usa o preço médio calculado do mês anterior.
-    Coluna 'preco_medio' sempre incluída no output para exibição/edição.
+    v1.4 — Ordem de construção do set de anúncios: real → histórico → metas.
+    Garante que o SKU do histórico/realizado não seja sobrescrito pelo SKU
+    vazio das metas. Fallback genérico de SKU via dim_config_marketplace.
     """
     is_amazon = 'AMAZON' in marketplace.upper()
 
@@ -712,23 +701,19 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
     # 7. Histórico (3 meses anteriores)
     historico = buscar_historico_meses(engine, loja, ano_mes, 3, marketplace)
 
-    # Montar lista de anúncios únicos
+    # ── MONTAR SET DE ANÚNCIOS ──────────────────────────────
+    # ORDEM: real → histórico → metas
+    # Isso garante que SKU do real/histórico tem prioridade sobre o vazio das metas.
     anuncios = set()
+
+    # Passo 1: Anúncios do realizado (com SKU correto)
     if not df_real.empty:
         for _, r in df_real.iterrows():
             log = r.get('logistica')
             log = None if pd.isna(log) else log
             anuncios.add((r['codigo_anuncio'], r['sku'], log))
 
-    codigos_existentes = {(a[0], a[2]) for a in anuncios}
-    if not df_metas.empty:
-        for _, r in df_metas.iterrows():
-            log = r.get('logistica')
-            log = None if pd.isna(log) else log
-            if (r['codigo_anuncio'], log) not in codigos_existentes:
-                anuncios.add((r['codigo_anuncio'], '', log))
-
-    # ── REGRA DOS 3 MESES ──
+    # Passo 2: Anúncios do histórico (com SKU — antes das metas!)
     codigos_existentes = {(a[0], a[2]) for a in anuncios}
     for mes_key, df_hist in historico.items():
         if not df_hist.empty:
@@ -739,13 +724,23 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
                     anuncios.add((h['codigo_anuncio'], h.get('sku', ''), log))
                     codigos_existentes.add((h['codigo_anuncio'], log))
 
-    config_skus = buscar_skus_config_amazon(engine) if is_amazon else {}
+    # Passo 3: Anúncios das metas (SKU vazio — último, não sobrescreve)
+    codigos_existentes = {(a[0], a[2]) for a in anuncios}
+    if not df_metas.empty:
+        for _, r in df_metas.iterrows():
+            log = r.get('logistica')
+            log = None if pd.isna(log) else log
+            if (r['codigo_anuncio'], log) not in codigos_existentes:
+                anuncios.add((r['codigo_anuncio'], '', log))
+
+    # Fallback: SKUs da config para anúncios sem SKU
+    config_skus = buscar_skus_config_marketplace(engine, marketplace)
 
     if not anuncios:
         return pd.DataFrame()
 
     rows = []
-    for cod_anuncio, sku_from_real, logistica in anuncios:
+    for cod_anuncio, sku_from_set, logistica in anuncios:
         # Realizados
         if not df_real.empty:
             if is_amazon:
@@ -761,12 +756,13 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
             qtd_real = int(r['qtd_realizado'])
             fat_real = float(r['fat_realizado'])
             margem_at = float(r['margem_atual'])
-            sku = str(r['sku'])
+            sku = str(r['sku']).strip()
         else:
             qtd_real, fat_real, margem_at = 0, 0.0, 0.0
-            sku = sku_from_real or ''
+            sku = str(sku_from_set or '').strip()
 
-        if (not sku or sku in ('', 'None', 'nan')) and is_amazon:
+        # Fallback: buscar SKU da config (todos marketplaces)
+        if not sku or sku in ('', 'None', 'nan'):
             sku = config_skus.get(cod_anuncio, '')
 
         # Meta e preço manual
@@ -827,7 +823,7 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
             if mes_key not in hist_data:
                 hist_data[mes_key] = {'qtd': 0, 'fat': 0.0}
 
-        nome_produto = nomes.get(sku, '')
+        nome_produto = nomes.get(str(sku).strip(), '')
 
         row = {
             'codigo_anuncio': cod_anuncio,
