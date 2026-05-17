@@ -24,81 +24,86 @@ import pandas as pd
 MODULOS = [
     'inicio', 'performance', 'skus', 'vendas', 'tags',
     'compras', 'config', 'calculadora', 'ia', 'kanban',
-    'tabela_preco', 'ads',
+    'tabela_preco', 'ads', 'analise_produtos',
 ]
 
 # Mapa de permissões por perfil
 # Valores: 'completo', 'leitura', 'parcial', False (sem acesso)
 PERMISSOES = {
     'ADMIN': {
-        'inicio':       'completo',
-        'performance':  'completo',
-        'skus':         'completo',
-        'vendas':       'completo',
-        'tags':         'completo',
-        'compras':      'completo',
-        'config':       'completo',
-        'calculadora':  'completo',
-        'ia':           'completo',
-        'kanban':       'completo',
-        'tabela_preco': 'completo',
-        'ads':          'completo',
+        'inicio':            'completo',
+        'performance':       'completo',
+        'skus':              'completo',
+        'vendas':            'completo',
+        'tags':              'completo',
+        'compras':           'completo',
+        'config':            'completo',
+        'calculadora':       'completo',
+        'ia':                'completo',
+        'kanban':            'completo',
+        'tabela_preco':      'completo',
+        'ads':               'completo',
+        'analise_produtos':  'completo',
     },
     'CONTROLADORIA': {
-        'inicio':       'completo',
-        'performance':  'completo',
-        'skus':         'completo',
-        'vendas':       'completo',
-        'tags':         'completo',
-        'compras':      'completo',
-        'config':       'completo',
-        'calculadora':  False,
-        'ia':           'completo',
-        'kanban':       'completo',
-        'tabela_preco': 'completo',
-        'ads':          'completo',
+        'inicio':            'completo',
+        'performance':       'completo',
+        'skus':              'completo',
+        'vendas':            'completo',
+        'tags':              'completo',
+        'compras':           'completo',
+        'config':            'completo',
+        'calculadora':       False,
+        'ia':                'completo',
+        'kanban':            'completo',
+        'tabela_preco':      'completo',
+        'ads':               'completo',
+        'analise_produtos':  'completo',
     },
     'DIRETOR': {
-        'inicio':       'leitura',
-        'performance':  'leitura',
-        'skus':         'leitura',
-        'vendas':       'leitura',
-        'tags':         'leitura',
-        'compras':      'leitura',
-        'config':       'leitura',
-        'calculadora':  False,
-        'ia':           'completo',
-        'kanban':       'completo',
-        'tabela_preco': 'leitura',
-        'ads':          'leitura',
+        'inicio':            'leitura',
+        'performance':       'leitura',
+        'skus':              'leitura',
+        'vendas':            'leitura',
+        'tags':              'leitura',
+        'compras':           'leitura',
+        'config':            'leitura',
+        'calculadora':       False,
+        'ia':                'completo',
+        'kanban':            'completo',
+        'tabela_preco':      'leitura',
+        'ads':               'leitura',
+        'analise_produtos':  'leitura',
     },
     'COMPRAS': {
-        'inicio':       'completo',
-        'performance':  'completo',
-        'skus':         'completo',
-        'vendas':       'leitura',
-        'tags':         'completo',
-        'compras':      'completo',
-        'config':       False,
-        'calculadora':  False,
-        'ia':           'completo',
-        'kanban':       'completo',
-        'tabela_preco': 'completo',
-        'ads':          'completo',
+        'inicio':            'completo',
+        'performance':       'completo',
+        'skus':              'completo',
+        'vendas':            'leitura',
+        'tags':              'completo',
+        'compras':           'completo',
+        'config':            False,
+        'calculadora':       False,
+        'ia':                'completo',
+        'kanban':            'completo',
+        'tabela_preco':      'completo',
+        'ads':               'completo',
+        'analise_produtos':  'completo',
     },
     'GESTOR': {
-        'inicio':       'parcial',      # filtrado por loja
-        'performance':  'parcial',      # filtrado por loja
-        'skus':         False,
-        'vendas':       'parcial',      # filtrado por loja
-        'tags':         'parcial',      # filtrado por loja
-        'compras':      False,
-        'config':       'parcial',      # só aba de anúncios
-        'calculadora':  False,
-        'ia':           'parcial',      # filtrado por loja + sem custos
-        'kanban':       'completo',
-        'tabela_preco': 'parcial',      # filtrado por marketplace
-        'ads':          'parcial',      # filtrado por marketplace
+        'inicio':            'parcial',      # filtrado por loja
+        'performance':       'parcial',      # filtrado por loja
+        'skus':              False,
+        'vendas':            'parcial',      # filtrado por loja
+        'tags':              'parcial',      # filtrado por loja
+        'compras':           False,
+        'config':            'parcial',      # só aba de anúncios
+        'calculadora':       False,
+        'ia':                'parcial',      # filtrado por loja + sem custos
+        'kanban':            'completo',
+        'tabela_preco':      'parcial',      # filtrado por marketplace
+        'ads':               'parcial',      # filtrado por marketplace
+        'analise_produtos':  'parcial',      # filtrado por loja
     },
 }
 
@@ -120,18 +125,19 @@ COLUNAS_CUSTO_OCULTAS = [
 
 # Mapeamento menu → módulo interno
 MENU_MODULOS = {
-    '🏠 Início':          'inicio',
-    '📊 Performance':     'performance',
-    '📦 SKUs':            'skus',
-    '💰 Vendas':          'vendas',
-    '🏷️ Tags':           'tags',
-    '🛒 Compras':         'compras',
-    '🧮 Calculadora':     'calculadora',
-    '🤖 Nala IA':         'ia',
-    '📋 Kanban':          'kanban',
-    '💲 Tabela de Preço': 'tabela_preco',
-    '📊 Análise de Ads':  'ads',
-    '⚙️ Config':          'config',
+    '🏠 Início':                'inicio',
+    '📊 Performance':           'performance',
+    '📦 SKUs':                  'skus',
+    '💰 Vendas':                'vendas',
+    '📈 Análise de Produtos':   'analise_produtos',
+    '🏷️ Tags':                 'tags',
+    '🛒 Compras':               'compras',
+    '🧮 Calculadora':           'calculadora',
+    '🤖 Nala IA':               'ia',
+    '📋 Kanban':                'kanban',
+    '💲 Tabela de Preço':       'tabela_preco',
+    '📊 Análise de Ads':        'ads',
+    '⚙️ Config':                'config',
 }
 
 
