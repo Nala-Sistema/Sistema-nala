@@ -84,6 +84,17 @@ def _query_to_df(engine, query, params=None):
         conn.close()
 
 
+def _coerce_num(df, cols):
+    """
+    psycopg2 traz NUMERIC do Postgres como Decimal — pandas vê como dtype=object,
+    o que quebra .nlargest(), .sum() etc. Convertemos para float aqui.
+    """
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _opcoes_lojas_marketplaces():
     """Lista distinct de lojas e marketplaces vindos de dim_lojas."""
@@ -222,7 +233,7 @@ def _tab_mais_vendidos(engine):
             SUM(f.valor_venda_efetivo) / NULLIF(SUM(f.quantidade), 0) AS ticket_medio,
             COUNT(DISTINCT f.loja_origem)::int                   AS lojas_ativas,
             COUNT(DISTINCT f.marketplace_origem)::int            AS marketplaces_ativos,
-            MAX(t.tag_curva)                                     AS curva
+            MIN(t.tag_curva)                                     AS curva
         FROM fact_vendas_snapshot f
         LEFT JOIN dim_produtos p ON p.sku = f.sku
         LEFT JOIN dim_tags_anuncio t ON t.codigo_anuncio = f.codigo_anuncio
@@ -243,6 +254,10 @@ def _tab_mais_vendidos(engine):
     if df.empty:
         st.info("Nenhuma venda encontrada para os filtros selecionados.")
         return
+
+    # NUMERIC do Postgres vem como Decimal/object → converter para float
+    df = _coerce_num(df, ['quantidade', 'receita', 'pedidos', 'margem_pct',
+                          'ticket_medio', 'lojas_ativas', 'marketplaces_ativos'])
 
     # Métricas resumo no topo
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -360,6 +375,8 @@ def _tab_crescimento(engine):
     if df.empty:
         st.info("Sem dados nos períodos selecionados.")
         return
+
+    df = _coerce_num(df, ['qtd_atual', 'qtd_ant', 'rec_atual', 'rec_ant'])
 
     # Calcula deltas
     df['delta_qtd'] = df['qtd_atual'] - df['qtd_ant']
@@ -506,7 +523,8 @@ def _tab_cobertura(engine):
         st.info("Nenhum SKU no estoque.")
         return
 
-    df['venda_dia']  = df['vendas_30d'].astype(float) / 30.0
+    df = _coerce_num(df, ['estoque', 'vendas_30d'])
+    df['venda_dia']  = df['vendas_30d'].fillna(0).astype(float) / 30.0
     df['dias_cobertura'] = df.apply(
         lambda r: (float(r['estoque']) / r['venda_dia']) if r['venda_dia'] > 0 else None,
         axis=1,
