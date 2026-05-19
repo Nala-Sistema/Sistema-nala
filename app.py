@@ -96,10 +96,21 @@ def _is_dev_environment():
 # ============================================================
 
 def carregar_modulo(nome_modulo):
-    """Carrega e recarrega módulos .py dinamicamente."""
+    """
+    Carrega módulos .py dinamicamente.
+
+    PERF v3.6 — Antes: importlib.reload() era chamado em TODO rerun (cada clique),
+    forçando reparse + reexecução do módulo inteiro. Causa principal do "ficou
+    carregando" a cada interação.
+
+    Agora: reload acontece apenas em ambiente Dev (para refletir mudanças durante
+    desenvolvimento) ou quando o usuário aciona explicitamente o toggle na sidebar.
+    Em produção, import normal — Python aproveita o cache de módulos.
+    """
     try:
         modulo = importlib.import_module(nome_modulo)
-        importlib.reload(modulo)
+        if _is_dev_environment() or st.session_state.get('_force_reload_modules', False):
+            importlib.reload(modulo)
         modulo.main()
     except Exception as e:
         st.error(f"⚠️ Erro crítico no módulo '{nome_modulo}':")
@@ -302,31 +313,36 @@ def _mes_anterior(ano_mes):
 # PAINEL DE INÍCIO — MÉTRICAS
 # ============================================================
 
-def _buscar_metricas_inicio(engine, ano_mes=None):
-    """Busca métricas do mês selecionado e anterior para o painel."""
+def _user_lojas_key():
+    """Chave de cache estável para o filtro de lojas do usuário logado."""
     from permissoes import ve_todas_lojas, get_lojas_usuario
+    if ve_todas_lojas():
+        return ('ALL',)
+    lojas = get_lojas_usuario()
+    return tuple(sorted(lojas)) if lojas else ('NONE',)
 
-    if ano_mes is None:
-        ano_mes = date.today().strftime('%Y-%m')
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _metricas_inicio_cached(ano_mes, lojas_key):
+    """Versão cacheada (3 min) — chave: ano_mes + tupla de lojas do usuário."""
+    from database_utils import get_engine
+    engine = get_engine()
 
     primeiro_sel, ultimo_sel = _ano_mes_para_datas(ano_mes)
     mes_ant = _mes_anterior(ano_mes)
     primeiro_ant, ultimo_ant = _ano_mes_para_datas(mes_ant)
 
+    where_loja = ""
+    params_loja = []
+    if lojas_key and lojas_key != ('ALL',) and lojas_key != ('NONE',):
+        placeholders = ', '.join(['%s'] * len(lojas_key))
+        where_loja = f" AND loja_origem IN ({placeholders})"
+        params_loja = list(lojas_key)
+
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        where_loja = ""
-        params_loja = []
-        if not ve_todas_lojas():
-            lojas = get_lojas_usuario(engine)
-            if lojas:
-                placeholders = ', '.join(['%s'] * len(lojas))
-                where_loja = f" AND loja_origem IN ({placeholders})"
-                params_loja = list(lojas)
-
-        # Mês selecionado
         cursor.execute(f"""
             SELECT COALESCE(SUM(valor_venda_efetivo), 0),
                    COALESCE(COUNT(*), 0),
@@ -336,7 +352,6 @@ def _buscar_metricas_inicio(engine, ano_mes=None):
         """, [primeiro_sel, ultimo_sel] + params_loja)
         fat_sel, ped_sel, margem_sel = cursor.fetchone()
 
-        # Mês anterior
         cursor.execute(f"""
             SELECT COALESCE(SUM(valor_venda_efetivo), 0),
                    COALESCE(COUNT(*), 0),
@@ -346,12 +361,27 @@ def _buscar_metricas_inicio(engine, ano_mes=None):
         """, [primeiro_ant, ultimo_ant] + params_loja)
         fat_ant, ped_ant, margem_ant = cursor.fetchone()
 
-        # SKUs ativos
         cursor.execute("SELECT COUNT(*) FROM dim_produtos WHERE status = 'Ativo'")
         total_skus = cursor.fetchone()[0]
 
         cursor.close()
         conn.close()
+        return (fat_sel, ped_sel, margem_sel, fat_ant, ped_ant, margem_ant, total_skus)
+    except Exception:
+        return None
+
+
+def _buscar_metricas_inicio(engine, ano_mes=None):
+    """Busca métricas do mês selecionado e anterior para o painel. (wrapper de cache)"""
+    if ano_mes is None:
+        ano_mes = date.today().strftime('%Y-%m')
+
+    res = _metricas_inicio_cached(ano_mes, _user_lojas_key())
+
+    try:
+        if res is None:
+            raise ValueError("query falhou")
+        fat_sel, ped_sel, margem_sel, fat_ant, ped_ant, margem_ant, total_skus = res
 
         var_fat = ((float(fat_sel) / float(fat_ant) - 1) * 100) if fat_ant > 0 else 0
         var_ped = ((int(ped_sel) / int(ped_ant) - 1) * 100) if ped_ant > 0 else 0
@@ -385,8 +415,11 @@ def _buscar_metricas_inicio(engine, ano_mes=None):
 # PANORAMA DE VENDAS POR LOJA
 # ============================================================
 
-def _buscar_metas_panorama(engine, ano_mes):
-    """Busca metas de todas as lojas para o mês. Retorna dict {loja: {meta_receita, modelo}}."""
+@st.cache_data(ttl=180, show_spinner=False)
+def _buscar_metas_panorama_cached(ano_mes):
+    """Busca metas de todas as lojas para o mês. Cache 3 min."""
+    from database_utils import get_engine
+    engine = get_engine()
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
@@ -404,15 +437,22 @@ def _buscar_metas_panorama(engine, ano_mes):
         return {}
 
 
-def _buscar_panorama_lojas(engine, ano_mes=None):
-    """
-    Busca panorama de vendas por loja para o mês selecionado.
-    Retorna rows: (loja, ult_att, max_mes_sel, vendas_sel, fat_sel, fat_ant_total, fat_ant_prop)
-    """
-    from permissoes import ve_todas_lojas, get_lojas_usuario
+def _buscar_metas_panorama(engine, ano_mes):
+    """Wrapper de compatibilidade — delega para versão cacheada."""
+    return _buscar_metas_panorama_cached(ano_mes)
 
-    if ano_mes is None:
-        ano_mes = date.today().strftime('%Y-%m')
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _panorama_lojas_cached(ano_mes, lojas_key):
+    """
+    Versão cacheada (3 min) do panorama de vendas por loja.
+    v3.6: adicionada coluna AVG(margem_percentual) do mês selecionado.
+
+    Retorna rows: (loja, ult_att, max_mes_sel, vendas_sel, fat_sel,
+                   fat_ant_total, fat_ant_prop, margem_pct_sel)
+    """
+    from database_utils import get_engine
+    engine = get_engine()
 
     primeiro_sel, ultimo_sel = _ano_mes_para_datas(ano_mes)
     mes_ant = _mes_anterior(ano_mes)
@@ -423,17 +463,14 @@ def _buscar_panorama_lojas(engine, ano_mes=None):
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        # Filtro RBAC — duas versões (CTE sem alias, SELECT principal com alias f.)
         where_loja_cte = ""
         where_loja_main = ""
         params_loja = []
-        if not ve_todas_lojas():
-            lojas = get_lojas_usuario(engine)
-            if lojas:
-                placeholders = ', '.join(['%s'] * len(lojas))
-                where_loja_cte = f" AND loja_origem IN ({placeholders})"
-                where_loja_main = f" AND f.loja_origem IN ({placeholders})"
-                params_loja = list(lojas)
+        if lojas_key and lojas_key != ('ALL',) and lojas_key != ('NONE',):
+            placeholders = ', '.join(['%s'] * len(lojas_key))
+            where_loja_cte = f" AND loja_origem IN ({placeholders})"
+            where_loja_main = f" AND f.loja_origem IN ({placeholders})"
+            params_loja = list(lojas_key)
 
         query = f"""
             WITH max_dates AS (
@@ -453,7 +490,8 @@ def _buscar_panorama_lojas(engine, ano_mes=None):
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (
                     WHERE f.data_venda >= %s
                       AND f.data_venda <= COALESCE(md.max_mes_sel - INTERVAL '1 month', %s::date)
-                ), 0)                                                                                            AS fat_ant_prop
+                ), 0)                                                                                            AS fat_ant_prop,
+                AVG(f.margem_percentual) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                AS margem_pct_sel
             FROM fact_vendas_snapshot f
             LEFT JOIN max_dates md ON f.loja_origem = md.loja_origem
             WHERE 1=1 {where_loja_main}
@@ -468,6 +506,7 @@ def _buscar_panorama_lojas(engine, ano_mes=None):
             primeiro_sel, ultimo_sel,
             primeiro_ant, ultimo_ant,
             primeiro_ant, fallback_ant,
+            primeiro_sel, ultimo_sel,
         ] + params_loja
 
         cursor.execute(query, params)
@@ -478,8 +517,18 @@ def _buscar_panorama_lojas(engine, ano_mes=None):
         return rows
 
     except Exception as e:
-        st.error(f"Erro ao buscar panorama: {e}")
+        return ('ERROR', str(e))
+
+
+def _buscar_panorama_lojas(engine, ano_mes=None):
+    """Wrapper de compatibilidade — delega para versão cacheada."""
+    if ano_mes is None:
+        ano_mes = date.today().strftime('%Y-%m')
+    res = _panorama_lojas_cached(ano_mes, _user_lojas_key())
+    if isinstance(res, tuple) and len(res) == 2 and res[0] == 'ERROR':
+        st.error(f"Erro ao buscar panorama: {res[1]}")
         return []
+    return res
 
 
 def _renderizar_panorama(rows, metas, ano_mes, engine):
@@ -539,6 +588,18 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
         else:
             return f'<span class="pct-down">🔴 {perf:.1f}%</span>'
 
+    def fmt_margem(margem):
+        if margem is None:
+            return '<span class="pct-zero">—</span>'
+        m = float(margem)
+        if m >= 20:
+            return f'<span class="pct-up">{m:.1f}%</span>'
+        if m >= 10:
+            return f'<span style="color:#e67e22;font-weight:600">{m:.1f}%</span>'
+        if m > 0:
+            return f'<span class="pct-down">{m:.1f}%</span>'
+        return f'<span class="pct-down">{m:.1f}%</span>'
+
     # Header
     html = f'''<div class="panorama-container">
     <div class="panorama-title">Panorama de Vendas por Loja — {nome_mes_sel} {ano_sel}</div>
@@ -551,6 +612,7 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
         <th style="text-align:right">Meta {nome_mes_sel}</th>
         <th style="text-align:right">Vendas {nome_mes_sel}</th>
         <th style="text-align:right">Fat. {nome_mes_sel}</th>
+        <th style="text-align:right">Margem</th>
         <th style="text-align:right">Projetado</th>
         <th style="text-align:right">Performance</th>
     </tr></thead><tbody>'''
@@ -563,8 +625,15 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     tot_meta = 0.0
     tot_projetado = 0.0
     tot_projetado_com_meta = 0.0  # apenas lojas COM meta — usado no cálculo de performance
+    # v3.6: agregação ponderada da margem para a linha TOTAL
+    soma_margem_x_vendas = 0.0
+    soma_vendas_com_margem = 0
 
-    for loja, ult_att, max_mes, vendas, fat_sel, fat_ant_t, fat_ant_p in rows:
+    for row in rows:
+        # v3.6: tupla agora tem 8 colunas (8ª = margem_pct_sel)
+        loja, ult_att, max_mes, vendas, fat_sel, fat_ant_t, fat_ant_p = row[:7]
+        margem_pct = row[7] if len(row) > 7 else None
+
         ult_str = ult_att.strftime('%d/%m/%Y') if ult_att else '—'
         fat_sel_f = float(fat_sel)
         vendas_int = int(vendas)
@@ -573,6 +642,10 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
         tot_fat_sel += fat_sel_f
         tot_fat_ant += float(fat_ant_t)
         tot_fat_ant_prop += float(fat_ant_p)
+
+        if margem_pct is not None and vendas_int > 0:
+            soma_margem_x_vendas += float(margem_pct) * vendas_int
+            soma_vendas_com_margem += vendas_int
 
         # Meta e modelo da loja
         meta_info = metas.get(loja)
@@ -608,6 +681,7 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
             <td style="text-align:right">{meta_html}</td>
             <td style="text-align:right">{fmt_int(vendas_int)}</td>
             <td style="text-align:right">{fmt_brl(fat_sel_f)}</td>
+            <td style="text-align:right">{fmt_margem(margem_pct)}</td>
             <td style="text-align:right">{proj_html}</td>
             <td style="text-align:right">{fmt_perf(perf)}</td>
         </tr>'''
@@ -629,6 +703,8 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     tot_proj_html = fmt_brl_short(tot_projetado) if tot_projetado > 0 else '<span class="pct-zero">—</span>'
     # Performance total: considera APENAS projetado de lojas que têm meta cadastrada
     tot_perf = (tot_projetado_com_meta / tot_meta * 100) if tot_meta > 0 and tot_projetado_com_meta > 0 else None
+    # Margem total: média aritmética ponderada pelo nº de vendas de cada loja
+    tot_margem = (soma_margem_x_vendas / soma_vendas_com_margem) if soma_vendas_com_margem > 0 else None
 
     html += f'''<tr class="row-total">
         <td>TOTAL</td>
@@ -638,6 +714,7 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
         <td style="text-align:right">{tot_meta_html}</td>
         <td style="text-align:right">{fmt_int(tot_vendas)}</td>
         <td style="text-align:right">{fmt_brl(tot_fat_sel)}</td>
+        <td style="text-align:right">{fmt_margem(tot_margem)}</td>
         <td style="text-align:right">{tot_proj_html}</td>
         <td style="text-align:right">{fmt_perf(tot_perf)}</td>
     </tr>'''
@@ -693,6 +770,21 @@ def _area_logada(engine):
             st.session_state.logado = False
             st.session_state.usuario = {}
             st.rerun()
+
+        # v3.6: ferramentas de cache (úteis quando dev sobe nova versão sem reiniciar app)
+        with st.expander("🔧 Cache & Reload", expanded=False):
+            if st.button("♻️ Limpar cache de dados"):
+                st.cache_data.clear()
+                st.success("Cache limpo.")
+                st.rerun()
+            if st.button("🔄 Recarregar código dos módulos"):
+                st.session_state['_force_reload_modules'] = True
+                st.success("Próximo clique vai recarregar os módulos.")
+                st.rerun()
+            else:
+                # Reset do flag depois de usado
+                if st.session_state.get('_force_reload_modules'):
+                    st.session_state['_force_reload_modules'] = False
 
     # ---- ROTEAMENTO ----
     modulo = get_modulo_do_menu(aba)
@@ -752,6 +844,11 @@ def _area_logada(engine):
         mostrar_badge_filtro_loja()
         carregar_modulo("gestao_tags")
 
+    elif modulo == 'analise_produtos':
+        mostrar_badge_leitura('analise_produtos')
+        mostrar_badge_filtro_loja()
+        carregar_modulo("analise_produtos")
+
     elif modulo == 'compras':
         mostrar_badge_leitura('compras')
         carregar_modulo("app_compras")
@@ -792,6 +889,7 @@ def main():
 
     engine = get_engine()
     _garantir_tabela_usuario_lojas(engine)
+    _garantir_tabela_estoque(engine)
 
     if not st.session_state.logado:
         total = _contar_usuarios(engine)
@@ -826,6 +924,30 @@ def _garantir_tabela_usuario_lojas(engine):
                     ALTER TABLE dim_usuarios ADD COLUMN nome VARCHAR(100);
                 END IF;
             END $$;
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _garantir_tabela_estoque(engine):
+    """v3.6: cria dim_estoque para receber saldos do relatório Upseller."""
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dim_estoque (
+                sku VARCHAR(120) PRIMARY KEY,
+                quantidade INTEGER NOT NULL DEFAULT 0,
+                data_atualizacao TIMESTAMP DEFAULT NOW(),
+                arquivo_origem VARCHAR(255)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS ix_dim_estoque_data
+            ON dim_estoque(data_atualizacao)
         """)
         conn.commit()
         cursor.close()

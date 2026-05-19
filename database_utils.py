@@ -1,6 +1,12 @@
 """
 DATABASE UTILS - Sistema Nala
-Versão: 3.5 (29/03/2026)
+Versão: 3.6 (17/05/2026)
+
+CHANGELOG v3.6:
+  - PERF CRÍTICO: get_engine() agora usa @st.cache_resource — antes recriava
+        o pool de conexões a cada chamada (uma vez por módulo carregado, por rerun).
+        Junto com a remoção do importlib.reload em prod (app.py), elimina a
+        principal causa do "ficou carregando" a cada clique.
 
 CHANGELOG v3.5:
   - MELHORIA: buscar_custos_skus() agora inclui outros_custos na soma dos custos.
@@ -55,18 +61,29 @@ import streamlit as st
 # Cada app (Produção e Dev) tem seu próprio Secret com a URL correta.
 # Isso garante isolamento total: Dev nunca acessa banco de Produção.
 
+@st.cache_resource(show_spinner=False)
 def get_engine():
-    """Retorna engine do SQLAlchemy lendo DB_URL de forma segura."""
+    """
+    Retorna engine do SQLAlchemy lendo DB_URL de forma segura.
+
+    v3.6: @st.cache_resource — pattern oficial Streamlit para objetos não
+    serializáveis (engine/pool). Antes, cada import de get_engine criava um
+    novo create_engine() e descartava o pool a cada rerun.
+    """
     try:
         # O uso do .get evita o erro de interrupção imediata (KeyError)
         db_url = st.secrets.get("DB_URL")
-        
+
         if not db_url:
             st.error("❌ A variável 'DB_URL' não foi encontrada no Streamlit Cloud.")
             st.info("Acesse: Settings -> Secrets e cole a URL do banco de dados.")
             st.stop() # Para o app aqui em vez de dar erro de tela vermelha
-            
-        return create_engine(db_url)
+
+        return create_engine(
+            db_url,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
     except Exception as e:
         st.error(f"⚠️ Falha ao criar a conexão com o banco: {e}")
         st.stop()
