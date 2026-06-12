@@ -306,6 +306,25 @@ def processar_arquivo_amazon(arquivo, loja, imposto, engine, data_ini, data_fim)
 
         except Exception as e:
             linhas_descartadas += 1
+            try:
+                _sku_err = str(row.get('sku_amz', f'linha_{_}')).strip()
+                _receita_err = 0.0
+                try:
+                    _receita_err = float(limpar_numero(row.get('receita_bruta', 0)))
+                except Exception:
+                    pass
+                descartes.append({
+                    'numero_pedido': f"AMZ_ERRO_{loja}_{_sku_err}",
+                    'sku': _sku_err,
+                    'status_original': 'Erro de processamento',
+                    'motivo_descarte': f'Erro interno ao processar linha: {str(e)[:200]}',
+                    'receita_estimada': _receita_err,
+                    'tarifa_venda_estimada': 0,
+                    'tarifa_envio_estimada': 0,
+                    'logistica': 'DESCONHECIDA',
+                })
+            except Exception:
+                pass
             continue
 
     # 5. VALIDAR SE TEM VENDAS
@@ -383,6 +402,12 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
             (loja, data_ini, data_fim)
         )
         atualiz = cursor.rowcount
+
+        # Limpar pendentes do mesmo período para re-upload limpo
+        cursor.execute(
+            "DELETE FROM fact_vendas_pendentes WHERE loja_origem = %s AND marketplace_origem = %s AND data_venda BETWEEN %s AND %s",
+            (loja, marketplace, data_ini, data_fim)
+        )
 
         # 2. PROCESSAR DESCARTES
         from database_utils import gravar_venda_descartada
@@ -523,8 +548,43 @@ def gravar_vendas_amazon(df, marketplace, loja, arq_nome, engine, data_ini, data
                 except:
                     pass
                 err += 1
-                if err == 1:
-                    st.warning(f"Primeiro erro Amazon: {str(e)[:200]}")
+                sku_err = str(row.get('sku', row.get('sku_amz', f'idx_{idx}'))).strip()
+                st.warning(f"Venda nao gravada (SKU: {sku_err}): {str(e)[:150]}")
+                # Fallback: salvar como pendente para nao perder a venda
+                try:
+                    _receita_fb = 0.0
+                    _qtd_fb = 1
+                    _data_fb = data_fim
+                    try:
+                        _receita_fb = float(row.get('receita', 0))
+                        _qtd_fb = max(int(row.get('qtd', 1)), 1)
+                        _data_fb = datetime.strptime(str(row.get('data', '')), "%d/%m/%Y").date()
+                    except Exception:
+                        pass
+                    dados_fallback = {
+                        'marketplace_origem': marketplace,
+                        'loja_origem': loja,
+                        'numero_pedido': str(row.get('pedido', f"AMZ_{loja}_{sku_err}")),
+                        'data_venda': _data_fb,
+                        'sku': sku_err,
+                        'codigo_anuncio': str(row.get('asin', '')).strip(),
+                        'quantidade': _qtd_fb,
+                        'preco_venda': _receita_fb / _qtd_fb,
+                        'valor_venda_efetivo': _receita_fb,
+                        'imposto': 0, 'comissao': 0, 'frete': 0,
+                        'tarifa_fixa': 0, 'outros_custos': 0, 'total_tarifas': 0,
+                        'valor_liquido': _receita_fb,
+                        'arquivo_origem': arq_nome,
+                        'motivo': f'Erro tecnico ao gravar: {str(e)[:150]}',
+                        'logistica': str(row.get('logistica', 'DBA')).strip(),
+                    }
+                    cursor.execute(f"SAVEPOINT fallback_{idx}")
+                    if gravar_venda_pendente(cursor, dados_fallback):
+                        pend += 1
+                        err -= 1
+                    cursor.execute(f"RELEASE SAVEPOINT fallback_{idx}")
+                except Exception:
+                    pass
 
         conn.commit()
 
