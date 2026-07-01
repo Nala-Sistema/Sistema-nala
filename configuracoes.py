@@ -72,8 +72,9 @@ def main():
     st.header("⚙️ Configurações Nala")
     engine = get_engine()
 
-    t_amz, t_ml, t_frete_ml26, t_frete_amz, t_fisc, t_users = st.tabs([
+    t_amz, t_tiktok, t_ml, t_frete_ml26, t_frete_amz, t_fisc, t_users = st.tabs([
         "📦 Amazon",
+        "🎵 TikTok Shop",
         "🚚 Frete ML (FLEX)",
         "📦 Frete ML 2026",
         "📦 Frete Amazon",
@@ -83,6 +84,9 @@ def main():
 
     with t_amz:
         _tab_amazon(engine)
+
+    with t_tiktok:
+        _tab_tiktok(engine)
 
     with t_ml:
         _tab_frete_ml(engine)
@@ -98,6 +102,131 @@ def main():
 
     with t_users:
         _tab_usuarios(engine)
+
+
+# ============================================================
+# TAB TIKTOK SHOP
+# ============================================================
+
+def _tab_tiktok(engine):
+    st.subheader("🎵 TikTok Shop — Lojas e Taxas")
+    st.caption("Gerencie lojas TikTok e as taxas fixas de plataforma (6%+6% comissão+SFP e R$4/item).")
+
+    # ── Lojas TikTok cadastradas ──────────────────────────────────────────────
+    st.markdown("### Lojas cadastradas")
+    df_lojas = _query_to_df(engine,
+        "SELECT id, loja, imposto, custo_flex FROM dim_lojas WHERE UPPER(marketplace) = 'TIKTOK' ORDER BY loja")
+
+    if df_lojas.empty:
+        st.info("Nenhuma loja TikTok cadastrada ainda. Use o formulário abaixo para adicionar.")
+    else:
+        st.dataframe(df_lojas, use_container_width=True, hide_index=True)
+
+    # ── Configurações de taxa cadastradas ────────────────────────────────────
+    st.markdown("### Configuração de taxas (dim_config_marketplace)")
+    df_cfg = _query_to_df(engine,
+        """SELECT id, loja, comissao_percentual, taxa_fixa, ativo, data_vigencia
+           FROM dim_config_marketplace
+           WHERE marketplace = 'TIKTOK'
+           ORDER BY loja""")
+
+    if df_cfg.empty:
+        st.info("Nenhuma configuração de taxa TikTok cadastrada.")
+    else:
+        st.dataframe(df_cfg, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Formulário para adicionar / atualizar loja ───────────────────────────
+    st.markdown("### Adicionar / atualizar loja TikTok")
+    st.caption("Preencha os campos e clique em Salvar. Se a loja já existir, os valores serão atualizados.")
+
+    with st.form("form_tiktok_loja"):
+        col1, col2, col3 = st.columns(3)
+        nome_loja = col1.text_input("Nome da loja", placeholder="Ex: TikTok_Nala",
+                                    help="Identificador único da loja (sem espaços).")
+        imposto = col2.number_input("Imposto (%)", min_value=0.0, max_value=100.0,
+                                     value=11.0, step=0.5,
+                                     help="Alíquota de imposto sobre a receita bruta.")
+        custo_flex = col3.number_input("Custo Flex (R$)", min_value=0.0, value=0.0, step=0.50,
+                                        help="Custo de envio FLEX, se aplicável. Normalmente 0 no TikTok SFP.")
+
+        st.markdown("**Taxas fixas de plataforma** (aplicadas a todos os produtos desta loja)")
+        col4, col5 = st.columns(2)
+        comissao_pct = col4.number_input(
+            "Comissão + SFP (%)", min_value=0.0, max_value=100.0, value=12.0, step=0.5,
+            help="6% comissão de plataforma + 6% taxa de serviço SFP = 12% total.")
+        taxa_item = col5.number_input(
+            "Taxa por item vendido (R$)", min_value=0.0, value=4.0, step=0.5,
+            help="R$ 4,00 fixo por unidade vendida (validado em todos os pedidos).")
+
+        salvar = st.form_submit_button("💾 Salvar", type="primary")
+
+    if salvar:
+        nome_loja = nome_loja.strip()
+        if not nome_loja:
+            st.error("❌ Nome da loja é obrigatório.")
+        else:
+            try:
+                conn = engine.raw_connection()
+                cursor = conn.cursor()
+
+                # Upsert dim_lojas
+                cursor.execute(
+                    "SELECT id FROM dim_lojas WHERE marketplace = 'TIKTOK' AND loja = %s",
+                    (nome_loja,)
+                )
+                existe = cursor.fetchone()
+                if existe:
+                    cursor.execute(
+                        "UPDATE dim_lojas SET imposto = %s, custo_flex = %s WHERE marketplace = 'TIKTOK' AND loja = %s",
+                        (imposto, custo_flex, nome_loja)
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO dim_lojas (marketplace, loja, imposto, custo_flex) VALUES ('TIKTOK', %s, %s, %s)",
+                        (nome_loja, imposto, custo_flex)
+                    )
+
+                # Upsert dim_config_marketplace (uma linha por loja, sem ASIN/SKU específico)
+                cursor.execute(
+                    "DELETE FROM dim_config_marketplace WHERE marketplace = 'TIKTOK' AND loja = %s",
+                    (nome_loja,)
+                )
+                cursor.execute("""
+                    INSERT INTO dim_config_marketplace
+                        (marketplace, loja, comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+                    VALUES ('TIKTOK', %s, %s, %s, 0, TRUE, CURRENT_DATE)
+                """, (nome_loja, comissao_pct, taxa_item))
+
+                conn.commit()
+                cursor.close()
+                conn.close()
+                st.success(f"✅ Loja '{nome_loja}' salva com sucesso!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Erro ao salvar: {e}")
+
+    st.divider()
+
+    # ── Mapeamento de SKUs TikTok ────────────────────────────────────────────
+    st.markdown("### Mapeamento de SKUs TikTok → Nala")
+    st.caption(
+        "Os IDs numéricos do TikTok são mapeados para SKUs internos da Nala. "
+        "O mapeamento é criado automaticamente quando você corrige um SKU na tela "
+        "'Vendas Pendentes'. Aqui você pode consultar o que já foi mapeado."
+    )
+    df_map = _query_to_df(engine,
+        """SELECT sku_errado AS "ID TikTok", sku_correto AS "SKU Nala", data_criacao AS "Mapeado em"
+           FROM dim_sku_mapeamento
+           WHERE sku_errado ~ '^[0-9]{15,}$'
+           ORDER BY data_criacao DESC
+           LIMIT 100""")
+
+    if df_map.empty:
+        st.info("Nenhum SKU TikTok mapeado ainda. Faça o primeiro upload e mapeie via Vendas Pendentes.")
+    else:
+        st.dataframe(df_map, use_container_width=True, hide_index=True)
 
 
 # ============================================================

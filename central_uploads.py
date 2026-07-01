@@ -43,6 +43,7 @@ from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 from processar_amazon import processar_arquivo_amazon, gravar_vendas_amazon
 from processar_shein import processar_arquivo_shein, gravar_vendas_shein
 from processar_magalu import processar_arquivo_magalu, gravar_vendas_magalu
+from processar_tiktok import processar_arquivo_tiktok, gravar_vendas_tiktok
 
 
 # ============================================================
@@ -107,6 +108,7 @@ def _detectar_marketplace(mktp):
     if 'AMAZON' in mktp_upper: return 'AMAZON'
     if 'SHEIN' in mktp_upper: return 'SHEIN'
     if 'MAGALU' in mktp_upper or 'MAGAZINE' in mktp_upper: return 'MAGALU'
+    if 'TIKTOK' in mktp_upper or 'TIK TOK' in mktp_upper: return 'TIKTOK'
     return 'DESCONHECIDO'
 
 
@@ -622,9 +624,18 @@ def tab_processar_upload(engine):
         arquivo_pacotes = col_up2.file_uploader("📦 Relatório de PACOTES (CSV)", type=['csv'], key=f"mglu_pacotes_{uc}")
         arquivo = arquivo_pedidos
         arquivos_ok = arquivo_pedidos is not None and arquivo_pacotes is not None
+    elif mp == 'TIKTOK':
+        st.markdown("**📂 TikTok Shop — relatório financeiro + em espera (opcional):**")
+        col_up1, col_up2 = st.columns(2)
+        arq_tktk_fin = col_up1.file_uploader("💰 Relatório Financeiro / Liquidado (XLSX)", type=['xlsx'], key=f"tktk_fin_{uc}")
+        arq_tktk_esp = col_up2.file_uploader("⏳ Relatório Em Espera (XLSX) — opcional", type=['xlsx'], key=f"tktk_esp_{uc}")
+        arquivo = arq_tktk_fin
+        arquivo_pedidos = None; arquivo_pacotes = None
+        arquivos_ok = arq_tktk_fin is not None
     else:
         arquivo = st.file_uploader(f"📂 Upload do arquivo de vendas", type=tipos, key=f"up_arquivo_{uc}")
         arquivo_pedidos = None; arquivo_pacotes = None
+        arq_tktk_fin = None; arq_tktk_esp = None
         arquivos_ok = arquivo is not None
 
     if arquivos_ok and st.button("🔍 ANALISAR ARQUIVO", type="primary"):
@@ -639,6 +650,8 @@ def tab_processar_upload(engine):
                 df_proc, info = processar_arquivo_shein(arquivo, loja, imposto, engine)
             elif mp == 'MAGALU':
                 df_proc, info = processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto, engine)
+            elif mp == 'TIKTOK':
+                df_proc, info = processar_arquivo_tiktok(arq_tktk_fin, arq_tktk_esp, loja, imposto, engine)
             else:
                 st.error(f"⚠️ Processador para '{mktp}' não implementado."); return
 
@@ -685,6 +698,10 @@ def tab_processar_upload(engine):
             st.warning(f"⚠️ {len(info['pendentes_carrinho'])} venda(s) com divergência financeira")
         if mp_key == 'SHOPEE':
             _exibir_alertas_comissao(info.get('alertas_comissao', []))
+        if mp_key == 'TIKTOK' and info.get('skus_nao_mapeados', 0) > 0:
+            st.warning(f"⚠️ {info['skus_nao_mapeados']} SKU(s) TikTok sem mapeamento — irão para pendentes. Mapeie na aba 'Vendas Pendentes' e reprocesse.")
+        if mp_key == 'TIKTOK' and info.get('pendentes_emespera'):
+            st.info(f"⏳ {len(info['pendentes_emespera'])} pedido(s) 'em espera' serão registrados como staging.")
         if mp_key == 'AMAZON' and info.get('asins_sem_config'):
             st.warning(f"⚠️ {len(info['asins_sem_config'])} ASIN(s) sem configuração")
 
@@ -741,6 +758,11 @@ def tab_processar_upload(engine):
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_magalu(
                         df_proc, mktp, loja, arquivo_nome, engine,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
+                elif mp_key == 'TIKTOK':
+                    registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_tiktok(
+                        df_proc, mktp, loja, arquivo_nome, engine,
+                        pendentes_sku=info.get('pendentes_sku', []),
+                        pendentes_emespera=info.get('pendentes_emespera', []))
                 else:
                     st.error("⚠️ Processador não identificado."); return
 
