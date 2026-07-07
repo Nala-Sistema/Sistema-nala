@@ -1290,6 +1290,33 @@ def _secao_pend_sku(engine):
     df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
         'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo']].copy()
     df_e['sku_original'] = df_e['sku'].copy()
+
+    # Enriquece linhas TikTok com nome_produto/nome_sku_variante de dim_tiktok_skus
+    df_e['nome_produto'] = ''
+    df_e['nome_sku_variante'] = ''
+    tiktok_mask = df_e['marketplace_origem'] == 'TIKTOK'
+    if tiktok_mask.any():
+        tiktok_ids = df_e.loc[tiktok_mask, 'sku'].tolist()
+        try:
+            _conn = engine.raw_connection()
+            _cur = _conn.cursor()
+            _ph = ', '.join(['%s'] * len(tiktok_ids))
+            _cur.execute(
+                f"SELECT id_sku_tiktok, COALESCE(nome_produto,''), COALESCE(nome_sku_variante,'') "
+                f"FROM dim_tiktok_skus WHERE id_sku_tiktok IN ({_ph})",
+                tiktok_ids
+            )
+            _nomes = {r[0]: (r[1], r[2]) for r in _cur.fetchall()}
+            _cur.close()
+            _conn.close()
+            for _idx in df_e[tiktok_mask].index:
+                _sid = df_e.at[_idx, 'sku']
+                if _sid in _nomes:
+                    df_e.at[_idx, 'nome_produto'] = _nomes[_sid][0]
+                    df_e.at[_idx, 'nome_sku_variante'] = _nomes[_sid][1]
+        except Exception:
+            pass
+
     df_e['data_venda'] = pd.to_datetime(df_e['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
     df_e.insert(0, 'Sel', False)
 
@@ -1302,6 +1329,8 @@ def _secao_pend_sku(engine):
         'comissao': st.column_config.NumberColumn("Tarifa", format="%.2f", disabled=True),
         'imposto': st.column_config.NumberColumn("Imposto", format="%.2f", disabled=True),
         'frete': st.column_config.NumberColumn("Frete", format="%.2f", disabled=True),
+        'nome_produto': st.column_config.TextColumn("Produto (TikTok)", disabled=True),
+        'nome_sku_variante': st.column_config.TextColumn("Variante (TikTok)", disabled=True),
     }, use_container_width=True, height=400, hide_index=True, key="ed_pend_sku")
 
     sels = df_ed[df_ed['Sel']==True]

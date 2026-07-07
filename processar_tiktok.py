@@ -16,7 +16,7 @@ import streamlit as st
 from datetime import datetime
 from database_utils import (
     buscar_custos_skus,
-    buscar_mapeamento_skus,
+    buscar_skus_validos,
     gravar_venda_pendente,
 )
 
@@ -89,11 +89,51 @@ def _buscar_config_tiktok(engine, loja):
     return _DEFAULT_COMISSAO_PCT, _DEFAULT_TAXA_ITEM
 
 
+def _buscar_tiktok_sku_map(engine):
+    """Carrega mapeamento id_sku_tiktok → sku_interno da dim_tiktok_skus."""
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id_sku_tiktok, sku_interno FROM dim_tiktok_skus "
+            "WHERE sku_interno IS NOT NULL AND sku_interno != ''"
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {r[0]: r[1] for r in rows}
+    except Exception:
+        return {}
+
+
+def _upsert_tiktok_nomes(engine, nomes_dict):
+    """Upsert nome_produto/nome_sku_variante sem sobrescrever sku_interno."""
+    if not nomes_dict:
+        return
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        for sku_tiktok, (nome_prod, nome_var) in nomes_dict.items():
+            cursor.execute("""
+                INSERT INTO dim_tiktok_skus (id_sku_tiktok, nome_produto, nome_sku_variante)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (id_sku_tiktok)
+                DO UPDATE SET nome_produto = EXCLUDED.nome_produto,
+                              nome_sku_variante = EXCLUDED.nome_sku_variante,
+                              atualizado_em = NOW()
+            """, (sku_tiktok, nome_prod, nome_var))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass  # nome enrichment não é crítico
+
+
 # ============================================================
 # PARSER ÚNICO (financeiro e em_espera têm as mesmas colunas)
 # ============================================================
 
-def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
+def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
     """
     Processa um DataFrame já com header detectado.
     fonte: 'financeiro' | 'em_espera'
@@ -105,6 +145,7 @@ def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
       skus_sem_custo  - set de SKUs mapeados mas sem custo cadastrado
       skus_nao_map    - set de IDs TikTok sem mapeamento
       linhas_desc     - count de linhas descartadas
+      nomes_dict      - {sku_tiktok: (nome_produto, nome_sku_variante)} para upsert
     """
     col_valor_total = ('Valor total a ser liquidado' if fonte == 'financeiro'
                        else 'Valor estimado a ser liquidado')
@@ -115,6 +156,7 @@ def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
     skus_sem_custo = set()
     skus_nao_map = set()
     linhas_desc = 0
+    nomes_dict = {}
 
     for _, row in df.iterrows():
         try:
@@ -139,6 +181,12 @@ def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
             if data_venda:
                 datas.append(data_venda)
 
+            # Captura nomes do produto e variante para enriquecer dim_tiktok_skus
+            nome_produto = str(row.get('Nome do produto', '') or '').strip()
+            nome_sku_variante = str(row.get('Nome do SKU', '') or '').strip()
+            if nome_produto or nome_sku_variante:
+                nomes_dict[sku_tiktok] = (nome_produto, nome_sku_variante)
+
             subtotal = _limpar_valor(row.get('Subtotal do item antes dos descontos', 0))
             desc_vendedor = abs(_limpar_valor(row.get('Descontos financiados pelo vendedor', 0)))
             custo_frete_rep = _limpar_valor(row.get('Custo líquido de frete', 0))
@@ -151,23 +199,21 @@ def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
             gmv_max = abs(_limpar_valor(row.get('Taxa de anúncio de GMV Max', 0)))
             valor_total_rep = _limpar_valor(row.get(col_valor_total, 0))
 
-            # Mapeamento de taxas para colunas do fact_vendas_snapshot
             # comissao = 6% plataforma + 6% SFP
             comissao_val = round(comissao_plat + sfp, 2)
-            # tarifa_fixa = R$4/unit (taxa por item - já é o valor total para a qtd)
+            # tarifa_fixa = R$4/unit (taxa por item)
             tarifa_fixa_val = round(taxa_item, 2)
             # outros_custos = variáveis (afiliados, ads, GMV Max)
             outros_custos_val = round(afiliados + ads_criadores + ads_agencias + gmv_max, 2)
-            # frete: negativo no relatório = custo pro vendedor (invertemos o sinal)
+            # frete: negativo no relatório = custo pro vendedor
             frete_val = round(-custo_frete_rep, 2)
 
             total_tarifas = round(comissao_val + tarifa_fixa_val + outros_custos_val + frete_val, 2)
-            # valor_liquido = valor pré-calculado pelo TikTok (mais confiável que somar manualmente)
             valor_liquido = round(valor_total_rep, 2)
             imposto_val = round(vendas_liq * (imposto_pct / 100), 2)
 
-            # Resolução de SKU via dim_sku_mapeamento
-            sku_nala = mapeamento_skus.get(sku_tiktok)
+            # Resolução de SKU via dim_tiktok_skus
+            sku_nala = tiktok_sku_map.get(sku_tiktok)
             sku_mapeado = sku_nala is not None
 
             custo_un = 0.0
@@ -221,7 +267,7 @@ def _processar_df(df, fonte, loja, imposto_pct, mapeamento_skus, custos_dict):
             linhas_desc += 1
             continue
 
-    return vendas_ok, pendentes_lista, datas, skus_sem_custo, skus_nao_map, linhas_desc
+    return vendas_ok, pendentes_lista, datas, skus_sem_custo, skus_nao_map, linhas_desc, nomes_dict
 
 
 # ============================================================
@@ -240,7 +286,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     e info['pendentes_emespera'].
     """
     timestamp = datetime.now().timestamp()
-    mapeamento_skus = buscar_mapeamento_skus(engine)
+    tiktok_sku_map = _buscar_tiktok_sku_map(engine)
     custos_dict = buscar_custos_skus(engine, force_refresh=timestamp)
 
     # ── Relatório Financeiro ──────────────────────────────────────────────────
@@ -248,7 +294,6 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         try:
             df_fin_raw = pd.read_excel(arq_financeiro, sheet_name='Detalhes do pedido', header=None)
         except Exception:
-            # Fallback: primeira aba
             arq_financeiro.seek(0)
             df_fin_raw = pd.read_excel(arq_financeiro, sheet_name=0, header=None)
     except Exception as e:
@@ -258,12 +303,13 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     if df_fin is None:
         return None, "Coluna 'ID do pedido/ajuste' não encontrada no relatório financeiro."
 
-    vendas_fin, pend_fin, datas_fin, sem_custo_fin, nao_map_fin, desc_fin = _processar_df(
-        df_fin, 'financeiro', loja, imposto_pct, mapeamento_skus, custos_dict
+    vendas_fin, pend_fin, datas_fin, sem_custo_fin, nao_map_fin, desc_fin, nomes_fin = _processar_df(
+        df_fin, 'financeiro', loja, imposto_pct, tiktok_sku_map, custos_dict
     )
 
     # ── Relatório Em Espera (opcional) ───────────────────────────────────────
     pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp = [], [], set(), set(), 0
+    nomes_esp = {}
 
     if arq_emespera is not None:
         try:
@@ -275,9 +321,12 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         if df_esp is None:
             return None, "Coluna 'ID do pedido/ajuste' não encontrada no relatório em espera."
 
-        _, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp = _processar_df(
-            df_esp, 'em_espera', loja, imposto_pct, mapeamento_skus, custos_dict
+        _, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp, nomes_esp = _processar_df(
+            df_esp, 'em_espera', loja, imposto_pct, tiktok_sku_map, custos_dict
         )
+
+    # Upsert nomes produto/variante em dim_tiktok_skus (sem sobrescrever sku_interno)
+    _upsert_tiktok_nomes(engine, {**nomes_fin, **nomes_esp})
 
     # ── Resumo ────────────────────────────────────────────────────────────────
     todas_datas = datas_fin + datas_esp
@@ -539,3 +588,120 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
         status_text.empty()
 
     return reg, err, skus_invalidos, dups, pend, desc_count, atualiz
+
+
+# ============================================================
+# RE-PROMOÇÃO DE PENDENTES TIKTOK APÓS MAPEAMENTO DE SKU
+# ============================================================
+
+def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
+    """
+    Promove pendentes TikTok com 'SKU não mapeado' para fact_vendas_snapshot
+    usando o sku_map fornecido ({id_sku_tiktok: sku_interno}).
+
+    Retorna (sucesso, erros).
+    """
+    if not sku_map:
+        return 0, 0
+
+    tiktok_ids = list(sku_map.keys())
+    custos_dict = buscar_custos_skus(engine)
+    skus_validos = buscar_skus_validos(engine)
+
+    conn = engine.raw_connection()
+    cursor = conn.cursor()
+    sucesso = 0
+    erros = 0
+
+    try:
+        placeholders = ', '.join(['%s'] * len(tiktok_ids))
+        cursor.execute(f"""
+            SELECT id, marketplace_origem, loja_origem, numero_pedido,
+                   data_venda, sku AS sku_tiktok_id, codigo_anuncio,
+                   quantidade, preco_venda, valor_venda_efetivo,
+                   imposto, comissao, frete, tarifa_fixa, outros_custos,
+                   total_tarifas, valor_liquido, arquivo_origem
+            FROM fact_vendas_pendentes
+            WHERE marketplace_origem = 'TIKTOK'
+              AND motivo LIKE %s
+              AND status = 'Pendente'
+              AND sku IN ({placeholders})
+        """, ['%SKU não mapeado%'] + tiktok_ids)
+        pendentes = cursor.fetchall()
+
+        sql_ins = """
+            INSERT INTO fact_vendas_snapshot (
+                marketplace_origem, loja_origem, numero_pedido, pedido_original,
+                data_venda, sku, codigo_anuncio, quantidade,
+                preco_venda, desconto_parceiro, desconto_marketplace,
+                valor_venda_efetivo, custo_unitario, custo_total,
+                imposto, comissao, frete, tarifa_fixa, outros_custos,
+                total_tarifas, valor_liquido, margem_total, margem_percentual,
+                data_processamento, arquivo_origem, logistica
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                NOW(), %s, %s
+            )
+            ON CONFLICT (numero_pedido) DO NOTHING
+        """
+
+        for row in pendentes:
+            (pid, marketplace, loja, numero_pedido, data_venda, sku_tiktok_id,
+             codigo_anuncio, qtd, preco_venda, receita,
+             imposto, comissao, frete, tarifa_fixa, outros_custos,
+             total_tarifas, valor_liquido, arquivo_origem) = row
+
+            sku_nala = sku_map.get(sku_tiktok_id)
+            if not sku_nala or sku_nala not in skus_validos:
+                erros += 1
+                continue
+
+            custo_un = custos_dict.get(sku_nala, 0.0)
+            custo_total = round(custo_un * int(qtd or 1), 2)
+            receita_f = float(receita or 0)
+            imposto_f = float(imposto or 0)
+            margem = round(receita_f - custo_total - imposto_f, 2)
+            margem_pct = round((margem / receita_f * 100) if receita_f > 0 else 0, 2)
+
+            pedido_original = numero_pedido.replace('TKTK_', '').rsplit('_', 1)[0] if numero_pedido.startswith('TKTK_') else numero_pedido
+
+            try:
+                cursor.execute(f"SAVEPOINT tktk_repro_{pid}")
+                cursor.execute(sql_ins, (
+                    marketplace, loja, numero_pedido, pedido_original,
+                    data_venda, sku_nala, codigo_anuncio or sku_tiktok_id,
+                    int(qtd or 1),
+                    float(preco_venda or 0), 0.0, 0.0,
+                    receita_f, custo_un, custo_total,
+                    imposto_f, float(comissao or 0), float(frete or 0),
+                    float(tarifa_fixa or 0), float(outros_custos or 0),
+                    float(total_tarifas or 0), float(valor_liquido or 0),
+                    margem, margem_pct,
+                    arquivo_origem or '', _LOGISTICA,
+                ))
+                cursor.execute(
+                    "UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id = %s",
+                    (pid,)
+                )
+                cursor.execute(f"RELEASE SAVEPOINT tktk_repro_{pid}")
+                sucesso += 1
+            except Exception:
+                try:
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT tktk_repro_{pid}")
+                except Exception:
+                    pass
+                erros += 1
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        erros += len(pendentes) if 'pendentes' in dir() else 1
+    finally:
+        cursor.close()
+        conn.close()
+
+    return sucesso, erros

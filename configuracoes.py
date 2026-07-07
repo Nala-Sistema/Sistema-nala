@@ -212,21 +212,136 @@ def _tab_tiktok(engine):
     # ── Mapeamento de SKUs TikTok ────────────────────────────────────────────
     st.markdown("### Mapeamento de SKUs TikTok → Nala")
     st.caption(
-        "Os IDs numéricos do TikTok são mapeados para SKUs internos da Nala. "
-        "O mapeamento é criado automaticamente quando você corrige um SKU na tela "
-        "'Vendas Pendentes'. Aqui você pode consultar o que já foi mapeado."
+        "Baixe o template com os IDs pendentes, preencha a coluna **sku_interno** com "
+        "os SKUs Nala correspondentes e faça o upload. As vendas pendentes serão "
+        "promovidas automaticamente para o histórico."
     )
-    df_map = _query_to_df(engine,
-        """SELECT sku_errado AS "ID TikTok", sku_correto AS "SKU Nala", data_criacao AS "Mapeado em"
-           FROM dim_sku_mapeamento
-           WHERE sku_errado ~ '^[0-9]{15,}$'
-           ORDER BY data_criacao DESC
-           LIMIT 100""")
 
-    if df_map.empty:
-        st.info("Nenhum SKU TikTok mapeado ainda. Faça o primeiro upload e mapeie via Vendas Pendentes.")
+    # Tabela de mapeamentos existentes
+    df_tiktok_skus = _query_to_df(engine,
+        """SELECT id_sku_tiktok AS "ID TikTok",
+                  nome_produto AS "Produto",
+                  nome_sku_variante AS "Variante",
+                  sku_interno AS "SKU Nala",
+                  atualizado_em AS "Atualizado em"
+           FROM dim_tiktok_skus
+           ORDER BY atualizado_em DESC
+           LIMIT 200""")
+
+    if df_tiktok_skus.empty:
+        st.info("Nenhum SKU TikTok registrado ainda. Faça um upload do relatório financeiro para popular esta tabela.")
     else:
-        st.dataframe(df_map, use_container_width=True, hide_index=True)
+        st.dataframe(df_tiktok_skus, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Download do template de mapeamento")
+    st.caption("Preenchido com todos os IDs TikTok pendentes (sem SKU Nala) + nomes já conhecidos.")
+
+    if st.button("📥 Gerar template Excel", key="btn_tiktok_template"):
+        try:
+            conn = engine.raw_connection()
+            cursor = conn.cursor()
+            # IDs pendentes sem mapeamento
+            cursor.execute("""
+                SELECT DISTINCT p.sku AS id_sku_tiktok,
+                       COALESCE(t.nome_produto, '') AS nome_produto,
+                       COALESCE(t.nome_sku_variante, '') AS nome_sku_variante,
+                       COALESCE(t.sku_interno, '') AS sku_interno
+                FROM fact_vendas_pendentes p
+                LEFT JOIN dim_tiktok_skus t ON t.id_sku_tiktok = p.sku
+                WHERE p.marketplace_origem = 'TIKTOK'
+                  AND p.motivo LIKE %s
+                  AND p.status = 'Pendente'
+                ORDER BY p.sku
+            """, ['%SKU não mapeado%'])
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            import io
+            df_template = pd.DataFrame(rows, columns=['id_sku_tiktok', 'nome_produto', 'nome_sku_variante', 'sku_interno'])
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                df_template.to_excel(writer, index=False, sheet_name='Mapeamento')
+            buf.seek(0)
+            st.download_button(
+                label="⬇️ Baixar template.xlsx",
+                data=buf,
+                file_name="template_sku_tiktok.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_tiktok_template"
+            )
+        except Exception as e:
+            st.error(f"Erro ao gerar template: {e}")
+
+    st.markdown("#### Upload do template preenchido")
+
+    arq_map = st.file_uploader(
+        "Selecione o arquivo Excel (.xlsx) com a coluna **sku_interno** preenchida",
+        type=['xlsx'],
+        key="up_tiktok_sku_map"
+    )
+
+    if arq_map is not None:
+        try:
+            import io
+            from processar_tiktok import reprocessar_pendentes_tiktok_mapeados
+            from database_utils import buscar_skus_validos
+
+            df_upload = pd.read_excel(arq_map)
+
+            required_cols = {'id_sku_tiktok', 'sku_interno'}
+            missing = required_cols - set(df_upload.columns)
+            if missing:
+                st.error(f"Colunas obrigatórias ausentes no arquivo: {missing}")
+            else:
+                df_novos = df_upload[df_upload['sku_interno'].notna() & (df_upload['sku_interno'].astype(str).str.strip() != '')].copy()
+                df_novos['sku_interno'] = df_novos['sku_interno'].astype(str).str.strip()
+                df_novos['id_sku_tiktok'] = df_novos['id_sku_tiktok'].astype(str).str.strip()
+
+                skus_validos = buscar_skus_validos(engine)
+                invalidos = df_novos[~df_novos['sku_interno'].isin(skus_validos)]['sku_interno'].tolist()
+
+                if invalidos:
+                    st.warning(f"⚠️ {len(invalidos)} SKU(s) não encontrados em dim_produtos e serão ignorados: {invalidos[:10]}")
+                    df_novos = df_novos[df_novos['sku_interno'].isin(skus_validos)]
+
+                if df_novos.empty:
+                    st.warning("Nenhum mapeamento válido encontrado no arquivo.")
+                else:
+                    st.info(f"{len(df_novos)} mapeamento(s) válido(s) prontos para salvar.")
+
+                    if st.button("💾 Salvar mapeamentos e promover pendentes", key="btn_salvar_sku_tiktok", type="primary"):
+                        try:
+                            conn = engine.raw_connection()
+                            cursor = conn.cursor()
+                            salvos = 0
+                            for _, r in df_novos.iterrows():
+                                cursor.execute("""
+                                    INSERT INTO dim_tiktok_skus
+                                        (id_sku_tiktok, sku_interno, atualizado_em)
+                                    VALUES (%s, %s, NOW())
+                                    ON CONFLICT (id_sku_tiktok)
+                                    DO UPDATE SET sku_interno = EXCLUDED.sku_interno,
+                                                  atualizado_em = NOW()
+                                """, (r['id_sku_tiktok'], r['sku_interno']))
+                                salvos += 1
+                            conn.commit()
+                            cursor.close()
+                            conn.close()
+
+                            sku_map = dict(zip(df_novos['id_sku_tiktok'], df_novos['sku_interno']))
+                            sucesso, erros = reprocessar_pendentes_tiktok_mapeados(engine, sku_map)
+
+                            st.success(
+                                f"✅ {salvos} mapeamento(s) salvo(s). "
+                                f"{sucesso} pendente(s) promovido(s) para o histórico. "
+                                f"{erros} erro(s)."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao salvar mapeamentos: {e}")
+        except Exception as e:
+            st.error(f"Erro ao ler arquivo: {e}")
 
 
 # ============================================================
@@ -1038,33 +1153,37 @@ def _tab_impostos_lojas(engine):
     st.subheader("Gerenciamento das 14 Lojas")
 
     df_lojas = _query_to_df(engine,
-        "SELECT marketplace, loja, imposto, custo_flex FROM dim_lojas ORDER BY marketplace ASC"
+        "SELECT marketplace, loja, imposto, custo_flex, visivel_no_painel FROM dim_lojas ORDER BY marketplace ASC"
     )
 
     if df_lojas.empty:
         data_nala = [
-            ["MERCADO LIVRE", "ML-Nala", 10.00, 12.90],
-            ["MERCADO LIVRE", "ML-LPT", 10.00, 12.90],
-            ["MERCADO LIVRE", "ML-YanniRJ", 10.00, 12.90],
-            ["MERCADO LIVRE", "ML-YanniSP", 10.00, 12.90],
-            ["AMAZON", "AMZ-Innovare(CPF)", 0.00, 0.00],
-            ["AMAZON", "AMZ-Nala", 10.00, 0.00],
-            ["AMAZON", "AMZ-LPT", 10.00, 0.00],
-            ["AMAZON", "AMZ-Yanni", 10.00, 0.00],
-            ["SHOPEE", "Shopee Lithouse(Nala)", 10.00, 0.00],
-            ["SHOPEE", "Shopee Litstore(Yanni)", 10.00, 0.00],
-            ["SHOPEE", "Shopee-LPT", 10.00, 0.00],
-            ["SHEIN", "Shein Yanni", 10.00, 0.00],
-            ["SHEIN", "Shein LPT", 10.00, 0.00],
-            ["MAGALU", "Magalu-Nala", 10.00, 0.00],
+            ["MERCADO LIVRE", "ML-Nala", 10.00, 12.90, True],
+            ["MERCADO LIVRE", "ML-LPT", 10.00, 12.90, True],
+            ["MERCADO LIVRE", "ML-YanniRJ", 10.00, 12.90, True],
+            ["MERCADO LIVRE", "ML-YanniSP", 10.00, 12.90, True],
+            ["AMAZON", "AMZ-Innovare(CPF)", 0.00, 0.00, False],
+            ["AMAZON", "AMZ-Nala", 10.00, 0.00, True],
+            ["AMAZON", "AMZ-LPT", 10.00, 0.00, True],
+            ["AMAZON", "AMZ-Yanni", 10.00, 0.00, True],
+            ["SHOPEE", "Shopee Lithouse(Nala)", 10.00, 0.00, True],
+            ["SHOPEE", "Shopee Litstore(Yanni)", 10.00, 0.00, True],
+            ["SHOPEE", "Shopee-LPT", 10.00, 0.00, True],
+            ["SHEIN", "Shein Yanni", 10.00, 0.00, True],
+            ["SHEIN", "Shein LPT", 10.00, 0.00, True],
+            ["MAGALU", "Magalu-Nala", 10.00, 0.00, True],
         ]
-        df_lojas = pd.DataFrame(data_nala, columns=["marketplace", "loja", "imposto", "custo_flex"])
+        df_lojas = pd.DataFrame(data_nala, columns=["marketplace", "loja", "imposto", "custo_flex", "visivel_no_painel"])
 
     if 'custo_flex' not in df_lojas.columns:
         df_lojas['custo_flex'] = 0.00
     df_lojas['custo_flex'] = df_lojas['custo_flex'].fillna(0.00)
 
-    st.info("Ajuste as alíquotas e custo FLEX, depois clique em salvar. "
+    if 'visivel_no_painel' not in df_lojas.columns:
+        df_lojas['visivel_no_painel'] = True
+    df_lojas['visivel_no_painel'] = df_lojas['visivel_no_painel'].fillna(True)
+
+    st.info("Ajuste as alíquotas, custo FLEX e visibilidade no painel, depois clique em salvar. "
             "Esta tela não adiciona/remove lojas — use o banco diretamente se precisar.")
 
     df_editado = st.data_editor(
@@ -1077,9 +1196,13 @@ def _tab_impostos_lojas(engine):
                 "Custo FLEX (R$)", format="%.2f", min_value=0.0,
                 help="Usado no cálculo de frete FLEX (Mercado Livre)"
             ),
+            'visivel_no_painel': st.column_config.CheckboxColumn(
+                "Visível no Painel",
+                help="Desmarcado = loja oculta da tabela de panorama da tela inicial"
+            ),
         },
         use_container_width=True,
-        num_rows="fixed",  # v3.2: bloqueia adicionar/remover linhas
+        num_rows="fixed",
         hide_index=True,
         key="editor_lojas_fiscal"
     )
@@ -1097,15 +1220,16 @@ def _tab_impostos_lojas(engine):
                 try:
                     val_imposto = float(str(row['imposto']).replace(',', '.')) if row['imposto'] is not None else 0.0
                     val_flex = float(str(row['custo_flex']).replace(',', '.')) if row['custo_flex'] is not None else 0.0
+                    val_visivel = bool(row.get('visivel_no_painel', True))
                     mkp = row['marketplace']
                     loja = row['loja']
 
                     # UPDATE cirúrgico — preserva id, não quebra FKs
                     cursor.execute(
-                        """UPDATE dim_lojas 
-                           SET imposto = %s, custo_flex = %s 
+                        """UPDATE dim_lojas
+                           SET imposto = %s, custo_flex = %s, visivel_no_painel = %s
                            WHERE marketplace = %s AND loja = %s""",
-                        (val_imposto, val_flex, mkp, loja)
+                        (val_imposto, val_flex, val_visivel, mkp, loja)
                     )
 
                     if cursor.rowcount > 0:
@@ -1113,9 +1237,9 @@ def _tab_impostos_lojas(engine):
                     else:
                         # Fallback: loja ainda não existe no banco (primeira instalação)
                         cursor.execute(
-                            """INSERT INTO dim_lojas (marketplace, loja, imposto, custo_flex) 
-                               VALUES (%s, %s, %s, %s)""",
-                            (mkp, loja, val_imposto, val_flex)
+                            """INSERT INTO dim_lojas (marketplace, loja, imposto, custo_flex, visivel_no_painel)
+                               VALUES (%s, %s, %s, %s, %s)""",
+                            (mkp, loja, val_imposto, val_flex, val_visivel)
                         )
                         inseridos += 1
 

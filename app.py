@@ -446,8 +446,7 @@ def _buscar_metas_panorama(engine, ano_mes):
 def _panorama_lojas_cached(ano_mes, lojas_key):
     """
     Versão cacheada (3 min) do panorama de vendas por loja.
-    v3.6: adicionada coluna AVG(margem_percentual) do mês selecionado.
-
+    v3.7: usa dim_lojas como base (mostra lojas sem vendas + respeita visivel_no_painel).
     Retorna rows: (loja, ult_att, max_mes_sel, vendas_sel, fat_sel,
                    fat_ant_total, fat_ant_prop, margem_pct_sel)
     """
@@ -463,28 +462,32 @@ def _panorama_lojas_cached(ano_mes, lojas_key):
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        where_loja_cte = ""
-        where_loja_main = ""
+        # Filtro de lojas do usuário: incide sobre dim_lojas, não sobre fact
+        where_loja_base = ""
         params_loja = []
         if lojas_key and lojas_key != ('ALL',) and lojas_key != ('NONE',):
             placeholders = ', '.join(['%s'] * len(lojas_key))
-            where_loja_cte = f" AND loja_origem IN ({placeholders})"
-            where_loja_main = f" AND f.loja_origem IN ({placeholders})"
+            where_loja_base = f" AND loja IN ({placeholders})"
             params_loja = list(lojas_key)
 
         query = f"""
-            WITH max_dates AS (
+            WITH lojas_visiveis AS (
+                SELECT loja
+                FROM dim_lojas
+                WHERE visivel_no_painel IS DISTINCT FROM FALSE{where_loja_base}
+            ),
+            max_dates AS (
                 SELECT loja_origem,
                        MAX(data_venda) FILTER (WHERE data_venda >= %s AND data_venda <= %s) AS max_mes_sel
                 FROM fact_vendas_snapshot
-                WHERE 1=1 {where_loja_cte}
+                WHERE loja_origem IN (SELECT loja FROM lojas_visiveis)
                 GROUP BY loja_origem
             )
             SELECT
-                f.loja_origem,
+                lv.loja                                                                                          AS loja_origem,
                 MAX(f.data_venda)                                                                                AS ultima_att,
                 md.max_mes_sel,
-                COUNT(*)           FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                      AS vendas_sel,
+                COUNT(*) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                                AS vendas_sel,
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0) AS fat_sel,
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0) AS fat_ant_total,
                 COALESCE(SUM(f.valor_venda_efetivo) FILTER (
@@ -492,22 +495,21 @@ def _panorama_lojas_cached(ano_mes, lojas_key):
                       AND f.data_venda <= COALESCE(md.max_mes_sel - INTERVAL '1 month', %s::date)
                 ), 0)                                                                                            AS fat_ant_prop,
                 AVG(f.margem_percentual) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                AS margem_pct_sel
-            FROM fact_vendas_snapshot f
-            LEFT JOIN max_dates md ON f.loja_origem = md.loja_origem
-            WHERE 1=1 {where_loja_main}
-            GROUP BY f.loja_origem, md.max_mes_sel
-            ORDER BY f.loja_origem
+            FROM lojas_visiveis lv
+            LEFT JOIN fact_vendas_snapshot f ON f.loja_origem = lv.loja
+            LEFT JOIN max_dates md ON md.loja_origem = lv.loja
+            GROUP BY lv.loja, md.max_mes_sel
+            ORDER BY lv.loja
         """
 
-        params = [
+        params = params_loja + [
             primeiro_sel, ultimo_sel,
-        ] + params_loja + [
             primeiro_sel, ultimo_sel,
             primeiro_sel, ultimo_sel,
             primeiro_ant, ultimo_ant,
             primeiro_ant, fallback_ant,
             primeiro_sel, ultimo_sel,
-        ] + params_loja
+        ]
 
         cursor.execute(query, params)
         rows = cursor.fetchall()
@@ -890,6 +892,8 @@ def main():
     engine = get_engine()
     _garantir_tabela_usuario_lojas(engine)
     _garantir_tabela_estoque(engine)
+    _garantir_coluna_visivel_painel(engine)
+    _garantir_tabela_tiktok_skus(engine)
 
     if not st.session_state.logado:
         total = _contar_usuarios(engine)
@@ -948,6 +952,47 @@ def _garantir_tabela_estoque(engine):
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS ix_dim_estoque_data
             ON dim_estoque(data_atualizacao)
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _garantir_coluna_visivel_painel(engine):
+    """Adiciona visivel_no_painel a dim_lojas e inicializa defaults na primeira execução.
+    AMZ-Innovare(CPF) começa oculta; todas as demais ficam visíveis."""
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("ALTER TABLE dim_lojas ADD COLUMN IF NOT EXISTS visivel_no_painel BOOLEAN")
+        # Idempotente: só toca linhas NULL (primeira execução, coluna recém-criada)
+        cursor.execute("""
+            UPDATE dim_lojas
+            SET visivel_no_painel = CASE WHEN loja = 'AMZ-Innovare(CPF)' THEN FALSE ELSE TRUE END
+            WHERE visivel_no_painel IS NULL
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _garantir_tabela_tiktok_skus(engine):
+    """Garante existência de dim_tiktok_skus para mapeamento de SKUs TikTok."""
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dim_tiktok_skus (
+                id_sku_tiktok     VARCHAR(50) PRIMARY KEY,
+                nome_produto      TEXT,
+                nome_sku_variante TEXT,
+                sku_interno       VARCHAR(120),
+                atualizado_em     TIMESTAMP DEFAULT NOW()
+            )
         """)
         conn.commit()
         cursor.close()
