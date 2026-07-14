@@ -437,6 +437,12 @@ def _excluir_lancamento(engine, log_id, marketplace, loja, arquivo_nome, periodo
         except:
             pass  # Tabela pode não existir ainda
 
+        # 2b. Excluir pendentes associadas (evita órfãos quando upload é excluído)
+        cursor.execute(
+            "DELETE FROM fact_vendas_pendentes WHERE marketplace_origem = %s AND loja_origem = %s AND arquivo_origem = %s",
+            [marketplace, loja, arquivo_nome]
+        )
+
         # 3. Excluir do log
         cursor.execute("DELETE FROM log_uploads WHERE id = %s", (log_id,))
 
