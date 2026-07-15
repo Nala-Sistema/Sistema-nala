@@ -698,12 +698,19 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                     margem, margem_pct,
                     arquivo_origem or '', _LOGISTICA,
                 ))
-                cursor.execute(
-                    "UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id = %s",
-                    (pid,)
-                )
-                cursor.execute(f"RELEASE SAVEPOINT tktk_repro_{pid}")
-                sucesso += 1
+                if cursor.rowcount > 0:
+                    cursor.execute(
+                        "UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id = %s",
+                        (pid,)
+                    )
+                    cursor.execute(f"RELEASE SAVEPOINT tktk_repro_{pid}")
+                    sucesso += 1
+                else:
+                    cursor.execute(f"RELEASE SAVEPOINT tktk_repro_{pid}")
+                    erros += 1
+                    msg = f"pedido={numero_pedido} sku={sku_nala}: INSERT descartado por ON CONFLICT (venda ja existia) -- status mantido 'Pendente'"
+                    detalhes.append(msg)
+                    print(f"[NALA][TIKTOK] {msg} (id={pid})")
             except Exception as e:
                 try:
                     cursor.execute(f"ROLLBACK TO SAVEPOINT tktk_repro_{pid}")
