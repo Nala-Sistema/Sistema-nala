@@ -239,6 +239,23 @@ def _tab_tiktok(engine):
     else:
         st.dataframe(df_tiktok_skus, use_container_width=True, hide_index=True)
 
+    st.markdown("#### Reprocessar pendentes com os mapeamentos já salvos")
+    st.caption(
+        "Usa o mapeamento completo já salvo em dim_tiktok_skus (não depende de subir "
+        "um arquivo novo). Útil quando os SKUs já foram mapeados e as vendas continuam pendentes."
+    )
+    if st.button("🔄 Reprocessar pendentes TikTok", key="btn_reprocessar_pend_tiktok"):
+        with st.spinner("Reprocessando pendentes TikTok..."):
+            from processar_tiktok import _buscar_tiktok_sku_map, reprocessar_pendentes_tiktok_mapeados
+            sku_map_completo = _buscar_tiktok_sku_map(engine)
+            if not sku_map_completo:
+                st.warning("Nenhum SKU TikTok mapeado em dim_tiktok_skus ainda.")
+            else:
+                sucesso, erros, detalhes = reprocessar_pendentes_tiktok_mapeados(engine, sku_map_completo)
+                st.success(f"✅ {sucesso} pendente(s) promovido(s) para o histórico. {erros} erro(s).")
+                st.session_state['tiktok_repro_erros'] = detalhes
+                st.rerun()
+
     st.markdown("#### Download do template de mapeamento")
     st.caption("Preenchido com todos os IDs TikTok pendentes (sem SKU Nala) + nomes já conhecidos.")
 
@@ -290,7 +307,7 @@ def _tab_tiktok(engine):
     if arq_map is not None:
         try:
             import io
-            from processar_tiktok import reprocessar_pendentes_tiktok_mapeados
+            from processar_tiktok import _buscar_tiktok_sku_map, reprocessar_pendentes_tiktok_mapeados
             from database_utils import buscar_skus_validos
 
             df_upload = pd.read_excel(arq_map)
@@ -335,8 +352,11 @@ def _tab_tiktok(engine):
                             cursor.close()
                             conn.close()
 
-                            sku_map = dict(zip(df_novos['id_sku_tiktok'], df_novos['sku_interno']))
-                            sucesso, erros, detalhes = reprocessar_pendentes_tiktok_mapeados(engine, sku_map)
+                            # Mapa completo do banco (não só os SKUs deste arquivo) --
+                            # promove qualquer pendente cujo SKU já esteja mapeado, mesmo
+                            # de uploads anteriores.
+                            sku_map_completo = _buscar_tiktok_sku_map(engine)
+                            sucesso, erros, detalhes = reprocessar_pendentes_tiktok_mapeados(engine, sku_map_completo)
 
                             st.success(
                                 f"✅ {salvos} mapeamento(s) salvo(s). "
