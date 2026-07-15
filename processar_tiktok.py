@@ -113,6 +113,15 @@ def _upsert_tiktok_nomes(engine, nomes_dict):
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dim_tiktok_skus (
+                id_sku_tiktok     VARCHAR(50) PRIMARY KEY,
+                nome_produto      TEXT,
+                nome_sku_variante TEXT,
+                sku_interno       VARCHAR(120),
+                atualizado_em     TIMESTAMP DEFAULT NOW()
+            )
+        """)
         for sku_tiktok, (nome_prod, nome_var) in nomes_dict.items():
             cursor.execute("""
                 INSERT INTO dim_tiktok_skus (id_sku_tiktok, nome_produto, nome_sku_variante)
