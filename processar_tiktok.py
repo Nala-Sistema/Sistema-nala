@@ -654,7 +654,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                 %s, %s, %s, %s,
                 NOW(), %s, %s
             )
-            ON CONFLICT (numero_pedido) DO NOTHING
+            ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING
         """
 
         for row in pendentes:
@@ -697,17 +697,22 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                 )
                 cursor.execute(f"RELEASE SAVEPOINT tktk_repro_{pid}")
                 sucesso += 1
-            except Exception:
+            except Exception as e:
                 try:
                     cursor.execute(f"ROLLBACK TO SAVEPOINT tktk_repro_{pid}")
                 except Exception:
                     pass
                 erros += 1
+                print(f"[NALA][TIKTOK] Erro ao reprocessar pendente id={pid} pedido={numero_pedido}: {e}")
+                if erros == 1:
+                    st.error(f"Erro ao reprocessar pendente TikTok (pedido {numero_pedido}): {e}")
 
         conn.commit()
 
-    except Exception:
+    except Exception as e:
         conn.rollback()
+        print(f"[NALA][TIKTOK] Erro geral em reprocessar_pendentes_tiktok_mapeados: {e}")
+        st.error(f"Erro ao reprocessar pendentes TikTok: {e}")
         erros += len(pendentes) if 'pendentes' in dir() else 1
     finally:
         cursor.close()
