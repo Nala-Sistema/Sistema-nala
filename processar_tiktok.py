@@ -608,10 +608,11 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
     Promove pendentes TikTok com 'SKU não mapeado' para fact_vendas_snapshot
     usando o sku_map fornecido ({id_sku_tiktok: sku_interno}).
 
-    Retorna (sucesso, erros).
+    Retorna (sucesso, erros, detalhes) -- detalhes é uma lista de strings
+    com a causa de cada erro, para exibir na UI sem depender do log do servidor.
     """
     if not sku_map:
-        return 0, 0
+        return 0, 0, []
 
     tiktok_ids = list(sku_map.keys())
     custos_dict = buscar_custos_skus(engine)
@@ -621,6 +622,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
     cursor = conn.cursor()
     sucesso = 0
     erros = 0
+    detalhes = []
 
     try:
         placeholders = ', '.join(['%s'] * len(tiktok_ids))
@@ -664,8 +666,13 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
              total_tarifas, valor_liquido, arquivo_origem) = row
 
             sku_nala = sku_map.get(sku_tiktok_id)
-            if not sku_nala or sku_nala not in skus_validos:
+            if not sku_nala:
                 erros += 1
+                detalhes.append(f"pedido={numero_pedido} sku_tiktok={sku_tiktok_id}: sem mapeamento em sku_map")
+                continue
+            if sku_nala not in skus_validos:
+                erros += 1
+                detalhes.append(f"pedido={numero_pedido} sku_tiktok={sku_tiktok_id}: sku_interno '{sku_nala}' não está Ativo em dim_produtos")
                 continue
 
             custo_un = custos_dict.get(sku_nala, 0.0)
@@ -703,19 +710,19 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                 except Exception:
                     pass
                 erros += 1
-                print(f"[NALA][TIKTOK] Erro ao reprocessar pendente id={pid} pedido={numero_pedido}: {e}")
-                if erros == 1:
-                    st.error(f"Erro ao reprocessar pendente TikTok (pedido {numero_pedido}): {e}")
+                msg = f"pedido={numero_pedido} sku={sku_nala}: {e}"
+                detalhes.append(msg)
+                print(f"[NALA][TIKTOK] Erro ao reprocessar pendente id={pid} {msg}")
 
         conn.commit()
 
     except Exception as e:
         conn.rollback()
+        detalhes.append(f"erro geral: {e}")
         print(f"[NALA][TIKTOK] Erro geral em reprocessar_pendentes_tiktok_mapeados: {e}")
-        st.error(f"Erro ao reprocessar pendentes TikTok: {e}")
         erros += len(pendentes) if 'pendentes' in dir() else 1
     finally:
         cursor.close()
         conn.close()
 
-    return sucesso, erros
+    return sucesso, erros, detalhes

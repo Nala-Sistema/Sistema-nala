@@ -112,6 +112,12 @@ def _tab_tiktok(engine):
     st.subheader("🎵 TikTok Shop — Lojas e Taxas")
     st.caption("Gerencie lojas TikTok e as taxas fixas de plataforma (6%+6% comissão+SFP e R$4/item).")
 
+    erros_repro = st.session_state.pop('tiktok_repro_erros', None)
+    if erros_repro:
+        with st.expander(f"⚠️ Detalhes dos {len(erros_repro)} erro(s) no último reprocessamento", expanded=True):
+            for msg in erros_repro:
+                st.code(msg, language=None)
+
     # ── Lojas TikTok cadastradas ──────────────────────────────────────────────
     st.markdown("### Lojas cadastradas")
     df_lojas = _query_to_df(engine,
@@ -330,13 +336,16 @@ def _tab_tiktok(engine):
                             conn.close()
 
                             sku_map = dict(zip(df_novos['id_sku_tiktok'], df_novos['sku_interno']))
-                            sucesso, erros = reprocessar_pendentes_tiktok_mapeados(engine, sku_map)
+                            sucesso, erros, detalhes = reprocessar_pendentes_tiktok_mapeados(engine, sku_map)
 
                             st.success(
                                 f"✅ {salvos} mapeamento(s) salvo(s). "
                                 f"{sucesso} pendente(s) promovido(s) para o histórico. "
                                 f"{erros} erro(s)."
                             )
+                            # Guarda os detalhes em session_state pois o st.rerun() abaixo
+                            # apaga qualquer st.error/st.warning exibido nesta execução.
+                            st.session_state['tiktok_repro_erros'] = detalhes
                             st.rerun()
                         except Exception as e:
                             st.error(f"Erro ao salvar mapeamentos: {e}")
