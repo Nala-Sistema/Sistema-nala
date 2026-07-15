@@ -43,6 +43,7 @@ from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
 from processar_amazon import processar_arquivo_amazon, gravar_vendas_amazon
 from processar_shein import processar_arquivo_shein, gravar_vendas_shein
 from processar_magalu import processar_arquivo_magalu, gravar_vendas_magalu
+from processar_tiktok import processar_arquivo_tiktok, gravar_vendas_tiktok
 
 
 # ============================================================
@@ -107,6 +108,7 @@ def _detectar_marketplace(mktp):
     if 'AMAZON' in mktp_upper: return 'AMAZON'
     if 'SHEIN' in mktp_upper: return 'SHEIN'
     if 'MAGALU' in mktp_upper or 'MAGAZINE' in mktp_upper: return 'MAGALU'
+    if 'TIKTOK' in mktp_upper or 'TIK TOK' in mktp_upper: return 'TIKTOK'
     return 'DESCONHECIDO'
 
 
@@ -435,6 +437,12 @@ def _excluir_lancamento(engine, log_id, marketplace, loja, arquivo_nome, periodo
         except:
             pass  # Tabela pode não existir ainda
 
+        # 2b. Excluir pendentes associadas (evita órfãos quando upload é excluído)
+        cursor.execute(
+            "DELETE FROM fact_vendas_pendentes WHERE marketplace_origem = %s AND loja_origem = %s AND arquivo_origem = %s",
+            [marketplace, loja, arquivo_nome]
+        )
+
         # 3. Excluir do log
         cursor.execute("DELETE FROM log_uploads WHERE id = %s", (log_id,))
 
@@ -622,9 +630,18 @@ def tab_processar_upload(engine):
         arquivo_pacotes = col_up2.file_uploader("📦 Relatório de PACOTES (CSV)", type=['csv'], key=f"mglu_pacotes_{uc}")
         arquivo = arquivo_pedidos
         arquivos_ok = arquivo_pedidos is not None and arquivo_pacotes is not None
+    elif mp == 'TIKTOK':
+        st.markdown("**📂 TikTok Shop — relatório financeiro + em espera (opcional):**")
+        col_up1, col_up2 = st.columns(2)
+        arq_tktk_fin = col_up1.file_uploader("💰 Relatório Financeiro / Liquidado (XLSX)", type=['xlsx'], key=f"tktk_fin_{uc}")
+        arq_tktk_esp = col_up2.file_uploader("⏳ Relatório Em Espera (XLSX) — opcional", type=['xlsx'], key=f"tktk_esp_{uc}")
+        arquivo = arq_tktk_fin
+        arquivo_pedidos = None; arquivo_pacotes = None
+        arquivos_ok = arq_tktk_fin is not None
     else:
         arquivo = st.file_uploader(f"📂 Upload do arquivo de vendas", type=tipos, key=f"up_arquivo_{uc}")
         arquivo_pedidos = None; arquivo_pacotes = None
+        arq_tktk_fin = None; arq_tktk_esp = None
         arquivos_ok = arquivo is not None
 
     if arquivos_ok and st.button("🔍 ANALISAR ARQUIVO", type="primary"):
@@ -639,6 +656,8 @@ def tab_processar_upload(engine):
                 df_proc, info = processar_arquivo_shein(arquivo, loja, imposto, engine)
             elif mp == 'MAGALU':
                 df_proc, info = processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto, engine)
+            elif mp == 'TIKTOK':
+                df_proc, info = processar_arquivo_tiktok(arq_tktk_fin, arq_tktk_esp, loja, imposto, engine)
             else:
                 st.error(f"⚠️ Processador para '{mktp}' não implementado."); return
 
@@ -685,6 +704,10 @@ def tab_processar_upload(engine):
             st.warning(f"⚠️ {len(info['pendentes_carrinho'])} venda(s) com divergência financeira")
         if mp_key == 'SHOPEE':
             _exibir_alertas_comissao(info.get('alertas_comissao', []))
+        if mp_key == 'TIKTOK' and info.get('skus_nao_mapeados', 0) > 0:
+            st.warning(f"⚠️ {info['skus_nao_mapeados']} SKU(s) TikTok sem mapeamento — irão para pendentes. Mapeie na aba 'Vendas Pendentes' e reprocesse.")
+        if mp_key == 'TIKTOK' and info.get('pendentes_emespera'):
+            st.info(f"⏳ {len(info['pendentes_emespera'])} pedido(s) 'em espera' serão registrados como staging.")
         if mp_key == 'AMAZON' and info.get('asins_sem_config'):
             st.warning(f"⚠️ {len(info['asins_sem_config'])} ASIN(s) sem configuração")
 
@@ -741,6 +764,12 @@ def tab_processar_upload(engine):
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_magalu(
                         df_proc, mktp, loja, arquivo_nome, engine,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
+                elif mp_key == 'TIKTOK':
+                    registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_tiktok(
+                        df_proc, mktp, loja, arquivo_nome, engine,
+                        pendentes_sku=info.get('pendentes_sku', []),
+                        pendentes_emespera=info.get('pendentes_emespera', []),
+                        descartes=info.get('descartes', []))
                 else:
                     st.error("⚠️ Processador não identificado."); return
 
@@ -1268,6 +1297,33 @@ def _secao_pend_sku(engine):
     df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
         'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo']].copy()
     df_e['sku_original'] = df_e['sku'].copy()
+
+    # Enriquece linhas TikTok com nome_produto/nome_sku_variante de dim_tiktok_skus
+    df_e['nome_produto'] = ''
+    df_e['nome_sku_variante'] = ''
+    tiktok_mask = df_e['marketplace_origem'] == 'TIKTOK'
+    if tiktok_mask.any():
+        tiktok_ids = df_e.loc[tiktok_mask, 'sku'].tolist()
+        try:
+            _conn = engine.raw_connection()
+            _cur = _conn.cursor()
+            _ph = ', '.join(['%s'] * len(tiktok_ids))
+            _cur.execute(
+                f"SELECT id_sku_tiktok, COALESCE(nome_produto,''), COALESCE(nome_sku_variante,'') "
+                f"FROM dim_tiktok_skus WHERE id_sku_tiktok IN ({_ph})",
+                tiktok_ids
+            )
+            _nomes = {r[0]: (r[1], r[2]) for r in _cur.fetchall()}
+            _cur.close()
+            _conn.close()
+            for _idx in df_e[tiktok_mask].index:
+                _sid = df_e.at[_idx, 'sku']
+                if _sid in _nomes:
+                    df_e.at[_idx, 'nome_produto'] = _nomes[_sid][0]
+                    df_e.at[_idx, 'nome_sku_variante'] = _nomes[_sid][1]
+        except Exception:
+            pass
+
     df_e['data_venda'] = pd.to_datetime(df_e['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
     df_e.insert(0, 'Sel', False)
 
@@ -1280,6 +1336,8 @@ def _secao_pend_sku(engine):
         'comissao': st.column_config.NumberColumn("Tarifa", format="%.2f", disabled=True),
         'imposto': st.column_config.NumberColumn("Imposto", format="%.2f", disabled=True),
         'frete': st.column_config.NumberColumn("Frete", format="%.2f", disabled=True),
+        'nome_produto': st.column_config.TextColumn("Produto (TikTok)", disabled=True),
+        'nome_sku_variante': st.column_config.TextColumn("Variante (TikTok)", disabled=True),
     }, use_container_width=True, height=400, hide_index=True, key="ed_pend_sku")
 
     sels = df_ed[df_ed['Sel']==True]
