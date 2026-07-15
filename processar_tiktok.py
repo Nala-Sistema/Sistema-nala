@@ -234,7 +234,7 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
                 skus_nao_map.add(sku_tiktok)
 
             custo_total = round(custo_un * qtd, 2)
-            margem = round(valor_liquido - custo_total - imposto_val, 2)
+            margem = round(valor_liquido - custo_total, 2)
             margem_pct = round((margem / vendas_liq * 100) if vendas_liq > 0 else 0, 2)
 
             # numero_pedido sintético: único por (pedido, variante TikTok)
