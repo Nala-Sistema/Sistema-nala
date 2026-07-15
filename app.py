@@ -333,12 +333,16 @@ def _metricas_inicio_cached(ano_mes, lojas_key):
     primeiro_ant, ultimo_ant = _ano_mes_para_datas(mes_ant)
 
     # Sempre exclui lojas ocultas do painel; restringe por loja se usuário não vê tudo
-    where_loja = " AND loja_origem IN (SELECT loja FROM dim_lojas WHERE visivel_no_painel IS DISTINCT FROM FALSE)"
+    where_loja_base = ""
     params_loja = []
     if lojas_key and lojas_key != ('ALL',) and lojas_key != ('NONE',):
         placeholders = ', '.join(['%s'] * len(lojas_key))
-        where_loja = f" AND loja_origem IN ({placeholders})"
+        where_loja_base = f" AND loja IN ({placeholders})"
         params_loja = list(lojas_key)
+    where_loja = (
+        " AND loja_origem IN (SELECT loja FROM dim_lojas "
+        f"WHERE visivel_no_painel IS DISTINCT FROM FALSE{where_loja_base})"
+    )
 
     try:
         conn = engine.raw_connection()
