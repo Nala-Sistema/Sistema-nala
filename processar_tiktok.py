@@ -679,7 +679,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
             custo_total = round(custo_un * int(qtd or 1), 2)
             receita_f = float(receita or 0)
             imposto_f = float(imposto or 0)
-            margem = round(receita_f - custo_total - imposto_f, 2)
+            margem = round(float(valor_liquido or 0) - custo_total, 2)
             margem_pct = round((margem / receita_f * 100) if receita_f > 0 else 0, 2)
 
             pedido_original = numero_pedido.replace('TKTK_', '').rsplit('_', 1)[0] if numero_pedido.startswith('TKTK_') else numero_pedido
