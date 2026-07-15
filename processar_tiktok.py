@@ -155,6 +155,8 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
       skus_nao_map    - set de IDs TikTok sem mapeamento
       linhas_desc     - count de linhas descartadas
       nomes_dict      - {sku_tiktok: (nome_produto, nome_sku_variante)} para upsert
+      descartes_lista - detalhe de cada linha descartada (numero_pedido, sku, motivo)
+                        para persistir em fact_vendas_descartadas
     """
     col_valor_total = ('Valor total a ser liquidado' if fonte == 'financeiro'
                        else 'Valor estimado a ser liquidado')
@@ -166,23 +168,55 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
     skus_nao_map = set()
     linhas_desc = 0
     nomes_dict = {}
+    descartes_lista = []
 
     for _, row in df.iterrows():
         try:
             tipo = str(row.get('Tipo de transação', 'Pedido')).strip()
-            if tipo != 'Pedido':
-                linhas_desc += 1
-                continue
-
-            vendas_liq = _limpar_valor(row.get('Vendas líquidas dos produtos', 0))
-            if vendas_liq <= 0:
-                linhas_desc += 1
-                continue
-
             pedido_id = str(row.get('ID do pedido/ajuste', '')).strip()
             sku_tiktok = str(row.get('ID do SKU', '')).strip()
+            vendas_liq = _limpar_valor(row.get('Vendas líquidas dos produtos', 0))
+
+            if tipo != 'Pedido':
+                linhas_desc += 1
+                descartes_lista.append({
+                    'numero_pedido': pedido_id,
+                    'sku': sku_tiktok,
+                    'status_original': tipo,
+                    'motivo_descarte': f"Tipo de transação diferente de 'Pedido': {tipo}",
+                    'receita_estimada': max(vendas_liq, 0),
+                    'tarifa_venda_estimada': 0,
+                    'tarifa_envio_estimada': 0,
+                    'logistica': _LOGISTICA,
+                })
+                continue
+
+            if vendas_liq <= 0:
+                linhas_desc += 1
+                descartes_lista.append({
+                    'numero_pedido': pedido_id,
+                    'sku': sku_tiktok,
+                    'status_original': tipo,
+                    'motivo_descarte': f"Vendas líquidas <= 0 (valor={vendas_liq})",
+                    'receita_estimada': 0,
+                    'tarifa_venda_estimada': 0,
+                    'tarifa_envio_estimada': 0,
+                    'logistica': _LOGISTICA,
+                })
+                continue
+
             if not pedido_id or not sku_tiktok or pedido_id == 'nan':
                 linhas_desc += 1
+                descartes_lista.append({
+                    'numero_pedido': pedido_id,
+                    'sku': sku_tiktok,
+                    'status_original': tipo,
+                    'motivo_descarte': "ID do pedido ou ID do SKU ausente",
+                    'receita_estimada': max(vendas_liq, 0),
+                    'tarifa_venda_estimada': 0,
+                    'tarifa_envio_estimada': 0,
+                    'logistica': _LOGISTICA,
+                })
                 continue
 
             qtd = max(1, int(_limpar_valor(row.get('Quantidade', 1)) or 1))
@@ -272,11 +306,21 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
             else:
                 pendentes_lista.append(item)
 
-        except Exception:
+        except Exception as e:
             linhas_desc += 1
+            descartes_lista.append({
+                'numero_pedido': str(row.get('ID do pedido/ajuste', '')).strip(),
+                'sku': str(row.get('ID do SKU', '')).strip(),
+                'status_original': 'Erro',
+                'motivo_descarte': f"Erro interno ao processar linha: {str(e)[:200]}",
+                'receita_estimada': 0,
+                'tarifa_venda_estimada': 0,
+                'tarifa_envio_estimada': 0,
+                'logistica': _LOGISTICA,
+            })
             continue
 
-    return vendas_ok, pendentes_lista, datas, skus_sem_custo, skus_nao_map, linhas_desc, nomes_dict
+    return vendas_ok, pendentes_lista, datas, skus_sem_custo, skus_nao_map, linhas_desc, nomes_dict, descartes_lista
 
 
 # ============================================================
@@ -312,13 +356,14 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     if df_fin is None:
         return None, "Coluna 'ID do pedido/ajuste' não encontrada no relatório financeiro."
 
-    vendas_fin, pend_fin, datas_fin, sem_custo_fin, nao_map_fin, desc_fin, nomes_fin = _processar_df(
+    vendas_fin, pend_fin, datas_fin, sem_custo_fin, nao_map_fin, desc_fin, nomes_fin, descartes_fin = _processar_df(
         df_fin, 'financeiro', loja, imposto_pct, tiktok_sku_map, custos_dict
     )
 
     # ── Relatório Em Espera (opcional) ───────────────────────────────────────
     pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp = [], [], set(), set(), 0
     nomes_esp = {}
+    descartes_esp = []
 
     if arq_emespera is not None:
         try:
@@ -330,7 +375,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         if df_esp is None:
             return None, "Coluna 'ID do pedido/ajuste' não encontrada no relatório em espera."
 
-        _, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp, nomes_esp = _processar_df(
+        _, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp, nomes_esp, descartes_esp = _processar_df(
             df_esp, 'em_espera', loja, imposto_pct, tiktok_sku_map, custos_dict
         )
 
@@ -357,7 +402,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         'arquivo_nome': arq_financeiro.name,
         'pendentes_sku': pend_fin,       # financeiro sem SKU mapeado
         'pendentes_emespera': pend_esp,  # todos os registros do em espera
-        'descartes': [],
+        'descartes': descartes_fin + descartes_esp,
         'divergencias': [],
     }
 
@@ -369,7 +414,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
 # ============================================================
 
 def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None, data_fim=None,
-                          pendentes_sku=None, pendentes_emespera=None):
+                          pendentes_sku=None, pendentes_emespera=None, descartes=None):
     """
     Grava vendas TikTok no banco seguindo o padrão dos demais processadores.
 
@@ -379,11 +424,14 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
       3. INSERT financeiro resolvidos -> fact_vendas_snapshot  (SAVEPOINT por linha)
       4. INSERT financeiro não mapeados -> fact_vendas_pendentes (SAVEPOINT por linha)
       5. INSERT em_espera -> fact_vendas_pendentes, ON CONFLICT DO NOTHING
+      6. INSERT descartes -> fact_vendas_descartadas (SAVEPOINT por linha)
     """
     if pendentes_sku is None:
         pendentes_sku = []
     if pendentes_emespera is None:
         pendentes_emespera = []
+    if descartes is None:
+        descartes = []
 
     # Auto-detectar período a partir dos dados do df + pendentes_sku
     todas_datas = []
@@ -434,7 +482,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
         )
     """
 
-    total_itens = len(df) + len(pendentes_sku) + len(pendentes_emespera)
+    total_itens = len(df) + len(pendentes_sku) + len(pendentes_emespera) + len(descartes)
     if total_itens == 0:
         total_itens = 1
     progress_bar = st.progress(0)
@@ -581,6 +629,29 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
                     err += 1
 
             except Exception:
+                err += 1
+
+        # 6. INSERT descartes -> fact_vendas_descartadas
+        from database_utils import gravar_venda_descartada
+        for idx, descarte in enumerate(descartes):
+            try:
+                item_atual += 1
+                progress_bar.progress(min(item_atual / total_itens, 1.0))
+                status_text.text(f"Registrando descarte {idx + 1} de {len(descartes)}...")
+
+                descarte['marketplace'] = marketplace
+                descarte['loja'] = loja
+                descarte['arquivo_origem'] = arq_nome
+
+                cursor.execute(f"SAVEPOINT tktk_desc_{idx}")
+                if gravar_venda_descartada(cursor, descarte):
+                    desc_count += 1
+                cursor.execute(f"RELEASE SAVEPOINT tktk_desc_{idx}")
+            except Exception:
+                try:
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT tktk_desc_{idx}")
+                except Exception:
+                    pass
                 err += 1
 
         conn.commit()

@@ -768,7 +768,8 @@ def tab_processar_upload(engine):
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_tiktok(
                         df_proc, mktp, loja, arquivo_nome, engine,
                         pendentes_sku=info.get('pendentes_sku', []),
-                        pendentes_emespera=info.get('pendentes_emespera', []))
+                        pendentes_emespera=info.get('pendentes_emespera', []),
+                        descartes=info.get('descartes', []))
                 else:
                     st.error("⚠️ Processador não identificado."); return
 
