@@ -144,6 +144,10 @@ def _render_meta_loja(engine, loja, marketplace, ano_mes):
         if st.button("💾 Salvar Meta", key=f"btn_meta_{loja}_{ano_mes}"):
             result = salvar_meta_loja(engine, loja, marketplace, ano_mes, nova_meta, modelo_sel)
             if result >= 0:
+                # Painel Início cacheia o panorama de metas por 3min (app.py) —
+                # sem isso, a meta recém-salva só aparece lá depois do TTL expirar.
+                import app
+                app._buscar_metas_panorama_cached.clear()
                 st.success("Meta salva!")
                 st.rerun()
             else:
