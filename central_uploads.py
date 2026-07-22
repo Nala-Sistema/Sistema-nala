@@ -1295,7 +1295,7 @@ def _secao_pend_sku(engine):
 
     skus_v = buscar_skus_validos(engine)
     df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
-        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo']].copy()
+        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo','arquivo_origem']].copy()
     df_e['sku_original'] = df_e['sku'].copy()
 
     # Enriquece linhas TikTok com nome_produto/nome_sku_variante de dim_tiktok_skus
@@ -1332,6 +1332,7 @@ def _secao_pend_sku(engine):
         'id': st.column_config.NumberColumn("ID", disabled=True),
         'sku': st.column_config.TextColumn("SKU (editável)"),
         'sku_original': None,
+        'arquivo_origem': None,
         'valor_venda_efetivo': st.column_config.NumberColumn("Receita", format="%.2f", disabled=True),
         'comissao': st.column_config.NumberColumn("Tarifa", format="%.2f", disabled=True),
         'imposto': st.column_config.NumberColumn("Imposto", format="%.2f", disabled=True),
@@ -1357,7 +1358,7 @@ def _secao_pend_sku(engine):
                         'frete':r['frete'],'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem','')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:
                         st.success(f"✅ {res['mensagem']}")
@@ -1384,7 +1385,7 @@ def _secao_pend_div(engine):
     if df.empty: st.success("✅ Nenhuma por divergência."); return
 
     df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
-        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','tarifa_fixa','imposto','frete','motivo']].copy()
+        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','tarifa_fixa','imposto','frete','motivo','arquivo_origem']].copy()
     df_e['sku_original'] = df_e['sku'].copy()
     df_e['data_venda'] = pd.to_datetime(df_e['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
     df_e.insert(0, 'Sel', False)
@@ -1392,6 +1393,7 @@ def _secao_pend_div(engine):
     df_ed = st.data_editor(df_e, column_config={
         'Sel': st.column_config.CheckboxColumn("Sel", default=False),
         'sku': st.column_config.TextColumn("SKU (editável)"), 'sku_original': None,
+        'arquivo_origem': None,
         'valor_venda_efetivo': st.column_config.NumberColumn("Receita", format="%.2f"),
         'comissao': st.column_config.NumberColumn("Comissão", format="%.2f"),
         'tarifa_fixa': st.column_config.NumberColumn("Taxa Fixa", format="%.2f"),
@@ -1413,7 +1415,7 @@ def _secao_pend_div(engine):
                         'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':''} for _,r in sels.iterrows()]
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem','')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:
                         st.success(f"✅ {res['mensagem']}")
