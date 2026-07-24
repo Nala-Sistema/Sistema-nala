@@ -26,6 +26,7 @@ from processar_ads_shopee import (
     buscar_skus_match, atualizar_matches_sku, calcular_tacos,
     data_fim_efetiva, LOJA_ADS_PARA_ORIGEM
 )
+from matching_ads_titulos import sugerir_matches_anuncios, contar_dicionario
 
 try:
     import google.generativeai as genai
@@ -1020,6 +1021,150 @@ def _bloco_ia_insights(engine, loja_nome, dt_inicio, dt_fim):
 # TAB 3: MATCH SKU (múltiplos SKUs por anúncio, com data_editor)
 # ============================================================
 
+def _aplicar_sugestoes(engine, loja_nome, lista_res, df_editado):
+    """
+    Aplica as sugestões marcadas (coluna 'Aplicar' = True) em dim_ads_produto_sku.
+    lista_res e df_editado estão na MESMA ordem (linha i ↔ lista_res[i]).
+    """
+    aplicados = 0
+    erros = []
+    for i, r in enumerate(lista_res):
+        try:
+            aplicar = bool(df_editado.iloc[i]['Aplicar'])
+        except Exception:
+            aplicar = False
+        if not aplicar or not r.get('skus'):
+            continue
+        ok = atualizar_matches_sku(
+            engine, loja_nome, r['nome_anuncio'], r.get('sku_pai') or '', r['skus']
+        )
+        if ok:
+            _sync_fact_sku_match(engine, loja_nome, r['nome_anuncio'], r['skus'][0])
+            aplicados += 1
+        else:
+            erros.append(r['nome_anuncio'][:40])
+
+    if aplicados:
+        st.success(
+            f"✅ {aplicados} anúncio(s) vinculado(s) a partir das sugestões. "
+            "Recarregue a aba (ou mude e volte) para ver a lista atualizada."
+        )
+        st.session_state.pop(f'sug_res_{loja_nome}', None)
+    if erros:
+        st.error(f"❌ Falha ao gravar {len(erros)}: {', '.join(erros[:5])}")
+    if not aplicados and not erros:
+        st.info("Nenhuma linha marcada em 'Aplicar'.")
+
+
+def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
+    """
+    Seção de match automático: compara os títulos dos anúncios com o
+    dicionário de títulos das vendas e sugere os SKUs.
+      - Automáticos (EXATO/PREFIXO/FUZZY): pré-marcados para aplicar.
+      - Duvidosos (DUVIDA): desmarcados; usuário confirma um a um.
+      - Sem match: apenas contados (caem no preenchimento manual abaixo).
+    """
+    st.markdown("### 🔮 Match automático (por título das vendas)")
+
+    loja_origem = LOJA_ADS_PARA_ORIGEM.get(loja_nome, loja_nome)
+    n_titulos, _ = contar_dicionario(engine, loja_origem)
+
+    if n_titulos == 0:
+        st.info(
+            "📖 O dicionário de títulos ainda está **vazio** para esta loja. "
+            "Ele enche automaticamente conforme os relatórios de **VENDAS** da "
+            "Shopee vão sendo importados. Enquanto isso, use o preenchimento "
+            "manual abaixo."
+        )
+        st.divider()
+        return
+
+    st.caption(
+        f"Dicionário com **{n_titulos}** títulos de venda conhecidos desta loja. "
+        "O sistema compara cada anúncio com eles e sugere o(s) SKU(s)."
+    )
+
+    if st.button("🔮 Buscar sugestões", key=f"sug_buscar_{loja_nome}"):
+        with st.spinner("Comparando anúncios com o dicionário..."):
+            st.session_state[f'sug_res_{loja_nome}'] = sugerir_matches_anuncios(engine, loja_nome)
+
+    res = st.session_state.get(f'sug_res_{loja_nome}')
+    if not res:
+        st.divider()
+        return
+
+    # Separar por tipo, ignorando o que já está vinculado igual ao sugerido
+    autos, duvidas, sem = [], [], []
+    for r in res:
+        if r['tipo'] == 'SEM' or not r['skus']:
+            sem.append(r)
+            continue
+        atuais = matches_atuais.get(r['nome_anuncio'], [])
+        if sorted(atuais) == sorted(r['skus']):
+            continue  # já vinculado exatamente assim
+        if r['automatico']:
+            autos.append(r)
+        elif r['tipo'] == 'DUVIDA':
+            duvidas.append(r)
+
+    st.caption(
+        f"✅ {len(autos)} automáticos  •  🤔 {len(duvidas)} duvidosos  •  "
+        f"⬜ {len(sem)} sem match"
+    )
+
+    # ---- AUTOMÁTICOS ----
+    if autos:
+        st.markdown(f"#### ✅ Automáticos (alta confiança) — {len(autos)}")
+        df_auto = pd.DataFrame([{
+            'Aplicar': True,
+            'Anúncio': r['nome_anuncio'],
+            'SKUs sugeridos': ', '.join(r['skus']),
+            'Tipo': r['tipo'],
+            'Parecença': f"{int(round(r['score'] * 100))}%",
+            'Título na venda': (r['titulo_venda'] or '')[:60],
+        } for r in autos])
+        ed_auto = st.data_editor(
+            df_auto, hide_index=True, use_container_width=True, num_rows="fixed",
+            disabled=['Anúncio', 'SKUs sugeridos', 'Tipo', 'Parecença', 'Título na venda'],
+            key=f"sug_auto_editor_{loja_nome}",
+            column_config={'Aplicar': st.column_config.CheckboxColumn(width="small")},
+        )
+        if st.button("✅ Aplicar automáticos marcados", key=f"sug_auto_aplicar_{loja_nome}", type="primary"):
+            _aplicar_sugestoes(engine, loja_nome, autos, ed_auto)
+
+    # ---- DUVIDOSOS ----
+    if duvidas:
+        st.markdown(f"#### 🤔 Precisa do seu olho — {len(duvidas)}")
+        st.caption(
+            "O sistema achou algo parecido mas **não teve certeza**. "
+            "Marque 'Aplicar' só nos que você confirmar."
+        )
+        df_duv = pd.DataFrame([{
+            'Aplicar': False,
+            'Anúncio': r['nome_anuncio'],
+            'SKUs sugeridos': ', '.join(r['skus']),
+            'Parecença': f"{int(round(r['score'] * 100))}%",
+            'Título na venda': (r['titulo_venda'] or '')[:60],
+        } for r in duvidas])
+        ed_duv = st.data_editor(
+            df_duv, hide_index=True, use_container_width=True, num_rows="fixed",
+            disabled=['Anúncio', 'SKUs sugeridos', 'Parecença', 'Título na venda'],
+            key=f"sug_duv_editor_{loja_nome}",
+            column_config={'Aplicar': st.column_config.CheckboxColumn(width="small")},
+        )
+        if st.button("Aplicar duvidosos marcados", key=f"sug_duv_aplicar_{loja_nome}"):
+            _aplicar_sugestoes(engine, loja_nome, duvidas, ed_duv)
+
+    if sem:
+        st.caption(
+            f"⬜ {len(sem)} anúncios sem título correspondente nas vendas "
+            "(produto que ainda não vendeu, ou nome muito diferente) — "
+            "use o preenchimento manual abaixo."
+        )
+
+    st.divider()
+
+
 def _shopee_match_sku(engine):
     st.subheader("Vincular Produto Ads → SKU")
     st.caption(
@@ -1065,6 +1210,9 @@ def _shopee_match_sku(engine):
     c1.metric("Total de anúncios", len(df_anuncios))
     c2.metric("Com SKU vinculado", com_match)
     c3.metric("Sem vínculo", sem_match)
+
+    # ---- BLOCO SUGESTÕES AUTOMÁTICAS (match por título via dicionário) ----
+    _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais)
 
     # ---- BLOCO XLSX: download para preenchimento + upload ----
     with st.expander("📎 Trabalhar via planilha (XLSX)", expanded=False):
