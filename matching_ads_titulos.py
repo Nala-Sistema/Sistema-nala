@@ -262,6 +262,210 @@ def atualizar_dicionario_de_vendas(engine, loja_origem, df_vendas):
     return gravados, erros
 
 
+# ============================================================
+# MOTOR DE MATCH: anúncio (título) → SKU(s) via dicionário
+# ------------------------------------------------------------
+# Classifica cada anúncio comparando o título normalizado contra
+# o dicionário de vendas:
+#   EXATO   — título idêntico          → automático (alta confiança)
+#   PREFIXO — um é começo do outro      → automático (trata truncamento)
+#   FUZZY   — parecença alta (>= 0.85)  → automático (alta confiança)
+#   DUVIDA  — parecença média           → sugere, precisa confirmação
+#   SEM     — nada parecido             → manual (como hoje)
+# Só o EXATO/PREFIXO/FUZZY entram como "automático"; DUVIDA/SEM nunca
+# gravam sozinhos.
+# ============================================================
+
+from difflib import SequenceMatcher
+
+# Limiares (calibrados com dados reais LPT jul/2026; ajustáveis depois)
+_MIN_CHARS_PREFIXO = 15    # tamanho mínimo do lado curto para valer prefixo
+_LIMIAR_FUZZY_AUTO = 0.85  # >= vira automático
+_LIMIAR_FUZZY_DUVIDA = 0.55  # entre isto e AUTO → duvidoso
+
+
+def _carregar_indice_dicionario(engine, loja_origem):
+    """
+    Carrega o dicionário de uma loja em memória, agrupado por título
+    normalizado. Retorna dict:
+        { titulo_normalizado: {
+              'titulo_original': str,
+              'skus': [sku, ...],
+              'sku_pai': str|None,
+              'ultima_venda': date|None,
+          } }
+    """
+    indice = {}
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT titulo_normalizado, titulo_original, sku, sku_pai, ultima_venda
+            FROM dim_titulo_sku_shopee
+            WHERE loja_origem = %s
+            ORDER BY titulo_normalizado, sku
+        """, (loja_origem,))
+        for tn, to, sku, sku_pai, ult in cursor.fetchall():
+            entrada = indice.setdefault(tn, {
+                'titulo_original': to,
+                'skus': [],
+                'sku_pai': None,
+                'ultima_venda': None,
+            })
+            if sku and sku not in entrada['skus']:
+                entrada['skus'].append(sku)
+            if sku_pai and not entrada['sku_pai']:
+                entrada['sku_pai'] = sku_pai
+            if ult is not None and (entrada['ultima_venda'] is None or ult > entrada['ultima_venda']):
+                entrada['ultima_venda'] = ult
+    except Exception:
+        pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return indice
+
+
+def classificar_anuncio(nome_anuncio, indice):
+    """
+    Classifica UM anúncio contra o índice do dicionário (em memória).
+
+    Parâmetros:
+        nome_anuncio : título do anúncio (fact_ads_shopee.nome_anuncio)
+        indice       : saída de _carregar_indice_dicionario()
+
+    Retorna dict:
+        {
+          'nome_anuncio', 'tipo', 'score', 'automatico' (bool),
+          'skus' (list), 'sku_pai', 'titulo_venda' (original do match)
+        }
+    """
+    base = {
+        'nome_anuncio': nome_anuncio,
+        'tipo': 'SEM',
+        'score': 0.0,
+        'automatico': False,
+        'skus': [],
+        'sku_pai': None,
+        'titulo_venda': None,
+    }
+    na = normalizar_titulo(nome_anuncio)
+    if not na or not indice:
+        return base
+
+    def _preencher(tipo, chave, score, automatico):
+        e = indice[chave]
+        base.update({
+            'tipo': tipo,
+            'score': round(float(score), 3),
+            'automatico': automatico,
+            'skus': list(e['skus']),
+            'sku_pai': e['sku_pai'],
+            'titulo_venda': e['titulo_original'],
+        })
+        return base
+
+    # 1) EXATO
+    if na in indice:
+        return _preencher('EXATO', na, 1.0, True)
+
+    # 2) PREFIXO / containment (trata truncamento do relatório geral)
+    melhor_pref = None
+    melhor_pref_score = -1.0
+    for chave in indice:
+        if len(min(na, chave, key=len)) < _MIN_CHARS_PREFIXO:
+            continue
+        if chave.startswith(na) or na.startswith(chave):
+            s = SequenceMatcher(None, na, chave).ratio()
+            if s > melhor_pref_score:
+                melhor_pref_score = s
+                melhor_pref = chave
+    if melhor_pref is not None:
+        return _preencher('PREFIXO', melhor_pref, melhor_pref_score, True)
+
+    # 3) FUZZY (melhor parecença geral)
+    melhor = None
+    melhor_score = -1.0
+    for chave in indice:
+        s = SequenceMatcher(None, na, chave).ratio()
+        if s > melhor_score:
+            melhor_score = s
+            melhor = chave
+    if melhor is not None:
+        if melhor_score >= _LIMIAR_FUZZY_AUTO:
+            return _preencher('FUZZY', melhor, melhor_score, True)
+        if melhor_score >= _LIMIAR_FUZZY_DUVIDA:
+            return _preencher('DUVIDA', melhor, melhor_score, False)
+
+    return base
+
+
+def sugerir_matches_anuncios(engine, loja_ads, lista_anuncios=None):
+    """
+    Roda o motor de match para todos os anúncios de uma loja.
+
+    Parâmetros:
+        loja_ads       : loja no formato ADS (ex: 'LPT Store', 'Nala-Lit')
+        lista_anuncios : opcional; se None, carrega nomes distintos de
+                         fact_ads_shopee para a loja.
+
+    Retorna: lista de dicts (saída de classificar_anuncio), ordenada
+             por tipo (automáticos primeiro, depois duvidosos, depois sem).
+    """
+    # Traduz loja ADS → loja_origem (mesma chave do dicionário/vendas)
+    try:
+        from processar_ads_shopee import LOJA_ADS_PARA_ORIGEM
+        loja_origem = LOJA_ADS_PARA_ORIGEM.get(loja_ads, loja_ads)
+    except Exception:
+        loja_origem = loja_ads
+
+    indice = _carregar_indice_dicionario(engine, loja_origem)
+
+    # Carrega anúncios se não vieram prontos
+    if lista_anuncios is None:
+        lista_anuncios = []
+        conn = None
+        cursor = None
+        try:
+            conn = engine.raw_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT nome_anuncio FROM fact_ads_shopee
+                WHERE loja = %s ORDER BY nome_anuncio
+            """, (loja_ads,))
+            lista_anuncios = [r[0] for r in cursor.fetchall()]
+        except Exception:
+            lista_anuncios = []
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    resultados = [classificar_anuncio(a, indice) for a in lista_anuncios]
+
+    # Ordena: automáticos, depois duvidosos, depois sem match
+    ordem = {'EXATO': 0, 'PREFIXO': 1, 'FUZZY': 2, 'DUVIDA': 3, 'SEM': 4}
+    resultados.sort(key=lambda r: (ordem.get(r['tipo'], 9), -r['score']))
+    return resultados
+
+
 def contar_dicionario(engine, loja_origem=None):
     """
     Retorna (titulos_distintos, pares_titulo_sku) do dicionário — para
