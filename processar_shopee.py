@@ -426,12 +426,19 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             # --------------------------------------------------
             imposto_valor = round(subtotal * (imposto / 100), 2)
 
+            # Título do produto (Nome do Produto) — usado para o dicionário
+            # título→SKU do módulo de Ads (match automático anúncio↔SKU).
+            titulo_produto = str(row.get('Nome do Produto', '') or '').strip()
+            if titulo_produto.lower() in ('nan', 'none'):
+                titulo_produto = ''
+
             resultados.append({
                 'pedido':            pedido_id,
                 'pedido_original':   pedido_id,  # v2.1: pedido real da Shopee
                 'data':              data_venda,
                 'sku':               sku,
                 'codigo_anuncio':    codigo_anuncio,
+                'titulo':            titulo_produto,  # NOVO: p/ dicionário de Ads
                 'qtd':               quantidade,
                 'preco_unit':        preco_unitario,
                 'receita':           subtotal,
@@ -733,5 +740,13 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     conn.close()
     progress.empty()
     status_text.empty()  # v2.1: limpar texto
+
+    # ---- NOVO: alimentar o dicionário título→SKU (módulo de Ads) ----
+    # Isolado em try/except: falha aqui NUNCA compromete a gravação da venda.
+    try:
+        from matching_ads_titulos import atualizar_dicionario_de_vendas
+        atualizar_dicionario_de_vendas(engine, loja, df_vendas)
+    except Exception:
+        pass
 
     return registros, erros, skus_invalidos, duplicatas_count, pendentes_count
