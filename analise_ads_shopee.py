@@ -24,7 +24,9 @@ from datetime import datetime, date, timedelta
 from processar_ads_shopee import (
     processar_csv_ads_shopee, gravar_ads_shopee, extrair_metadados_csv,
     buscar_skus_match, atualizar_matches_sku, calcular_tacos,
-    data_fim_efetiva, LOJA_ADS_PARA_ORIGEM
+    data_fim_efetiva, LOJA_ADS_PARA_ORIGEM,
+    vincular_anuncio_titulo, desvincular_anuncio_titulo, buscar_titulo_vinculado,
+    garantir_tabela_link_titulo,
 )
 from matching_ads_titulos import sugerir_matches_anuncios, contar_dicionario
 
@@ -1023,21 +1025,28 @@ def _bloco_ia_insights(engine, loja_nome, dt_inicio, dt_fim):
 
 def _aplicar_itens(engine, loja_nome, itens):
     """
-    Aplica uma lista de vínculos em dim_ads_produto_sku.
-    itens: lista de dicts {nome_anuncio, skus, sku_pai}.
+    Cria os vínculos DINÂMICOS anúncio→título (dim_ads_titulo_link).
+    itens: lista de dicts {nome_anuncio, titulo_normalizado, titulo_venda, origem?}.
+    A partir do vínculo, os SKUs do anúncio são derivados ao vivo do dicionário
+    (todas as variações que venderam sob aquele título, agora e no futuro).
     Retorna (aplicados, erros).
     """
     aplicados = 0
     erros = []
     for it in itens:
-        skus = it.get('skus') or []
-        if not skus:
+        tn = it.get('titulo_normalizado')
+        if not tn:
             continue
-        ok = atualizar_matches_sku(
-            engine, loja_nome, it['nome_anuncio'], it.get('sku_pai') or '', skus
+        ok = vincular_anuncio_titulo(
+            engine, loja_nome, it['nome_anuncio'], tn,
+            it.get('titulo_venda'), it.get('origem', 'auto')
         )
         if ok:
-            _sync_fact_sku_match(engine, loja_nome, it['nome_anuncio'], skus[0])
+            # sincroniza fact_ads_shopee.sku_match com o 1o SKU derivado
+            skus = buscar_skus_match(engine, loja_nome, it['nome_anuncio'])
+            _sync_fact_sku_match(
+                engine, loja_nome, it['nome_anuncio'], skus[0] if skus else None
+            )
             aplicados += 1
         else:
             erros.append(it['nome_anuncio'][:40])
@@ -1091,11 +1100,12 @@ def _aplicar_sugestoes(engine, loja_nome, lista_res, df_editado):
             aplicar = bool(df_editado.iloc[i]['Aplicar'])
         except Exception:
             aplicar = False
-        if aplicar and r.get('skus'):
+        if aplicar and r.get('titulo_normalizado'):
             itens.append({
                 'nome_anuncio': r['nome_anuncio'],
-                'skus': r['skus'],
-                'sku_pai': r.get('sku_pai'),
+                'titulo_normalizado': r['titulo_normalizado'],
+                'titulo_venda': r.get('titulo_venda'),
+                'origem': 'auto',
             })
     aplicados, erros = _aplicar_itens(engine, loja_nome, itens)
     _reportar_aplicacao(loja_nome, aplicados, erros)
@@ -1198,11 +1208,12 @@ def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
                 sel = st.session_state.get(f"duv_sel_{loja_nome}_{i}")
                 _, mapa = _opcoes_duvidoso(r)
                 c = mapa.get(sel)
-                if c:
+                if c and c.get('titulo_normalizado'):
                     itens.append({
                         'nome_anuncio': r['nome_anuncio'],
-                        'skus': c['skus'],
-                        'sku_pai': c['sku_pai'],
+                        'titulo_normalizado': c['titulo_normalizado'],
+                        'titulo_venda': c.get('titulo_venda'),
+                        'origem': 'duvida',
                     })
             aplicados, erros = _aplicar_itens(engine, loja_nome, itens)
             _reportar_aplicacao(loja_nome, aplicados, erros)
@@ -1220,13 +1231,16 @@ def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
 def _shopee_match_sku(engine):
     st.subheader("Vincular Produto Ads → SKU")
     st.caption(
-        "Cada anúncio pode ter até 3 SKUs vinculados. "
-        "Alterações criam um novo registro temporal (SKU antigo é encerrado na data atual, "
-        "novo SKU começa hoje) — igual ao snapshot de custos do sistema."
+        "Cada anúncio é vinculado a um **título de venda**, e os SKUs são derivados "
+        "**ao vivo** do dicionário — todas as variações que venderam sob aquele título, "
+        "inclusive as que venderem no futuro (entram sozinhas). Sem digitar SKU, sem limite."
     )
 
     loja = st.selectbox("Loja", list(LOJAS_SHOPEE.keys()), key="match_loja")
     loja_nome = LOJAS_SHOPEE[loja]
+
+    # Garante a tabela de vínculo dinâmico (idempotente)
+    garantir_tabela_link_titulo(engine)
 
     # 1) Carregar todos os anúncios da loja (com ou sem match)
     df_anuncios = _query_df(engine, """
@@ -1240,12 +1254,15 @@ def _shopee_match_sku(engine):
         st.info("Nenhum anúncio importado para esta loja ainda. Faça upload de um CSV primeiro.")
         return
 
-    # 2) Carregar SKUs vigentes hoje para cada anúncio
+    # 2) Carregar SKUs vigentes e o título vinculado para cada anúncio
     hoje = date.today()
-    matches_atuais = {}  # {nome_anuncio: [sku1, sku2, ...]}
+    matches_atuais = {}   # {nome_anuncio: [sku1, sku2, ...]} (derivados ao vivo)
+    vinculos_atuais = {}  # {nome_anuncio: titulo_normalizado | None}
     for _, r in df_anuncios.iterrows():
-        lista = buscar_skus_match(engine, loja_nome, r['nome_anuncio'], data_ref=hoje)
-        matches_atuais[r['nome_anuncio']] = lista
+        nome = r['nome_anuncio']
+        matches_atuais[nome] = buscar_skus_match(engine, loja_nome, nome, data_ref=hoje)
+        norm, _venda = buscar_titulo_vinculado(engine, loja_nome, nome)
+        vinculos_atuais[nome] = norm
 
     # 3) Carregar lista de SKUs disponíveis (para a dica no topo)
     df_skus = _query_df(engine, """
@@ -1315,114 +1332,151 @@ def _shopee_match_sku(engine):
 
     st.divider()
 
-    # 5) Construir DataFrame editável
-    # Colunas: ID, Anúncio, SKU 1, SKU 2, SKU 3
+    # 5) Editor por TÍTULO (modelo dinâmico) — sem digitar SKU, sem limite de 3
+    st.markdown("### 📝 Vincular anúncio a um título de venda")
+    st.caption(
+        "Escolha, pra cada anúncio, **qual título de venda** ele corresponde. "
+        "Os SKUs são trazidos **automaticamente** do dicionário (todas as variações "
+        "que venderam sob aquele título — e as que venderem no futuro entram sozinhas). "
+        "Não precisa digitar SKU nem se preocupar com quantidade de variações."
+    )
+
+    # Carregar os títulos conhecidos do dicionário desta loja (opções do seletor)
+    loja_origem = LOJA_ADS_PARA_ORIGEM.get(loja_nome, loja_nome)
+    df_titulos = _query_df(engine, """
+        SELECT titulo_normalizado,
+               MIN(titulo_original) AS titulo_venda,
+               string_agg(DISTINCT sku, ', ' ORDER BY sku) AS skus
+        FROM dim_titulo_sku_shopee
+        WHERE loja_origem = %s
+        GROUP BY titulo_normalizado
+        ORDER BY MIN(titulo_original)
+    """, [loja_origem])
+
+    if df_titulos.empty:
+        st.info(
+            "O dicionário de títulos desta loja ainda está vazio "
+            "(suba relatórios de VENDAS da Shopee para preenchê-lo)."
+        )
+        return
+
+    SEM_VINCULO = "— sem vínculo —"
+    opcoes = [SEM_VINCULO]
+    label_to_norm = {}
+    label_to_venda = {}
+    norm_to_label = {}
+    norm_to_skus = {}
+    _usados = set()
+    for _, t in df_titulos.iterrows():
+        norm = t['titulo_normalizado']
+        venda = str(t['titulo_venda'] or '')
+        skus = str(t['skus'] or '')
+        label = venda[:80] if venda else norm[:80]
+        while label in _usados:  # garante rótulos únicos p/ o seletor
+            label = label + " ."
+        _usados.add(label)
+        opcoes.append(label)
+        label_to_norm[label] = norm
+        label_to_venda[label] = venda
+        norm_to_label[norm] = label
+        norm_to_skus[norm] = skus
+
+    # Montar linhas do editor: Anúncio | Título vinculado | SKUs (hoje)
     linhas = []
     for _, r in df_anuncios.iterrows():
         nome = r['nome_anuncio']
-        id_prod = r.get('id_produto', '') or ''
-        skus = matches_atuais.get(nome, [])
-        # Preencher até MAX_SKUS_POR_ANUNCIO
-        skus_padded = list(skus) + [""] * (MAX_SKUS_POR_ANUNCIO - len(skus))
-        skus_padded = skus_padded[:MAX_SKUS_POR_ANUNCIO]
+        norm_atual = vinculos_atuais.get(nome)
+        label_atual = norm_to_label.get(norm_atual, SEM_VINCULO)
+        skus_hoje = ", ".join(matches_atuais.get(nome, []))
         linhas.append({
-            'ID Produto': str(id_prod),
             'Anúncio': nome,
-            'SKU 1': skus_padded[0],
-            'SKU 2': skus_padded[1],
-            'SKU 3': skus_padded[2],
+            'Título vinculado (da venda)': label_atual,
+            'SKUs (hoje)': skus_hoje,
         })
-
     df_editor = pd.DataFrame(linhas)
 
-    st.markdown("### 📝 Edite os SKUs abaixo e clique em Salvar")
-    st.caption(
-        "💡 **Dica:** preencha os SKUs exatamente como cadastrados no sistema "
-        f"(exemplos dos seus {total_skus} SKUs ativos disponíveis em `dim_skus`). "
-        "Deixe em branco os campos não usados. Para remover um SKU, apague o valor do campo."
-    )
-
-    # st.data_editor — edição inline como planilha
     df_editado = st.data_editor(
         df_editor,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        disabled=['ID Produto', 'Anúncio'],
-        key="match_editor",
+        disabled=['Anúncio', 'SKUs (hoje)'],
+        key="match_editor_titulo",
         column_config={
-            'ID Produto': st.column_config.TextColumn(width="small"),
             'Anúncio': st.column_config.TextColumn(width="large"),
-            'SKU 1': st.column_config.TextColumn(width="small", help="SKU principal"),
-            'SKU 2': st.column_config.TextColumn(width="small", help="SKU adicional (opcional)"),
-            'SKU 3': st.column_config.TextColumn(width="small", help="SKU adicional (opcional)"),
+            'Título vinculado (da venda)': st.column_config.SelectboxColumn(
+                width="large", options=opcoes,
+                help="Título de venda que corresponde a este anúncio",
+            ),
+            'SKUs (hoje)': st.column_config.TextColumn(
+                width="medium", help="Derivado do dicionário; recalcula ao salvar",
+            ),
         }
     )
 
-    if st.button("💾 Salvar alterações", key="match_salvar", type="primary"):
-        _salvar_matches_em_lote(engine, loja_nome, df_editado, matches_atuais)
+    st.caption(
+        f"💡 {len(opcoes) - 1} títulos disponíveis nesta loja. "
+        "A coluna **SKUs (hoje)** recalcula sozinha depois de salvar."
+    )
+
+    if st.button("💾 Salvar vínculos", key="match_salvar_titulo", type="primary"):
+        _salvar_vinculos_titulo(
+            engine, loja_nome, df_editado, vinculos_atuais,
+            label_to_norm, label_to_venda, SEM_VINCULO
+        )
 
 
-def _salvar_matches_em_lote(engine, loja_nome, df_editado, matches_atuais):
-    """Processa o DataFrame editado e atualiza a dim_ads_produto_sku com lógica temporal."""
+def _salvar_vinculos_titulo(engine, loja_nome, df_editado, vinculos_atuais,
+                            label_to_norm, label_to_venda, sem_vinculo):
+    """
+    Salva o editor por TÍTULO: cria/atualiza/remove o vínculo dinâmico de cada
+    anúncio em dim_ads_titulo_link. Os SKUs são derivados ao vivo do dicionário,
+    então aqui só gravamos o título — nada de listas de SKU.
+    """
     alterados = 0
     inalterados = 0
+    removidos = 0
     erros = []
 
-    progress = st.progress(0, text="Salvando alterações...")
-    total = len(df_editado)
-
-    for idx, row in df_editado.iterrows():
+    for _, row in df_editado.iterrows():
         nome = str(row['Anúncio']).strip()
-        id_prod = str(row.get('ID Produto', '')).strip()
+        label = row.get('Título vinculado (da venda)', sem_vinculo)
+        novo_norm = None if label == sem_vinculo else label_to_norm.get(label)
+        atual_norm = vinculos_atuais.get(nome)
 
-        # Coletar SKUs novos (não-vazios, normalizados)
-        skus_novos = []
-        for col in ['SKU 1', 'SKU 2', 'SKU 3']:
-            val = row.get(col, '')
-            if val is not None and not pd.isna(val):
-                txt = str(val).strip()
-                if txt and txt.lower() not in ('nan', 'none'):
-                    skus_novos.append(txt)
-
-        # Remover duplicatas preservando ordem
-        seen = set()
-        skus_novos_unicos = []
-        for s in skus_novos:
-            if s not in seen:
-                seen.add(s)
-                skus_novos_unicos.append(s)
-
-        # Comparar com o estado atual
-        atuais = matches_atuais.get(nome, [])
-        if sorted(atuais) == sorted(skus_novos_unicos):
+        if novo_norm == atual_norm:
             inalterados += 1
+            continue
+
+        if novo_norm is None:
+            ok = desvincular_anuncio_titulo(engine, loja_nome, nome)
+            if ok:
+                _sync_fact_sku_match(engine, loja_nome, nome, None)
+                removidos += 1
+            else:
+                erros.append(nome[:40])
         else:
-            # Aplicar mudanças via função temporal
-            sucesso = atualizar_matches_sku(
-                engine, loja_nome, nome, id_prod, skus_novos_unicos
+            ok = vincular_anuncio_titulo(
+                engine, loja_nome, nome, novo_norm,
+                label_to_venda.get(label), origem='manual'
             )
-            if sucesso:
-                # Atualizar sku_match em fact_ads_shopee (pega o primeiro da lista)
-                primeiro_sku = skus_novos_unicos[0] if skus_novos_unicos else None
-                _sync_fact_sku_match(engine, loja_nome, nome, primeiro_sku)
+            if ok:
+                skus = buscar_skus_match(engine, loja_nome, nome)
+                _sync_fact_sku_match(engine, loja_nome, nome, skus[0] if skus else None)
                 alterados += 1
             else:
                 erros.append(nome[:40])
 
-        progress.progress((idx + 1) / total, text=f"Processando {idx + 1}/{total}...")
-
-    progress.empty()
-
-    if alterados > 0:
-        st.success(f"✅ {alterados} anúncio(s) atualizados com vigência temporal a partir de hoje.")
-    if inalterados > 0:
-        st.info(f"ℹ️ {inalterados} anúncio(s) sem alteração.")
+    if alterados:
+        st.success(f"✅ {alterados} anúncio(s) vinculado(s)/atualizado(s). SKUs derivados automaticamente.")
+    if removidos:
+        st.info(f"↩️ {removidos} vínculo(s) removido(s).")
+    if inalterados:
+        st.caption(f"ℹ️ {inalterados} sem alteração.")
     if erros:
-        st.error(f"❌ {len(erros)} erros: {', '.join(erros[:5])}")
-
-    if alterados > 0:
-        st.caption("Clique em **Rerun** ou mude de aba para recarregar a tela.")
+        st.error(f"❌ {len(erros)} erro(s): {', '.join(erros[:5])}")
+    if alterados or removidos:
+        st.caption("Mude de aba e volte (ou clique em Rerun) para ver os SKUs atualizados.")
 
 
 def _sync_fact_sku_match(engine, loja, nome_anuncio, primeiro_sku):

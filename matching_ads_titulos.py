@@ -361,6 +361,7 @@ def classificar_anuncio(nome_anuncio, indice):
         'skus': [],
         'sku_pai': None,
         'titulo_venda': None,
+        'titulo_normalizado': None,
         'candidatos': [],
     }
     na = normalizar_titulo(nome_anuncio)
@@ -377,6 +378,7 @@ def classificar_anuncio(nome_anuncio, indice):
     base['candidatos'] = [
         {
             'titulo_venda': indice[ch]['titulo_original'],
+            'titulo_normalizado': ch,
             'skus': list(indice[ch]['skus']),
             'sku_pai': indice[ch]['sku_pai'],
             'score': round(float(sc), 3),
@@ -393,6 +395,7 @@ def classificar_anuncio(nome_anuncio, indice):
             'skus': list(e['skus']),
             'sku_pai': e['sku_pai'],
             'titulo_venda': e['titulo_original'],
+            'titulo_normalizado': chave,
         })
         return base
 
