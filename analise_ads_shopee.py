@@ -1021,39 +1021,84 @@ def _bloco_ia_insights(engine, loja_nome, dt_inicio, dt_fim):
 # TAB 3: MATCH SKU (múltiplos SKUs por anúncio, com data_editor)
 # ============================================================
 
-def _aplicar_sugestoes(engine, loja_nome, lista_res, df_editado):
+def _aplicar_itens(engine, loja_nome, itens):
     """
-    Aplica as sugestões marcadas (coluna 'Aplicar' = True) em dim_ads_produto_sku.
-    lista_res e df_editado estão na MESMA ordem (linha i ↔ lista_res[i]).
+    Aplica uma lista de vínculos em dim_ads_produto_sku.
+    itens: lista de dicts {nome_anuncio, skus, sku_pai}.
+    Retorna (aplicados, erros).
     """
     aplicados = 0
     erros = []
-    for i, r in enumerate(lista_res):
-        try:
-            aplicar = bool(df_editado.iloc[i]['Aplicar'])
-        except Exception:
-            aplicar = False
-        if not aplicar or not r.get('skus'):
+    for it in itens:
+        skus = it.get('skus') or []
+        if not skus:
             continue
         ok = atualizar_matches_sku(
-            engine, loja_nome, r['nome_anuncio'], r.get('sku_pai') or '', r['skus']
+            engine, loja_nome, it['nome_anuncio'], it.get('sku_pai') or '', skus
         )
         if ok:
-            _sync_fact_sku_match(engine, loja_nome, r['nome_anuncio'], r['skus'][0])
+            _sync_fact_sku_match(engine, loja_nome, it['nome_anuncio'], skus[0])
             aplicados += 1
         else:
-            erros.append(r['nome_anuncio'][:40])
+            erros.append(it['nome_anuncio'][:40])
+    return aplicados, erros
 
+
+def _reportar_aplicacao(loja_nome, aplicados, erros):
+    """Feedback padrão pós-aplicação; limpa o cache de sugestões se houve gravação."""
     if aplicados:
         st.success(
-            f"✅ {aplicados} anúncio(s) vinculado(s) a partir das sugestões. "
+            f"✅ {aplicados} anúncio(s) vinculado(s). "
             "Recarregue a aba (ou mude e volte) para ver a lista atualizada."
         )
         st.session_state.pop(f'sug_res_{loja_nome}', None)
     if erros:
         st.error(f"❌ Falha ao gravar {len(erros)}: {', '.join(erros[:5])}")
     if not aplicados and not erros:
-        st.info("Nenhuma linha marcada em 'Aplicar'.")
+        st.info("Nenhum vínculo selecionado.")
+
+
+def _opcoes_duvidoso(r):
+    """
+    Monta as opções de escolha para um anúncio duvidoso a partir dos candidatos
+    (SKUs mais parecidos). Retorna (lista_de_labels, mapa_label->candidato).
+    A primeira opção é sempre 'deixar em branco'.
+    """
+    opcoes = ["— deixar em branco —"]
+    mapa = {}
+    for c in r.get('candidatos', []):
+        if not c.get('skus'):
+            continue
+        label = (
+            f"{int(round(c['score'] * 100))}% · "
+            f"{(c['titulo_venda'] or '')[:55]} → {', '.join(c['skus'])}"
+        )
+        if label in mapa:
+            continue
+        opcoes.append(label)
+        mapa[label] = c
+    return opcoes, mapa
+
+
+def _aplicar_sugestoes(engine, loja_nome, lista_res, df_editado):
+    """
+    Aplica os automáticos marcados (coluna 'Aplicar' = True) em dim_ads_produto_sku.
+    lista_res e df_editado estão na MESMA ordem (linha i ↔ lista_res[i]).
+    """
+    itens = []
+    for i, r in enumerate(lista_res):
+        try:
+            aplicar = bool(df_editado.iloc[i]['Aplicar'])
+        except Exception:
+            aplicar = False
+        if aplicar and r.get('skus'):
+            itens.append({
+                'nome_anuncio': r['nome_anuncio'],
+                'skus': r['skus'],
+                'sku_pai': r.get('sku_pai'),
+            })
+    aplicados, erros = _aplicar_itens(engine, loja_nome, itens)
+    _reportar_aplicacao(loja_nome, aplicados, erros)
 
 
 def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
@@ -1136,24 +1181,31 @@ def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
     if duvidas:
         st.markdown(f"#### 🤔 Precisa do seu olho — {len(duvidas)}")
         st.caption(
-            "O sistema achou algo parecido mas **não teve certeza**. "
-            "Marque 'Aplicar' só nos que você confirmar."
+            "O sistema achou coisas parecidas mas **não teve certeza**. "
+            "Pra cada anúncio, escolha o SKU certo entre os mais parecidos — "
+            "ou deixe em branco pra resolver manualmente depois."
         )
-        df_duv = pd.DataFrame([{
-            'Aplicar': False,
-            'Anúncio': r['nome_anuncio'],
-            'SKUs sugeridos': ', '.join(r['skus']),
-            'Parecença': f"{int(round(r['score'] * 100))}%",
-            'Título na venda': (r['titulo_venda'] or '')[:60],
-        } for r in duvidas])
-        ed_duv = st.data_editor(
-            df_duv, hide_index=True, use_container_width=True, num_rows="fixed",
-            disabled=['Anúncio', 'SKUs sugeridos', 'Parecença', 'Título na venda'],
-            key=f"sug_duv_editor_{loja_nome}",
-            column_config={'Aplicar': st.column_config.CheckboxColumn(width="small")},
-        )
-        if st.button("Aplicar duvidosos marcados", key=f"sug_duv_aplicar_{loja_nome}"):
-            _aplicar_sugestoes(engine, loja_nome, duvidas, ed_duv)
+        for i, r in enumerate(duvidas):
+            opcoes, _ = _opcoes_duvidoso(r)
+            st.selectbox(
+                f"🔸 **{r['nome_anuncio']}**",
+                opcoes,
+                key=f"duv_sel_{loja_nome}_{i}",
+            )
+        if st.button("✅ Aplicar escolhas dos duvidosos", key=f"sug_duv_aplicar_{loja_nome}"):
+            itens = []
+            for i, r in enumerate(duvidas):
+                sel = st.session_state.get(f"duv_sel_{loja_nome}_{i}")
+                _, mapa = _opcoes_duvidoso(r)
+                c = mapa.get(sel)
+                if c:
+                    itens.append({
+                        'nome_anuncio': r['nome_anuncio'],
+                        'skus': c['skus'],
+                        'sku_pai': c['sku_pai'],
+                    })
+            aplicados, erros = _aplicar_itens(engine, loja_nome, itens)
+            _reportar_aplicacao(loja_nome, aplicados, erros)
 
     if sem:
         st.caption(
