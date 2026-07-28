@@ -487,30 +487,210 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
 
 
 # ============================================================
-# FUNÇÕES DE MATCH SKU (TEMPORAL + MÚLTIPLO)
+# FUNÇÕES DE MATCH SKU
+# ------------------------------------------------------------
+# MODELO DINÂMICO (2026-07): o anúncio é VINCULADO a um TÍTULO de venda
+# (chave do dicionário dim_titulo_sku_shopee), NÃO a uma lista fixa de SKUs.
+# Os SKUs são derivados AO VIVO do dicionário — então variações que
+# venderem no futuro sob aquele título entram sozinhas, sem refazer o match
+# e sem limite de quantidade.
+# A tabela antiga dim_ads_produto_sku continua como FALLBACK para vínculos
+# legados (feitos antes deste modelo).
 # ============================================================
 
-def buscar_skus_match(engine, loja, nome_produto_ads, data_ref=None):
-    """
-    Retorna LISTA de SKUs vigentes para um anúncio em uma data específica.
-
-    Parâmetros:
-        loja: nome da loja no formato ads (ex: 'Nala-Lit')
-        nome_produto_ads: nome exato do anúncio
-        data_ref: data de referência (default = hoje)
-
-    Regra temporal:
-        data_inicio <= data_ref AND (data_fim IS NULL OR data_fim >= data_ref)
-
-    Retorna: lista de strings de SKU (pode ser vazia).
-    """
-    if data_ref is None:
-        data_ref = date.today()
+def garantir_tabela_link_titulo(engine):
+    """Cria a tabela de vínculo anúncio→título se não existir. Idempotente."""
     conn = None
     cursor = None
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dim_ads_titulo_link (
+                id                 SERIAL PRIMARY KEY,
+                marketplace        VARCHAR(30) NOT NULL DEFAULT 'Shopee',
+                loja               VARCHAR(120) NOT NULL,
+                nome_anuncio       TEXT NOT NULL,
+                titulo_normalizado TEXT NOT NULL,
+                titulo_venda       TEXT,
+                origem             VARCHAR(20),
+                atualizado_em      TIMESTAMP DEFAULT NOW(),
+                UNIQUE (marketplace, loja, nome_anuncio)
+            )
+        """)
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def vincular_anuncio_titulo(engine, loja, nome_anuncio, titulo_normalizado,
+                            titulo_venda=None, origem='auto'):
+    """
+    Cria/atualiza o vínculo dinâmico anúncio→título (um por anúncio).
+    Depois disso, os SKUs do anúncio são sempre os do dicionário para esse título.
+    """
+    garantir_tabela_link_titulo(engine)
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO dim_ads_titulo_link
+                (marketplace, loja, nome_anuncio, titulo_normalizado, titulo_venda, origem, atualizado_em)
+            VALUES ('Shopee', %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (marketplace, loja, nome_anuncio)
+            DO UPDATE SET
+                titulo_normalizado = EXCLUDED.titulo_normalizado,
+                titulo_venda       = EXCLUDED.titulo_venda,
+                origem             = EXCLUDED.origem,
+                atualizado_em      = NOW()
+        """, (loja, nome_anuncio, titulo_normalizado, titulo_venda, origem))
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def desvincular_anuncio_titulo(engine, loja, nome_anuncio):
+    """Remove o vínculo dinâmico de um anúncio (volta a não ter SKUs derivados)."""
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM dim_ads_titulo_link
+            WHERE marketplace = 'Shopee' AND loja = %s AND nome_anuncio = %s
+        """, (loja, nome_anuncio))
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def buscar_titulo_vinculado(engine, loja, nome_anuncio):
+    """Retorna (titulo_normalizado, titulo_venda) do vínculo do anúncio, ou (None, None)."""
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT titulo_normalizado, titulo_venda FROM dim_ads_titulo_link
+            WHERE marketplace = 'Shopee' AND loja = %s AND nome_anuncio = %s
+        """, (loja, nome_anuncio))
+        r = cursor.fetchone()
+        return (r[0], r[1]) if r else (None, None)
+    except Exception:
+        return (None, None)
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def buscar_skus_match(engine, loja, nome_produto_ads, data_ref=None):
+    """
+    Retorna a LISTA de SKUs de um anúncio.
+
+    MODELO DINÂMICO (preferencial): se o anúncio tem vínculo em
+    dim_ads_titulo_link, os SKUs são derivados AO VIVO do dicionário
+    dim_titulo_sku_shopee (todas as variações que já venderam sob aquele
+    título — inclusive as que passarem a vender no futuro).
+
+    FALLBACK (legado): se não há vínculo por título, usa a tabela antiga
+    dim_ads_produto_sku (vínculos feitos antes do modelo dinâmico).
+
+    Retorna: lista de strings de SKU (pode ser vazia).
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        # 1) Vínculo dinâmico por título → SKUs ao vivo do dicionário
+        #    (só consulta se as tabelas já existem — evita erro antes do 1o uso)
+        cursor.execute("SELECT to_regclass('public.dim_ads_titulo_link')")
+        link_existe = cursor.fetchone()[0] is not None
+        if link_existe:
+            cursor.execute("""
+                SELECT titulo_normalizado FROM dim_ads_titulo_link
+                WHERE marketplace = 'Shopee' AND loja = %s AND nome_anuncio = %s
+            """, (loja, nome_produto_ads))
+            row = cursor.fetchone()
+            if row and row[0]:
+                titulo_norm = row[0]
+                loja_origem = LOJA_ADS_PARA_ORIGEM.get(loja, loja)
+                cursor.execute("SELECT to_regclass('public.dim_titulo_sku_shopee')")
+                if cursor.fetchone()[0] is not None:
+                    cursor.execute("""
+                        SELECT DISTINCT sku FROM dim_titulo_sku_shopee
+                        WHERE loja_origem = %s AND titulo_normalizado = %s
+                        ORDER BY sku
+                    """, (loja_origem, titulo_norm))
+                    return [r[0] for r in cursor.fetchall()]
+                return []
+
+        # 2) Fallback legado (dim_ads_produto_sku, temporal)
+        ref = data_ref or date.today()
         cursor.execute("""
             SELECT sku FROM dim_ads_produto_sku
             WHERE marketplace = 'Shopee'
@@ -519,7 +699,7 @@ def buscar_skus_match(engine, loja, nome_produto_ads, data_ref=None):
               AND data_inicio <= %s
               AND (data_fim IS NULL OR data_fim >= %s)
             ORDER BY data_inicio DESC, sku
-        """, (loja, nome_produto_ads, data_ref, data_ref))
+        """, (loja, nome_produto_ads, ref, ref))
         return [r[0] for r in cursor.fetchall()]
     except Exception:
         return []
