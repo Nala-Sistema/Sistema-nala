@@ -282,6 +282,7 @@ from difflib import SequenceMatcher
 _MIN_CHARS_PREFIXO = 15    # tamanho mínimo do lado curto para valer prefixo
 _LIMIAR_FUZZY_AUTO = 0.85  # >= vira automático
 _LIMIAR_FUZZY_DUVIDA = 0.55  # entre isto e AUTO → duvidoso
+_MAX_CANDIDATOS = 3        # nº de SKUs mais parecidos oferecidos nos duvidosos
 
 
 def _carregar_indice_dicionario(engine, loja_origem):
@@ -347,8 +348,10 @@ def classificar_anuncio(nome_anuncio, indice):
     Retorna dict:
         {
           'nome_anuncio', 'tipo', 'score', 'automatico' (bool),
-          'skus' (list), 'sku_pai', 'titulo_venda' (original do match)
+          'skus' (list), 'sku_pai', 'titulo_venda' (original do match),
+          'candidatos' (lista dos títulos mais parecidos p/ o usuário escolher)
         }
+    Cada candidato: {'titulo_venda', 'skus', 'sku_pai', 'score'}.
     """
     base = {
         'nome_anuncio': nome_anuncio,
@@ -358,10 +361,28 @@ def classificar_anuncio(nome_anuncio, indice):
         'skus': [],
         'sku_pai': None,
         'titulo_venda': None,
+        'candidatos': [],
     }
     na = normalizar_titulo(nome_anuncio)
     if not na or not indice:
         return base
+
+    # Ranking geral por parecença (reaproveitado p/ fuzzy e p/ candidatos)
+    ranked = sorted(
+        ((SequenceMatcher(None, na, ch).ratio(), ch) for ch in indice),
+        key=lambda x: x[0], reverse=True
+    )
+    # Candidatos: os títulos mais parecidos, p/ o usuário escolher nos duvidosos.
+    # Guarda até _MAX_CANDIDATOS acima de um piso baixo (0.40).
+    base['candidatos'] = [
+        {
+            'titulo_venda': indice[ch]['titulo_original'],
+            'skus': list(indice[ch]['skus']),
+            'sku_pai': indice[ch]['sku_pai'],
+            'score': round(float(sc), 3),
+        }
+        for sc, ch in ranked[:_MAX_CANDIDATOS] if sc >= 0.40
+    ]
 
     def _preencher(tipo, chave, score, automatico):
         e = indice[chave]
@@ -393,15 +414,9 @@ def classificar_anuncio(nome_anuncio, indice):
     if melhor_pref is not None:
         return _preencher('PREFIXO', melhor_pref, melhor_pref_score, True)
 
-    # 3) FUZZY (melhor parecença geral)
-    melhor = None
-    melhor_score = -1.0
-    for chave in indice:
-        s = SequenceMatcher(None, na, chave).ratio()
-        if s > melhor_score:
-            melhor_score = s
-            melhor = chave
-    if melhor is not None:
+    # 3) FUZZY (melhor parecença do ranking já calculado)
+    if ranked:
+        melhor_score, melhor = ranked[0]
         if melhor_score >= _LIMIAR_FUZZY_AUTO:
             return _preencher('FUZZY', melhor, melhor_score, True)
         if melhor_score >= _LIMIAR_FUZZY_DUVIDA:
