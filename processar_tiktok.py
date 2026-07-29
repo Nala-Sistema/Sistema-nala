@@ -504,13 +504,14 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
     item_atual = 0
 
     try:
-        # 1. DELETE snapshot do período (reupload limpa e reinsere)
-        if data_ini and data_fim:
-            cursor.execute(
-                "DELETE FROM fact_vendas_snapshot WHERE loja_origem = %s AND data_venda BETWEEN %s AND %s",
-                (loja, data_ini, data_fim)
-            )
-            atualiz = cursor.rowcount
+        # 1. DELETE snapshot do arquivo (reupload limpa e reinsere só os próprios registros)
+        # NÃO usar range de data: pedidos TikTok de meses anteriores aparecem em relatórios
+        # mais recentes (liquidação assíncrona), então overlap por data apaga dados de outros arquivos.
+        cursor.execute(
+            "DELETE FROM fact_vendas_snapshot WHERE loja_origem = %s AND marketplace_origem = %s AND arquivo_origem = %s",
+            (loja, marketplace, arq_nome)
+        )
+        atualiz = cursor.rowcount
 
         # 2. Apagar staging de em_espera para pedidos que chegaram no financeiro
         # numero_pedido em pendentes = 'TKTK_{pedido_id}_{sku_tiktok}', então filtramos por prefixo
