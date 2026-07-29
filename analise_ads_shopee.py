@@ -26,7 +26,7 @@ from processar_ads_shopee import (
     buscar_skus_match, atualizar_matches_sku, calcular_tacos,
     data_fim_efetiva, LOJA_ADS_PARA_ORIGEM,
     vincular_anuncio_titulo, desvincular_anuncio_titulo, buscar_titulo_vinculado,
-    garantir_tabela_link_titulo,
+    garantir_tabela_link_titulo, auto_vincular_confiantes,
 )
 from matching_ads_titulos import sugerir_matches_anuncios, contar_dicionario
 
@@ -1231,9 +1231,9 @@ def _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais):
 def _shopee_match_sku(engine):
     st.subheader("Vincular Produto Ads → SKU")
     st.caption(
-        "Cada anúncio é vinculado a um **título de venda**, e os SKUs são derivados "
-        "**ao vivo** do dicionário — todas as variações que venderam sob aquele título, "
-        "inclusive as que venderem no futuro (entram sozinhas). Sem digitar SKU, sem limite."
+        "O sistema **vincula sozinho** os anúncios que reconhece com segurança "
+        "(traz todos os SKUs que venderam sob aquele título; variações futuras entram "
+        "automaticamente). Você só **confere os poucos duvidosos** 🤔. Não precisa digitar SKU."
     )
 
     loja = st.selectbox("Loja", list(LOJAS_SHOPEE.keys()), key="match_loja")
@@ -1254,6 +1254,21 @@ def _shopee_match_sku(engine):
         st.info("Nenhum anúncio importado para esta loja ainda. Faça upload de um CSV primeiro.")
         return
 
+    # ---- MATCH AUTOMÁTICO: vincula sozinho os de alta confiança ----
+    # Roda 1x por sessão/loja ao abrir; botão permite rodar de novo (ex: após
+    # subir novos anúncios ou novas vendas).
+    _auto_key = f"automatch_{loja_nome}"
+    col_a, col_b = st.columns([3, 1])
+    with col_b:
+        rodar_agora = st.button("🤖 Rodar match automático", key=f"reauto_{loja_nome}")
+    if rodar_agora or not st.session_state.get(_auto_key):
+        with st.spinner("Vinculando automaticamente os de alta confiança..."):
+            n_auto = auto_vincular_confiantes(engine, loja_nome)
+        st.session_state[_auto_key] = True
+        if n_auto:
+            with col_a:
+                st.success(f"🤖 {n_auto} anúncio(s) vinculado(s) automaticamente.")
+
     # 2) Carregar SKUs vigentes e o título vinculado para cada anúncio
     hoje = date.today()
     matches_atuais = {}   # {nome_anuncio: [sku1, sku2, ...]} (derivados ao vivo)
@@ -1271,14 +1286,15 @@ def _shopee_match_sku(engine):
     """)
     total_skus = len(df_skus)
 
-    # 4) Métricas de topo
-    com_match = sum(1 for skus in matches_atuais.values() if skus)
-    sem_match = len(matches_atuais) - com_match
+    # 4) Métricas de topo (vínculos dinâmicos por título)
+    vinculados_din = sum(1 for v in vinculos_atuais.values() if v)
+    pendentes = len(df_anuncios) - vinculados_din
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total de anúncios", len(df_anuncios))
-    c2.metric("Com SKU vinculado", com_match)
-    c3.metric("Sem vínculo", sem_match)
+    c1.metric("Anúncios", len(df_anuncios))
+    c2.metric("✅ Vinculados", vinculados_din)
+    c3.metric("⬜ Pendentes", pendentes)
+    st.caption("Pendentes = duvidosos (🤔 conferir) + produtos que ainda não venderam (⬜ sem match).")
 
     # ---- BLOCO XLSX: download para preenchimento + upload ----
     with st.expander("📎 Trabalhar via planilha (XLSX)", expanded=False):

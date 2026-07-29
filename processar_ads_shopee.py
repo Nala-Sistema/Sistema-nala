@@ -646,6 +646,73 @@ def buscar_titulo_vinculado(engine, loja, nome_anuncio):
                 pass
 
 
+def _set_sku_match(engine, loja, nome_anuncio, sku):
+    """Atualiza fact_ads_shopee.sku_match (1o SKU do vínculo) — usado pelo cálculo de TACOS."""
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        if sku:
+            cursor.execute("""
+                UPDATE fact_ads_shopee SET sku_match = %s, match_confirmado = TRUE
+                WHERE loja = %s AND nome_anuncio = %s
+            """, (sku, loja, nome_anuncio))
+        else:
+            cursor.execute("""
+                UPDATE fact_ads_shopee SET sku_match = NULL, match_confirmado = FALSE
+                WHERE loja = %s AND nome_anuncio = %s
+            """, (loja, nome_anuncio))
+        conn.commit()
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def auto_vincular_confiantes(engine, loja_ads):
+    """
+    Vincula AUTOMATICAMENTE (sem interação) os anúncios cujo melhor match é de
+    alta confiança (EXATO/PREFIXO/FUZZY) e que ainda NÃO têm vínculo.
+    Não mexe em quem já está vinculado, nem nos duvidosos. Retorna nº vinculados.
+    """
+    try:
+        from matching_ads_titulos import sugerir_matches_anuncios
+        res = sugerir_matches_anuncios(engine, loja_ads)
+    except Exception:
+        return 0
+    garantir_tabela_link_titulo(engine)
+    vinculados = 0
+    for r in res:
+        if not r.get('automatico') or not r.get('titulo_normalizado'):
+            continue
+        norm_atual, _ = buscar_titulo_vinculado(engine, loja_ads, r['nome_anuncio'])
+        if norm_atual:
+            continue  # já vinculado → respeita
+        ok = vincular_anuncio_titulo(
+            engine, loja_ads, r['nome_anuncio'], r['titulo_normalizado'],
+            r.get('titulo_venda'), origem='auto'
+        )
+        if ok:
+            skus = buscar_skus_match(engine, loja_ads, r['nome_anuncio'])
+            _set_sku_match(engine, loja_ads, r['nome_anuncio'], skus[0] if skus else None)
+            vinculados += 1
+    return vinculados
+
+
 def buscar_skus_match(engine, loja, nome_produto_ads, data_ref=None):
     """
     Retorna a LISTA de SKUs de um anúncio.
