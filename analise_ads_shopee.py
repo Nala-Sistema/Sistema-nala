@@ -1280,9 +1280,6 @@ def _shopee_match_sku(engine):
     c2.metric("Com SKU vinculado", com_match)
     c3.metric("Sem vínculo", sem_match)
 
-    # ---- BLOCO SUGESTÕES AUTOMÁTICAS (match por título via dicionário) ----
-    _shopee_sugestoes_automaticas(engine, loja_nome, matches_atuais)
-
     # ---- BLOCO XLSX: download para preenchimento + upload ----
     with st.expander("📎 Trabalhar via planilha (XLSX)", expanded=False):
         st.caption(
@@ -1381,17 +1378,35 @@ def _shopee_match_sku(engine):
         norm_to_label[norm] = label
         norm_to_skus[norm] = skus
 
-    # Montar linhas do editor: Anúncio | Título vinculado | SKUs (hoje)
+    # Sugestões do motor p/ PRÉ-PREENCHER a tabela (o sistema já propõe;
+    # você só revisa e salva). Vínculo existente vence a sugestão.
+    sugestoes = {s['nome_anuncio']: s for s in sugerir_matches_anuncios(engine, loja_nome)}
+
     linhas = []
     for _, r in df_anuncios.iterrows():
         nome = r['nome_anuncio']
         norm_atual = vinculos_atuais.get(nome)
-        label_atual = norm_to_label.get(norm_atual, SEM_VINCULO)
-        skus_hoje = ", ".join(matches_atuais.get(nome, []))
+        if norm_atual and norm_atual in norm_to_label:
+            default_norm = norm_atual
+            situacao = "🔗 vinculado"
+        else:
+            s = sugestoes.get(nome)
+            if s and s.get('automatico') and s.get('titulo_normalizado') in norm_to_label:
+                default_norm = s['titulo_normalizado']
+                situacao = f"✅ sugerido ({int(round(s['score'] * 100))}%)"
+            elif s and s.get('tipo') == 'DUVIDA':
+                default_norm = None
+                situacao = f"🤔 conferir — parecido: {(s.get('titulo_venda') or '')[:32]}"
+            else:
+                default_norm = None
+                situacao = "— sem match —"
+        label = norm_to_label.get(default_norm, SEM_VINCULO)
+        skus_preview = norm_to_skus.get(default_norm, "")
         linhas.append({
             'Anúncio': nome,
-            'Título vinculado (da venda)': label_atual,
-            'SKUs (hoje)': skus_hoje,
+            'Situação': situacao,
+            'Título vinculado (da venda)': label,
+            'SKUs (derivados)': skus_preview,
         })
     df_editor = pd.DataFrame(linhas)
 
@@ -1400,23 +1415,25 @@ def _shopee_match_sku(engine):
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
-        disabled=['Anúncio', 'SKUs (hoje)'],
+        disabled=['Anúncio', 'Situação', 'SKUs (derivados)'],
         key="match_editor_titulo",
         column_config={
             'Anúncio': st.column_config.TextColumn(width="large"),
+            'Situação': st.column_config.TextColumn(width="medium"),
             'Título vinculado (da venda)': st.column_config.SelectboxColumn(
                 width="large", options=opcoes,
                 help="Título de venda que corresponde a este anúncio",
             ),
-            'SKUs (hoje)': st.column_config.TextColumn(
-                width="medium", help="Derivado do dicionário; recalcula ao salvar",
+            'SKUs (derivados)': st.column_config.TextColumn(
+                width="medium", help="Trazidos do dicionário; recalcula ao salvar",
             ),
         }
     )
 
     st.caption(
-        f"💡 {len(opcoes) - 1} títulos disponíveis nesta loja. "
-        "A coluna **SKUs (hoje)** recalcula sozinha depois de salvar."
+        f"💡 Os **✅ sugeridos** já vêm preenchidos — é só **salvar** pra confirmar. "
+        f"Confira os **🤔 conferir** (escolha o título certo no seletor). "
+        f"{len(opcoes) - 1} títulos disponíveis nesta loja."
     )
 
     if st.button("💾 Salvar vínculos", key="match_salvar_titulo", type="primary"):
