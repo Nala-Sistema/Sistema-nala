@@ -785,8 +785,16 @@ def _area_logada(engine):
                 st.success("Cache limpo.")
                 st.rerun()
             if st.button("🔄 Recarregar código dos módulos"):
+                # Recarrega explicitamente os módulos utilitários que não passam por
+                # carregar_modulo() (e portanto nunca são recarregados pelo flag normal).
+                for _nome in ['processar_tiktok', 'processar_amazon', 'processar_shein',
+                               'processar_magalu', 'database_utils']:
+                    try:
+                        importlib.reload(importlib.import_module(_nome))
+                    except Exception:
+                        pass
                 st.session_state['_force_reload_modules'] = True
-                st.success("Próximo clique vai recarregar os módulos.")
+                st.success("Módulos recarregados.")
                 st.rerun()
             else:
                 # Reset do flag depois de usado
