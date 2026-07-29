@@ -300,8 +300,8 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
                 'fonte': fonte,
             }
 
-            # Financeiro com SKU mapeado -> snapshot; todo o resto -> pendentes
-            if fonte == 'financeiro' and sku_mapeado:
+            # SKU mapeado -> snapshot (financeiro e em_espera); sem SKU -> pendentes
+            if sku_mapeado:
                 vendas_ok.append(item)
             else:
                 pendentes_lista.append(item)
@@ -480,6 +480,20 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
             %s, %s, %s, %s,
             NOW(), %s, %s
         )
+        ON CONFLICT (numero_pedido, sku, loja_origem) DO UPDATE SET
+            valor_venda_efetivo = EXCLUDED.valor_venda_efetivo,
+            valor_liquido       = EXCLUDED.valor_liquido,
+            comissao            = EXCLUDED.comissao,
+            frete               = EXCLUDED.frete,
+            tarifa_fixa         = EXCLUDED.tarifa_fixa,
+            outros_custos       = EXCLUDED.outros_custos,
+            total_tarifas       = EXCLUDED.total_tarifas,
+            custo_unitario      = EXCLUDED.custo_unitario,
+            custo_total         = EXCLUDED.custo_total,
+            margem_total        = EXCLUDED.margem_total,
+            margem_percentual   = EXCLUDED.margem_percentual,
+            arquivo_origem      = EXCLUDED.arquivo_origem,
+            data_processamento  = NOW()
     """
 
     total_itens = len(df) + len(pendentes_sku) + len(pendentes_emespera) + len(descartes)
