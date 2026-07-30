@@ -736,6 +736,7 @@ MARKETPLACES = [
     ("🛍️ Shopee", "SHOPEE"),
     ("👗 Shein", "SHEIN"),
     ("🏬 Magalu", "MAGALU"),
+    ("🎵 TikTok", "TIKTOK"),
     ("📊 Geral", "GERAL"),
 ]
 

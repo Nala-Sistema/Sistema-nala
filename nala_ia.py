@@ -103,6 +103,7 @@ REGRAS MATEMÁTICAS (NALA STANDARD):
 - Comissões Amazon: 12% + R$6,50 DBA ou R$5,50 FBA (abaixo R$79)
 - Comissões Magalu: 14,8% + R$5 fixo (abaixo R$79)
 - Comissões Shein: 16% + R$5 fixo
+- Comissões TikTok Shop: ~13% + R$4 fixo (sem regra de frete separada)
 - Regra R$78,99: ML, Amazon, Magalu — acima desse valor, taxa fixa vira custo de frete
 
 CAPACIDADES:
