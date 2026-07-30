@@ -26,7 +26,7 @@ from database_utils import get_engine
 # CONSTANTES
 # ============================================================
 
-TABS_ORDER = ["Mercado Livre", "Shopee", "Amazon", "Shein", "Magalu", "B2B"]
+TABS_ORDER = ["Mercado Livre", "Shopee", "Amazon", "Shein", "Magalu", "TikTok", "B2B"]
 ML_LOJA_ORDER = ["ML-Nala", "ML-LPT", "ML-YanniRJ", "ML-YanniSP"]
 PERFIS_COM_CUSTO = ["ADMIN", "CONTROLADORIA", "DIRETOR", "COMPRAS"]
 EDITOR_HEIGHT = 595
@@ -1017,6 +1017,12 @@ def render_tab_magalu(engine, perfil, usuario):
 # TAB B2B
 # ============================================================
 
+def render_tab_tiktok(engine, perfil, usuario):
+    st.subheader("🎵 TikTok Shop"); st.caption("Comissão ~13% | Taxa ~R$4 | Sem frete fixo")
+    render_tab_generica(engine, perfil, usuario, "TikTok", [
+        {"nome": "Normal", "comissao_default": 13.0, "taxa_default": 4.0, "label": "Normal (13%+R$4)", "default_on": True}])
+
+
 def render_tab_b2b(engine, perfil, usuario):
     st.subheader("🏢 B2B — Venda Direta")
     st.caption("Desconto máx: >R$300→4% | R$301-1000→7% | >R$1000→10%")
@@ -1132,6 +1138,7 @@ def tabela_preco_page():
                 elif tn == "Amazon": render_tab_amazon(engine, perfil, usuario)
                 elif tn == "Shein": render_tab_shein(engine, perfil, usuario)
                 elif tn == "Magalu": render_tab_magalu(engine, perfil, usuario)
+                elif tn == "TikTok": render_tab_tiktok(engine, perfil, usuario)
                 elif tn == "B2B": render_tab_b2b(engine, perfil, usuario)
             except Exception as e:
                 st.error(f"Erro ao carregar {tn}: {str(e)}")
