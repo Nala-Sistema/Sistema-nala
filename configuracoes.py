@@ -110,7 +110,7 @@ def main():
 
 def _tab_tiktok(engine):
     st.subheader("🎵 TikTok Shop — Lojas e Taxas")
-    st.caption("Gerencie lojas TikTok e as taxas fixas de plataforma (6%+6% comissão+SFP e R$4/item).")
+    st.caption("Gerencie lojas TikTok e as taxas escalonadas: pedidos < R$50 → 16%+R$4 | pedidos ≥ R$50 → 12%+R$6.")
 
     erros_repro = st.session_state.pop('tiktok_repro_erros', None)
     if erros_repro:
@@ -131,10 +131,10 @@ def _tab_tiktok(engine):
     # ── Configurações de taxa cadastradas ────────────────────────────────────
     st.markdown("### Configuração de taxas (dim_config_marketplace)")
     df_cfg = _query_to_df(engine,
-        """SELECT id, loja, comissao_percentual, taxa_fixa, ativo, data_vigencia
+        """SELECT id, loja, logistica AS faixa, comissao_percentual, taxa_fixa, ativo, data_vigencia
            FROM dim_config_marketplace
            WHERE marketplace = 'TIKTOK'
-           ORDER BY loja""")
+           ORDER BY loja, logistica""")
 
     if df_cfg.empty:
         st.info("Nenhuma configuração de taxa TikTok cadastrada.")
@@ -157,14 +157,22 @@ def _tab_tiktok(engine):
         custo_flex = col3.number_input("Custo Flex (R$)", min_value=0.0, value=0.0, step=0.50,
                                         help="Custo de envio FLEX, se aplicável. Normalmente 0 no TikTok SFP.")
 
-        st.markdown("**Taxas fixas de plataforma** (aplicadas a todos os produtos desta loja)")
-        col4, col5 = st.columns(2)
-        comissao_pct = col4.number_input(
-            "Comissão + SFP (%)", min_value=0.0, max_value=100.0, value=12.0, step=0.5,
-            help="6% comissão de plataforma + 6% taxa de serviço SFP = 12% total.")
-        taxa_item = col5.number_input(
-            "Taxa por item vendido (R$)", min_value=0.0, value=4.0, step=0.5,
-            help="R$ 4,00 fixo por unidade vendida (validado em todos os pedidos).")
+        st.markdown("**Taxas escalonadas por faixa de preço**")
+        col4, col5, col6, col7 = st.columns(4)
+        col4.markdown("**< R\\$50**")
+        col6.markdown("**≥ R\\$50**")
+        comissao_lt50 = col4.number_input(
+            "Comissão % (<R$50)", min_value=0.0, max_value=100.0, value=16.0, step=0.5,
+            help="Comissão TikTok para pedidos abaixo de R$50.")
+        taxa_lt50 = col5.number_input(
+            "Taxa fixa (<R$50) R$", min_value=0.0, value=4.0, step=0.5,
+            help="Taxa por item para pedidos abaixo de R$50.")
+        comissao_gte50 = col6.number_input(
+            "Comissão % (≥R$50)", min_value=0.0, max_value=100.0, value=12.0, step=0.5,
+            help="Comissão TikTok para pedidos de R$50 ou mais.")
+        taxa_gte50 = col7.number_input(
+            "Taxa fixa (≥R$50) R$", min_value=0.0, value=6.0, step=0.5,
+            help="Taxa por item para pedidos de R$50 ou mais.")
 
         salvar = st.form_submit_button("💾 Salvar", type="primary")
 
@@ -194,16 +202,17 @@ def _tab_tiktok(engine):
                         (nome_loja, imposto, custo_flex)
                     )
 
-                # Upsert dim_config_marketplace (uma linha por loja, sem ASIN/SKU específico)
+                # Upsert dim_config_marketplace — duas linhas (uma por faixa de preço)
                 cursor.execute(
                     "DELETE FROM dim_config_marketplace WHERE marketplace = 'TIKTOK' AND loja = %s",
                     (nome_loja,)
                 )
-                cursor.execute("""
-                    INSERT INTO dim_config_marketplace
-                        (marketplace, loja, comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
-                    VALUES ('TIKTOK', %s, %s, %s, 0, TRUE, CURRENT_DATE)
-                """, (nome_loja, comissao_pct, taxa_item))
+                for logistica, com_pct, taxa in [('lt50', comissao_lt50, taxa_lt50), ('gte50', comissao_gte50, taxa_gte50)]:
+                    cursor.execute("""
+                        INSERT INTO dim_config_marketplace
+                            (marketplace, loja, logistica, comissao_percentual, taxa_fixa, frete_estimado, ativo, data_vigencia)
+                        VALUES ('TIKTOK', %s, %s, %s, %s, 0, TRUE, CURRENT_DATE)
+                    """, (nome_loja, logistica, com_pct, taxa))
 
                 conn.commit()
                 cursor.close()

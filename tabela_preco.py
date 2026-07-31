@@ -1018,9 +1018,10 @@ def render_tab_magalu(engine, perfil, usuario):
 # ============================================================
 
 def render_tab_tiktok(engine, perfil, usuario):
-    st.subheader("🎵 TikTok Shop"); st.caption("Comissão ~13% | Taxa ~R$4 | Sem frete fixo")
+    st.subheader("🎵 TikTok Shop"); st.caption("Comissão escalonada | < R$50: 16%+R$4 | ≥ R$50: 12%+R$6")
     render_tab_generica(engine, perfil, usuario, "TikTok", [
-        {"nome": "Normal", "comissao_default": 13.0, "taxa_default": 4.0, "label": "Normal (13%+R$4)", "default_on": True}])
+        {"nome": "lt50", "comissao_default": 16.0, "taxa_default": 4.0, "label": "< R$50 (16%+R$4)", "default_on": True},
+        {"nome": "gte50", "comissao_default": 12.0, "taxa_default": 6.0, "label": "≥ R$50 (12%+R$6)", "default_on": True}])
 
 
 def render_tab_b2b(engine, perfil, usuario):
