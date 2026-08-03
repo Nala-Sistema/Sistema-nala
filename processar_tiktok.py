@@ -148,8 +148,8 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
     fonte: 'financeiro' | 'em_espera'
 
     Retorna:
-      vendas_ok       - linhas com SKU mapeado (-> snapshot se financeiro)
-      pendentes_lista - linhas sem SKU mapeado ou todas do em_espera
+      vendas_ok       - linhas com SKU mapeado (-> snapshot, tanto financeiro quanto em_espera)
+      pendentes_lista - linhas sem SKU mapeado (-> fact_vendas_pendentes)
       datas           - lista de date para extrair período
       skus_sem_custo  - set de SKUs mapeados mas sem custo cadastrado
       skus_nao_map    - set de IDs TikTok sem mapeamento
@@ -361,7 +361,9 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     )
 
     # ── Relatório Em Espera (opcional) ───────────────────────────────────────
-    pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp = [], [], set(), set(), 0
+    # vendas_esp = em_espera com SKU mapeado → vão para snapshot junto com financeiro
+    # pend_esp   = em_espera sem SKU mapeado → vão para fact_vendas_pendentes (staging)
+    vendas_esp, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp = [], [], set(), set(), 0, 0
     nomes_esp = {}
     descartes_esp = []
 
@@ -375,7 +377,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         if df_esp is None:
             return None, "Coluna 'ID do pedido/ajuste' não encontrada no relatório em espera."
 
-        _, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp, nomes_esp, descartes_esp = _processar_df(
+        vendas_esp, pend_esp, datas_esp, sem_custo_esp, nao_map_esp, desc_esp, nomes_esp, descartes_esp = _processar_df(
             df_esp, 'em_espera', loja, imposto_pct, tiktok_sku_map, custos_dict
         )
 
@@ -390,10 +392,12 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     else:
         periodo_ini = periodo_fim = '-'
 
-    df_vendas = pd.DataFrame(vendas_fin) if vendas_fin else pd.DataFrame()
+    # vendas_fin + vendas_esp → snapshot; ON CONFLICT DO UPDATE garante que quando
+    # um pedido em_espera aparecer no financeiro futuro, os dados reais sobrepõem.
+    df_vendas = pd.DataFrame(vendas_fin + vendas_esp) if (vendas_fin or vendas_esp) else pd.DataFrame()
 
     info = {
-        'total_linhas': len(vendas_fin) + len(pend_fin) + len(pend_esp),
+        'total_linhas': len(vendas_fin) + len(vendas_esp) + len(pend_fin) + len(pend_esp),
         'linhas_descartadas': desc_fin + desc_esp,
         'skus_nao_mapeados': len(nao_map_fin | nao_map_esp),
         'skus_sem_custo': len(sem_custo_fin | sem_custo_esp),
@@ -401,7 +405,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         'periodo_fim': periodo_fim,
         'arquivo_nome': arq_financeiro.name,
         'pendentes_sku': pend_fin,       # financeiro sem SKU mapeado
-        'pendentes_emespera': pend_esp,  # todos os registros do em espera
+        'pendentes_emespera': pend_esp,  # em_espera sem SKU mapeado (staging)
         'descartes': descartes_fin + descartes_esp,
         'divergencias': [],
     }
