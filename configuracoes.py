@@ -114,9 +114,11 @@ def _tab_tiktok(engine):
 
     erros_repro = st.session_state.pop('tiktok_repro_erros', None)
     if erros_repro:
-        with st.expander(f"⚠️ Detalhes dos {len(erros_repro)} erro(s) no último reprocessamento", expanded=True):
-            for msg in erros_repro:
-                st.code(msg, language=None)
+        erros_texto = "\n".join(f"• {msg}" for msg in erros_repro)
+        st.error(
+            f"❌ {len(erros_repro)} erro(s) no último reprocessamento — "
+            f"SKU(s) interno(s) não cadastrados em dim_produtos:\n\n{erros_texto}"
+        )
 
     # ── Lojas TikTok cadastradas ──────────────────────────────────────────────
     st.markdown("### Lojas cadastradas")
@@ -334,7 +336,7 @@ def _tab_tiktok(engine):
                 invalidos = df_novos[~df_novos['sku_interno'].isin(skus_validos)]['sku_interno'].tolist()
 
                 if invalidos:
-                    st.warning(f"⚠️ {len(invalidos)} SKU(s) não encontrados em dim_produtos e serão ignorados: {invalidos[:10]}")
+                    st.error(f"❌ {len(invalidos)} SKU(s) não encontrados em dim_produtos e serão ignorados: {invalidos[:10]}")
                     df_novos = df_novos[df_novos['sku_interno'].isin(skus_validos)]
 
                 if df_novos.empty:
