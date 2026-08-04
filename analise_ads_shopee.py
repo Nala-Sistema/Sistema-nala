@@ -26,7 +26,7 @@ from processar_ads_shopee import (
     buscar_skus_match, atualizar_matches_sku, calcular_tacos,
     data_fim_efetiva, LOJA_ADS_PARA_ORIGEM,
     vincular_anuncio_titulo, desvincular_anuncio_titulo, buscar_titulo_vinculado,
-    garantir_tabela_link_titulo, auto_vincular_confiantes,
+    garantir_tabela_link_titulo, auto_vincular_confiantes, garantir_coluna_ads_grupo,
 )
 from matching_ads_titulos import sugerir_matches_anuncios, contar_dicionario
 
@@ -170,7 +170,7 @@ def _gerar_xlsx_matches(engine, loja_nome):
     df_anuncios = _query_df(engine, """
         SELECT DISTINCT nome_anuncio, id_produto
         FROM fact_ads_shopee
-        WHERE loja = %s
+        WHERE loja = %s AND COALESCE(eh_linha_grupo, FALSE) = FALSE
         ORDER BY nome_anuncio
     """, [loja_nome])
 
@@ -402,6 +402,7 @@ def _coletar_dados_para_ia(engine, loja_nome, dt_inicio, dt_fim):
         WHERE loja = %s
           AND periodo_inicio = %s
           AND periodo_fim = %s
+          AND COALESCE(eh_linha_grupo, FALSE) = FALSE
         ORDER BY despesas DESC
     """, [loja_nome, dt_inicio, dt_fim])
 
@@ -544,6 +545,7 @@ def _chamar_gemini(prompt):
 
 def modulo_ads_shopee(engine):
     """Ponto de entrada do módulo Shopee Ads (chamado pelo orquestrador)."""
+    garantir_coluna_ads_grupo(engine)  # garante eh_linha_grupo antes de qualquer query
     subtab_upload, subtab_dashboard, subtab_match, subtab_historico = st.tabs([
         "📤 Upload", "📈 Dashboard TACOS", "🔗 Match SKU", "📋 Histórico"
     ])
@@ -578,15 +580,37 @@ def _shopee_upload(engine):
         type=['csv'], accept_multiple_files=True, key="ads_files"
     )
 
+    TIPO_MAP = {
+        "Geral (Todos os Anúncios)": "geral",
+        "Grupo de Anúncios": "grupo",
+        "Produto Individual": "produto",
+    }
+
     if arquivos and st.button("🔍 ANALISAR", key="ads_analisar", type="primary"):
         nomes_arquivos = []
+        tipo_cod = TIPO_MAP.get(tipo, "geral")
         for arquivo in arquivos:
             st.markdown(f"**📄 Arquivo:** `{arquivo.name}`")
             loja_nome = LOJAS_SHOPEE[loja]
-            df, meta = processar_csv_ads_shopee(arquivo, loja_override=loja_nome)
+            df, meta = processar_csv_ads_shopee(
+                arquivo, loja_override=loja_nome, tipo_override=tipo_cod
+            )
             if df is None:
                 st.error(f"❌ {meta}")
                 continue
+
+            # ALERTA: relatório GERAL que contém grupo(s) de anúncios
+            grupos = meta.get('grupos_detectados') or []
+            if tipo_cod == 'geral' and grupos:
+                st.warning(
+                    f"⚠️ Detectei **{len(grupos)} grupo(s) de anúncios** neste relatório geral "
+                    f"({', '.join(g[:30] for g in grupos[:3])}{'…' if len(grupos) > 3 else ''}). "
+                    "A linha do grupo **não é atrelada a produto** e **não conta despesa** aqui "
+                    "(pra não duplicar). Suba o **relatório de Grupo de Anúncios** de cada um "
+                    "(escolhendo o tipo **'Grupo de Anúncios'**) pra detalhar o gasto por produto."
+                )
+            if tipo_cod == 'grupo':
+                st.info("📦 Processando como **relatório de Grupo de Anúncios** (linha-resumo descartada; produtos do grupo importados).")
 
             # Banner destacado com o período do relatório
             pi = meta.get('periodo_inicio')
@@ -775,7 +799,7 @@ def _shopee_dashboard(engine):
                COUNT(*) AS anuncios,
                ROUND(SUM(despesas)::numeric, 2) AS invest
         FROM fact_ads_shopee
-        WHERE loja = %s
+        WHERE loja = %s AND COALESCE(eh_linha_grupo, FALSE) = FALSE
         GROUP BY periodo_inicio, periodo_fim
         ORDER BY periodo_fim DESC, periodo_inicio DESC
     """, [loja_nome])
@@ -821,6 +845,7 @@ def _shopee_dashboard(engine):
             WHERE loja = %s
               AND periodo_inicio = %s
               AND periodo_fim = %s
+              AND COALESCE(eh_linha_grupo, FALSE) = FALSE
             ORDER BY despesas DESC
         """, [loja_nome, dt_inicio, dt_fim])
 
@@ -1246,7 +1271,7 @@ def _shopee_match_sku(engine):
     df_anuncios = _query_df(engine, """
         SELECT DISTINCT nome_anuncio, id_produto
         FROM fact_ads_shopee
-        WHERE loja = %s
+        WHERE loja = %s AND COALESCE(eh_linha_grupo, FALSE) = FALSE
         ORDER BY nome_anuncio
     """, [loja_nome])
 

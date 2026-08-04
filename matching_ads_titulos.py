@@ -459,7 +459,8 @@ def sugerir_matches_anuncios(engine, loja_ads, lista_anuncios=None):
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT DISTINCT nome_anuncio FROM fact_ads_shopee
-                WHERE loja = %s ORDER BY nome_anuncio
+                WHERE loja = %s AND COALESCE(eh_linha_grupo, FALSE) = FALSE
+                ORDER BY nome_anuncio
             """, (loja_ads,))
             lista_anuncios = [r[0] for r in cursor.fetchall()]
         except Exception:
