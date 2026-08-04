@@ -144,6 +144,37 @@ def _eh_mestra_carrinho(status_str):
     return False, 0
 
 
+def classificar_logistica_ml(forma_entrega):
+    """
+    Deriva o valor da coluna `logistica` a partir de 'Forma de entrega' do ML.
+
+    Vocabulário fechado de três estados, para permitir agrupamento e gráfico:
+
+        FULL   — estoque no CD do ML; é aqui que incidem coleta e armazenagem
+        FLEX   — entrega própria com reembolso do ML
+        ENVIOS — todo o resto (Mercado Envios, Coletas, Correios, Places...)
+
+    O grupo ENVIOS é proposital: a Nala não posta mais nada em Correios, então
+    a distinção entre as modalidades de envio do ML é ruído operacional, não
+    informação de gestão. O que muda decisão é onde o estoque está.
+
+    FULL e FLEX são detectados por substring — mesmo critério já usado em
+    `is_flex` — para sobreviverem a renomeações do rótulo pelo ML.
+
+    Devolve None quando a coluna vem vazia — não inventa categoria.
+    """
+    texto = str(forma_entrega or '').strip()
+    if not texto:
+        return None
+
+    minusculo = texto.lower()
+    if 'full' in minusculo or 'fulfillment' in minusculo:
+        return 'FULL'
+    if 'flex' in minusculo:
+        return 'FLEX'
+    return 'ENVIOS'
+
+
 def renomear_colunas_ml(df):
     """
     Renomeia colunas do ML para nomes padronizados.
@@ -460,7 +491,8 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
             # ---- FRETE - Colunas opcionais ----
             receita_envio = abs(limpar_numero(row.get('receita_envio', 0)))
             tarifa_envio = abs(limpar_numero(row.get('tarifa_envio', 0)))
-            forma_entrega = str(row.get('forma_entrega', '')).lower()
+            forma_entrega_raw = str(row.get('forma_entrega', ''))
+            forma_entrega = forma_entrega_raw.lower()
             total_brl = limpar_numero(row.get('total_brl', 0))
 
             # ---- CAPTURAR CÓDIGO ANÚNCIO ----
@@ -468,6 +500,11 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
 
             # ---- DETECTAR FLEX ----
             is_flex = 'flex' in forma_entrega
+
+            # ---- LOGÍSTICA (Full / Flex / outros) ----
+            # O valor já era lido para detectar Flex e descartado em seguida.
+            # Agora é preservado para permitir atrelar custos de Full por venda.
+            logistica_val = classificar_logistica_ml(forma_entrega_raw)
 
             # ---- v3.2: LER DESCONTOS E BÔNUS ----
             # Para Flex: reembolso ML pelo custo da entrega
@@ -558,6 +595,7 @@ def processar_arquivo_ml(arquivo, loja, imposto, engine):
                 'margem_pct': margem_pct,
                 'tem_custo': custo_unit > 0,
                 'is_flex': is_flex,
+                'logistica': logistica_val,
                 '_custo_unit': custo_unit,
                 '_data_obj': datetime.strptime(data_venda, "%d/%m/%Y") if data_venda else None,
                 '_carrinho_grupo': carrinho_grupo,
@@ -875,11 +913,12 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             codigo_anuncio, quantidade, preco_venda, desconto_parceiro, desconto_marketplace,
             valor_venda_efetivo, custo_unitario, custo_total, imposto, comissao,
             frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
-            margem_total, margem_percentual, data_processamento, arquivo_origem
+            margem_total, margem_percentual, data_processamento, arquivo_origem,
+            logistica
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, NOW(), %s
+            %s, %s, NOW(), %s, %s
         )
     """
 
@@ -947,6 +986,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                     'total_tarifas': total_tarifas,
                     'valor_liquido': valor_liquido,
                     'arquivo_origem': arquivo_nome,
+                    # Preserva a logística para não perder o dado quando a
+                    # pendente for reprocessada para o snapshot.
+                    'logistica': row.get('logistica') or None,
                     # motivo não informado → default 'SKU não cadastrado'
                 }
 
@@ -977,6 +1019,9 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
             # v3.2: outros_custos real (negativo = descontos_bonus)
             outros_custos_val = float(row.get('outros_custos', 0))
 
+            # Logística derivada de 'Forma de entrega' (FULL / FLEX / rótulo bruto)
+            logistica_val = row.get('logistica') or None
+
             # Calcular valores derivados
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_unit = custo_total / qtd if qtd > 0 else custo_total
@@ -994,7 +1039,7 @@ def gravar_vendas_ml(df_vendas, marketplace, loja, arquivo_nome, engine,
                 qtd, preco_venda, 0, 0,
                 receita, custo_unit, custo_total, imposto_val, tarifa,
                 frete, 0, outros_custos_val, total_tarifas, valor_liquido,
-                margem, margem_pct, arquivo_nome
+                margem, margem_pct, arquivo_nome, logistica_val
             ))
 
             # Liberar SAVEPOINT (sucesso)
