@@ -213,13 +213,20 @@ def detectar_header_ads_shopee(arquivo):
         return 7
 
 
-def processar_csv_ads_shopee(arquivo, loja_override=None):
+def _eh_linha_grupo(nome):
+    """True se o nome do anúncio é a linha lumpada de um Grupo de Anúncios."""
+    return str(nome).strip().lower().startswith('grupo de an')
+
+
+def processar_csv_ads_shopee(arquivo, loja_override=None, tipo_override=None):
     """
     Processa um CSV de ads da Shopee.
 
     Parâmetros:
         arquivo: file-like object ou path do CSV
         loja_override: nome da loja (sobrescreve o detectado no CSV)
+        tipo_override: 'geral' | 'grupo' | 'produto' — o tipo escolhido pelo
+                       usuário na tela (VENCE a auto-detecção do CSV).
 
     Retorna:
         (df_processado, metadados) ou (None, mensagem_erro)
@@ -229,6 +236,10 @@ def processar_csv_ads_shopee(arquivo, loja_override=None):
         meta = extrair_metadados_csv(arquivo)
         if 'erro' in meta:
             return None, f"Erro ao ler metadados: {meta['erro']}"
+
+        # O tipo escolhido na tela manda (auto-detecção é só fallback)
+        if tipo_override in ('geral', 'grupo', 'produto'):
+            meta['tipo_relatorio'] = tipo_override
 
         loja = loja_override or meta.get('loja', 'Desconhecida')
 
@@ -307,6 +318,7 @@ def processar_csv_ads_shopee(arquivo, loja_override=None):
 
         # 5. Construir DataFrame padronizado
         registros = []
+        grupos_detectados = []  # nomes das linhas lumpadas de grupo (p/ alerta)
 
         # Para relatórios de grupo: pular linha 0 (resumo do grupo)
         if meta['tipo_relatorio'] == 'grupo':
@@ -319,9 +331,18 @@ def processar_csv_ads_shopee(arquivo, loja_override=None):
             if not nome or nome == 'nan' or nome == '-':
                 continue
 
-            # Ignorar linhas que são o resumo do próprio grupo/produto
-            if 'Grupo de Anúncios' in nome and meta['tipo_relatorio'] == 'grupo':
+            eh_grupo = _eh_linha_grupo(nome)
+
+            # No relatório de GRUPO, a linha-resumo do grupo é descartada
+            # (os produtos do grupo é que interessam).
+            if eh_grupo and meta['tipo_relatorio'] == 'grupo':
                 continue
+
+            # No relatório GERAL, a linha lumpada do grupo é MANTIDA, mas
+            # marcada: não vira produto, não conta despesa (evita dupla
+            # contagem com o relatório de grupo), e dispara o alerta.
+            if eh_grupo:
+                grupos_detectados.append(nome)
 
             despesas = parse_numero_br(row.get(colunas_map.get('despesas', ''), 0))
 
@@ -357,6 +378,7 @@ def processar_csv_ads_shopee(arquivo, loja_override=None):
                 # NOVA
                 'roas_direto': parse_numero_br(row.get(colunas_map.get('roas_direto', ''), 0)),
                 'grupo_anuncio': meta.get('nome_grupo', None),
+                'eh_linha_grupo': eh_grupo,
             }
 
             # Para relatórios de grupo, preencher tipo e método do grupo
@@ -374,14 +396,46 @@ def processar_csv_ads_shopee(arquivo, loja_override=None):
 
         # Info para exibição
         meta['total_registros'] = len(df_resultado)
-        meta['total_despesas'] = df_resultado['despesas'].sum()
+        # Despesa total NÃO conta a linha lumpada de grupo (evita dupla contagem)
+        meta['total_despesas'] = float(
+            df_resultado.loc[~df_resultado['eh_linha_grupo'], 'despesas'].sum()
+        )
         meta['total_gmv'] = df_resultado['gmv'].sum()
         meta['loja'] = loja
+        meta['grupos_detectados'] = grupos_detectados
 
         return df_resultado, meta
 
     except Exception as e:
         return None, f"Erro ao processar: {str(e)}"
+
+
+def garantir_coluna_ads_grupo(engine):
+    """Garante a coluna eh_linha_grupo em fact_ads_shopee. Idempotente."""
+    conn = None
+    cursor = None
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("ALTER TABLE fact_ads_shopee ADD COLUMN IF NOT EXISTS eh_linha_grupo BOOLEAN DEFAULT FALSE")
+        conn.commit()
+    except Exception:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def gravar_ads_shopee(df_ads, arquivo_nome, engine):
@@ -396,6 +450,7 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
     erros = []
     duplicatas = 0
 
+    garantir_coluna_ads_grupo(engine)
     conn = engine.raw_connection()
     cursor = conn.cursor()
 
@@ -414,7 +469,7 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
                         itens_vendidos, itens_vendidos_diretos,
                         gmv, receita_direta, despesas,
                         acos, acos_direto, roas_direto,
-                        grupo_anuncio, arquivo_origem
+                        grupo_anuncio, arquivo_origem, eh_linha_grupo
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s,
@@ -423,7 +478,7 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s
+                        %s, %s, %s
                     )
                     ON CONFLICT (loja, periodo_inicio, periodo_fim, nome_anuncio, id_produto)
                     DO UPDATE SET
@@ -449,6 +504,7 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
                         roas_direto = EXCLUDED.roas_direto,
                         grupo_anuncio = EXCLUDED.grupo_anuncio,
                         arquivo_origem = EXCLUDED.arquivo_origem,
+                        eh_linha_grupo = EXCLUDED.eh_linha_grupo,
                         data_upload = CURRENT_TIMESTAMP
                 """, (
                     row['loja'], row['periodo_inicio'], row['periodo_fim'],
@@ -461,7 +517,8 @@ def gravar_ads_shopee(df_ads, arquivo_nome, engine):
                     row['itens_vendidos'], row['itens_vendidos_diretos'],
                     row['gmv'], row['receita_direta'], row['despesas'],
                     row['acos'], row['acos_direto'], row.get('roas_direto', 0),
-                    row.get('grupo_anuncio', None), arquivo_nome
+                    row.get('grupo_anuncio', None), arquivo_nome,
+                    bool(row.get('eh_linha_grupo', False))
                 ))
 
                 cursor.execute("RELEASE SAVEPOINT sp_ads")
