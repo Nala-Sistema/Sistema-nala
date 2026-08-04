@@ -197,6 +197,47 @@ def detectar_header_shopee(arquivo) -> int:
 # PADRONIZAÇÃO DE COLUNAS
 # ============================================================
 
+_VALORES_SIM_FBS = ('sim', 'yes', 'y', 's', 'true', '1', 'fbs')
+
+
+def classificar_logistica_shopee(row) -> str | None:
+    """
+    Deriva o valor da coluna `logistica` para a Shopee.
+
+    Mesmo vocabulário fechado usado no ML, para permitir gráfico consistente
+    entre marketplaces:
+
+        FULL   — FBS (Fulfillment by Shopee): estoque no CD da Shopee, onde
+                 incidem armazenagem e coleta
+        ENVIOS — todo o resto (Shopee Xpress, Retirada, Postagem...)
+
+    Não há FLEX na Shopee hoje. As modalidades de envio são agrupadas em
+    ENVIOS porque o que muda decisão é onde o estoque está, não como o pedido
+    sai.
+
+    A flag de Full não aparece em todos os exports — na inspeção do
+    `Order.all` de 27/07 a 02/08/2026 (Litstore Yanni) havia apenas
+    'Opção de envio' e 'Método de envio', sem nenhuma coluna de FBS. Por isso
+    a detecção é defensiva e olha os dois lugares.
+
+    Devolve None quando não há informação nenhuma — não inventa categoria.
+    """
+    valor_fbs = str(row.get('Pedido FBS', '') or '').strip().lower()
+    if valor_fbs and valor_fbs not in ('nan', 'none'):
+        return 'FULL' if valor_fbs in _VALORES_SIM_FBS else 'ENVIOS'
+
+    metodo = str(row.get('Método de envio', '') or '').strip()
+    if metodo and metodo.lower() not in ('nan', 'none'):
+        # Rede de segurança: se a Shopee passar a sinalizar Full pelo método
+        # de envio em vez de uma coluna própria, ainda assim é capturado.
+        minusculo = metodo.lower()
+        if 'full' in minusculo or 'fbs' in minusculo:
+            return 'FULL'
+        return 'ENVIOS'
+
+    return None
+
+
 def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
     """
     Padroniza nomes de colunas do arquivo Shopee (v2.2).
@@ -226,7 +267,13 @@ def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
         # Mapeamento: Cashback — só 'Coin Cashback' (Shopee adicionou 'Compensar Moedas' separado)
         elif 'coin cashback' in col_norm:
             rename_map[col] = 'Seller Absorbed Coin Cashback'
-            
+
+        # Mapeamento: flag de FBS (Fulfillment by Shopee) — o nome varia entre
+        # exports e a coluna nem sempre está presente. Normaliza para que
+        # classificar_logistica_shopee() tenha um nome único para procurar.
+        elif col_norm == 'fbs' or ('fbs' in col_norm and 'pedido' in col_norm):
+            rename_map[col] = 'Pedido FBS'
+
     return df.rename(columns=rename_map)
 
 
@@ -439,6 +486,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
                 'sku':               sku,
                 'codigo_anuncio':    codigo_anuncio,
                 'titulo':            titulo_produto,  # NOVO: p/ dicionário de Ads
+                'logistica':         classificar_logistica_shopee(row),
                 'qtd':               quantidade,
                 'preco_unit':        preco_unitario,
                 'receita':           subtotal,
@@ -596,13 +644,14 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             margem_total,
             margem_percentual,
             data_processamento,
-            arquivo_origem
+            arquivo_origem,
+            logistica
         ) VALUES (
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s,
-            %s, %s, %s, NOW(), %s
+            %s, %s, %s, NOW(), %s, %s
         )
     """
 
@@ -660,6 +709,9 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 'total_tarifas': total_tarifas,
                 'valor_liquido': valor_liquido,
                 'arquivo_origem': arquivo_nome,
+                # Preserva a logística para não perder o dado quando a
+                # pendente for reprocessada para o snapshot.
+                'logistica': row.get('logistica') or None,
             }
 
             if gravar_venda_pendente(cursor, dados_pendente):
@@ -715,6 +767,7 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 margem_total,
                 margem_pct,
                 arquivo_nome,
+                row.get('logistica') or None,
             ))
             cursor.execute(f"RELEASE SAVEPOINT sp_shopee_{idx}")
             registros += 1
