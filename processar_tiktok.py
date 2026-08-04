@@ -268,7 +268,7 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
                 skus_nao_map.add(sku_tiktok)
 
             custo_total = round(custo_un * qtd, 2)
-            margem = round(valor_liquido - custo_total, 2)
+            margem = round(valor_liquido - custo_total - imposto_val, 2)
             margem_pct = round((margem / vendas_liq * 100) if vendas_liq > 0 else 0, 2)
 
             # numero_pedido sintético: único por (pedido, variante TikTok)
@@ -369,7 +369,11 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
 
     if arq_emespera is not None:
         try:
-            df_esp_raw = pd.read_excel(arq_emespera, sheet_name=0, header=None)
+            nome_esp = getattr(arq_emespera, 'name', '').lower()
+            if nome_esp.endswith('.csv'):
+                df_esp_raw = pd.read_csv(arq_emespera, sep=';', header=None, encoding='latin1', dtype=str)
+            else:
+                df_esp_raw = pd.read_excel(arq_emespera, sheet_name=0, header=None)
         except Exception as e:
             return None, f"Erro ao ler relatório em espera: {e}"
 
@@ -769,7 +773,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
             custo_total = round(custo_un * int(qtd or 1), 2)
             receita_f = float(receita or 0)
             imposto_f = float(imposto or 0)
-            margem = round(float(valor_liquido or 0) - custo_total, 2)
+            margem = round(float(valor_liquido or 0) - custo_total - imposto_f, 2)
             margem_pct = round((margem / receita_f * 100) if receita_f > 0 else 0, 2)
 
             pedido_original = numero_pedido.replace('TKTK_', '').rsplit('_', 1)[0] if numero_pedido.startswith('TKTK_') else numero_pedido

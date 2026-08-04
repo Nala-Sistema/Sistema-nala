@@ -634,7 +634,7 @@ def tab_processar_upload(engine):
         st.markdown("**📂 TikTok Shop — relatório financeiro + em espera (opcional):**")
         col_up1, col_up2 = st.columns(2)
         arq_tktk_fin = col_up1.file_uploader("💰 Relatório Financeiro / Liquidado (XLSX)", type=['xlsx'], key=f"tktk_fin_{uc}")
-        arq_tktk_esp = col_up2.file_uploader("⏳ Relatório Em Espera (XLSX) — opcional", type=['xlsx'], key=f"tktk_esp_{uc}")
+        arq_tktk_esp = col_up2.file_uploader("⏳ Relatório Em Espera (XLSX ou CSV Onhold) — opcional", type=['xlsx', 'csv'], key=f"tktk_esp_{uc}")
         arquivo = arq_tktk_fin
         arquivo_pedidos = None; arquivo_pacotes = None
         arquivos_ok = arq_tktk_fin is not None
