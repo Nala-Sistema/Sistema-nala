@@ -827,7 +827,16 @@ def _shopee_dashboard(engine):
     )
     _, dt_inicio, dt_fim = opcoes_periodos[sel]
 
-    if not st.button("📊 CALCULAR", key="dash_calc", type="primary"):
+    # Persistir o "calculado" em session_state: assim a tela NÃO some quando a
+    # página recarrega por outro motivo (ex: clicar em "Gerar Insights com IA").
+    if st.button("📊 CALCULAR", key="dash_calc", type="primary"):
+        st.session_state['dash_calc_ativo'] = {
+            'loja_nome': loja_nome, 'dt_inicio': dt_inicio, 'dt_fim': dt_fim,
+        }
+
+    _calc = st.session_state.get('dash_calc_ativo')
+    if not (_calc and _calc.get('loja_nome') == loja_nome
+            and _calc.get('dt_inicio') == dt_inicio and _calc.get('dt_fim') == dt_fim):
         return
 
     with st.spinner("Calculando TACOS..."):
