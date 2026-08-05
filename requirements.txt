@@ -1,4 +1,7 @@
-streamlit
+streamlit==1.54.0
+# starlette 1.4.0 mudou a assinatura de GZipResponder.__init__ e quebra o
+# MediaAwareGZipMiddleware do streamlit (TypeError no boot do app).
+starlette<1.4
 pandas
 sqlalchemy
 psycopg2-binary
