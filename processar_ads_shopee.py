@@ -155,6 +155,10 @@ def extrair_metadados_csv(arquivo):
                 match = re.search(r'(Grupo de Anúncios[^-]*)', linha)
                 if match:
                     meta['nome_grupo'] = match.group(1).strip()
+            # "Relatório de Anúncios para Novos Produtos" também é um relatório de
+            # grupo (traz a linha-resumo do grupo + os produtos dentro dele).
+            elif 'Novos Produtos' in linha or 'New Product' in linha:
+                meta['tipo_relatorio'] = 'grupo'
             elif 'Relatório de Anúncios de Produto' in linha or 'Product Ad' in linha:
                 meta['tipo_relatorio'] = 'produto'
 
@@ -320,8 +324,14 @@ def processar_csv_ads_shopee(arquivo, loja_override=None, tipo_override=None):
         registros = []
         grupos_detectados = []  # nomes das linhas lumpadas de grupo (p/ alerta)
 
-        # Para relatórios de grupo: pular linha 0 (resumo do grupo)
+        # Para relatórios de grupo: a 1ª linha dos dados é o RESUMO do grupo
+        # (ex: "Grupo de Anúncios 16/07/2026 - 1"). Dela tiramos o NOME do grupo
+        # para ETIQUETAR os produtos (grupo_anuncio) e depois a descartamos.
         if meta['tipo_relatorio'] == 'grupo':
+            if len(df) > 0 and colunas_map.get('nome'):
+                nome0 = str(df.iloc[0].get(colunas_map['nome'], '')).strip()
+                if _eh_linha_grupo(nome0):
+                    meta['nome_grupo'] = nome0
             df_dados = df.iloc[1:] if len(df) > 1 else df
         else:
             df_dados = df
