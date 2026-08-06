@@ -246,12 +246,14 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
             comissao_val = round(comissao_plat + sfp, 2)
             # tarifa_fixa = R$4/unit (taxa por item)
             tarifa_fixa_val = round(taxa_item, 2)
-            # outros_custos = variáveis (afiliados, ads, GMV Max)
-            outros_custos_val = round(afiliados + ads_criadores + ads_agencias + gmv_max, 2)
+            # comissao_afiliados = só o repasse ao afiliado/criador que vendeu
+            comissao_afiliados_val = round(afiliados, 2)
+            # outros_custos = ads da loja (criadores/agências) + GMV Max, sem afiliados
+            outros_custos_val = round(ads_criadores + ads_agencias + gmv_max, 2)
             # frete: negativo no relatório = custo pro vendedor
             frete_val = round(-custo_frete_rep, 2)
 
-            total_tarifas = round(comissao_val + tarifa_fixa_val + outros_custos_val + frete_val, 2)
+            total_tarifas = round(comissao_val + tarifa_fixa_val + outros_custos_val + comissao_afiliados_val + frete_val, 2)
             valor_liquido = round(valor_total_rep, 2)
             imposto_val = round(vendas_liq * (imposto_pct / 100), 2)
 
@@ -287,6 +289,7 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
                 'desconto_marketplace': 0.0,
                 'comissao': comissao_val,
                 'tarifa_fixa': tarifa_fixa_val,
+                'comissao_afiliados': comissao_afiliados_val,
                 'outros_custos': outros_custos_val,
                 'frete': frete_val,
                 'total_tarifas': total_tarifas,
@@ -478,13 +481,13 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
             data_venda, sku, codigo_anuncio, quantidade,
             preco_venda, desconto_parceiro, desconto_marketplace,
             valor_venda_efetivo, custo_unitario, custo_total,
-            imposto, comissao, frete, tarifa_fixa, outros_custos,
+            imposto, comissao, frete, tarifa_fixa, comissao_afiliados, outros_custos,
             total_tarifas, valor_liquido, margem_total, margem_percentual,
             data_processamento, arquivo_origem, logistica
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             NOW(), %s, %s
         )
@@ -494,6 +497,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
             comissao            = EXCLUDED.comissao,
             frete               = EXCLUDED.frete,
             tarifa_fixa         = EXCLUDED.tarifa_fixa,
+            comissao_afiliados  = EXCLUDED.comissao_afiliados,
             outros_custos       = EXCLUDED.outros_custos,
             total_tarifas       = EXCLUDED.total_tarifas,
             custo_unitario      = EXCLUDED.custo_unitario,
@@ -549,7 +553,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
                     float(row['preco_venda']), float(row['desconto_parceiro']), 0.0,
                     float(row['receita']), float(row['custo']), float(row['custo_total']),
                     float(row['imposto']), float(row['comissao']), float(row['frete']),
-                    float(row['tarifa_fixa']), float(row['outros_custos']),
+                    float(row['tarifa_fixa']), float(row['comissao_afiliados']), float(row['outros_custos']),
                     float(row['total_tarifas']), float(row['valor_liquido']),
                     float(row['margem']), float(row['margem_pct']),
                     arq_nome, _LOGISTICA
@@ -587,6 +591,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
                     'comissao': float(p.get('comissao', 0)),
                     'frete': float(p.get('frete', 0)),
                     'tarifa_fixa': float(p.get('tarifa_fixa', 0)),
+                    'comissao_afiliados': float(p.get('comissao_afiliados', 0)),
                     'outros_custos': float(p.get('outros_custos', 0)),
                     'total_tarifas': float(p.get('total_tarifas', 0)),
                     'valor_liquido': float(p.get('valor_liquido', 0)),
@@ -633,6 +638,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
                     'comissao': float(p.get('comissao', 0)),
                     'frete': float(p.get('frete', 0)),
                     'tarifa_fixa': float(p.get('tarifa_fixa', 0)),
+                    'comissao_afiliados': float(p.get('comissao_afiliados', 0)),
                     'outros_custos': float(p.get('outros_custos', 0)),
                     'total_tarifas': float(p.get('total_tarifas', 0)),
                     'valor_liquido': float(p.get('valor_liquido', 0)),
@@ -724,7 +730,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
             SELECT id, marketplace_origem, loja_origem, numero_pedido,
                    data_venda, sku AS sku_tiktok_id, codigo_anuncio,
                    quantidade, preco_venda, valor_venda_efetivo,
-                   imposto, comissao, frete, tarifa_fixa, outros_custos,
+                   imposto, comissao, frete, tarifa_fixa, comissao_afiliados, outros_custos,
                    total_tarifas, valor_liquido, arquivo_origem
             FROM fact_vendas_pendentes
             WHERE marketplace_origem = 'TIKTOK'
@@ -740,13 +746,13 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                 data_venda, sku, codigo_anuncio, quantidade,
                 preco_venda, desconto_parceiro, desconto_marketplace,
                 valor_venda_efetivo, custo_unitario, custo_total,
-                imposto, comissao, frete, tarifa_fixa, outros_custos,
+                imposto, comissao, frete, tarifa_fixa, comissao_afiliados, outros_custos,
                 total_tarifas, valor_liquido, margem_total, margem_percentual,
                 data_processamento, arquivo_origem, logistica
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s,
                 NOW(), %s, %s
             )
@@ -756,7 +762,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
         for row in pendentes:
             (pid, marketplace, loja, numero_pedido, data_venda, sku_tiktok_id,
              codigo_anuncio, qtd, preco_venda, receita,
-             imposto, comissao, frete, tarifa_fixa, outros_custos,
+             imposto, comissao, frete, tarifa_fixa, comissao_afiliados, outros_custos,
              total_tarifas, valor_liquido, arquivo_origem) = row
 
             sku_nala = sku_map.get(sku_tiktok_id)
@@ -787,7 +793,7 @@ def reprocessar_pendentes_tiktok_mapeados(engine, sku_map):
                     float(preco_venda or 0), 0.0, 0.0,
                     receita_f, custo_un, custo_total,
                     imposto_f, float(comissao or 0), float(frete or 0),
-                    float(tarifa_fixa or 0), float(outros_custos or 0),
+                    float(tarifa_fixa or 0), float(comissao_afiliados or 0), float(outros_custos or 0),
                     float(total_tarifas or 0), float(valor_liquido or 0),
                     margem, margem_pct,
                     arquivo_origem or '', _LOGISTICA,

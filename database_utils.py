@@ -467,11 +467,11 @@ def gravar_venda_pendente(cursor, dados):
 
     sql = """
         INSERT INTO fact_vendas_pendentes (
-            marketplace_origem, loja_origem, numero_pedido, data_venda, sku, 
+            marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
             codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo,
-            imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas,
+            imposto, comissao, frete, tarifa_fixa, comissao_afiliados, outros_custos, total_tarifas,
             valor_liquido, arquivo_origem, data_processamento, status, motivo, logistica
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 'Pendente', %s, %s)
         ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING
     """
     try:
@@ -480,8 +480,8 @@ def gravar_venda_pendente(cursor, dados):
             dados['data_venda'], dados['sku'], dados.get('codigo_anuncio', ''),
             dados.get('quantidade', 1), dados.get('preco_venda', 0), dados.get('valor_venda_efetivo', 0),
             dados.get('imposto', 0), dados.get('comissao', 0), dados.get('frete', 0),
-            dados.get('tarifa_fixa', 0), dados.get('outros_custos', 0), dados.get('total_tarifas', 0),
-            dados.get('valor_liquido', 0), dados.get('arquivo_origem', ''),
+            dados.get('tarifa_fixa', 0), dados.get('comissao_afiliados', 0), dados.get('outros_custos', 0),
+            dados.get('total_tarifas', 0), dados.get('valor_liquido', 0), dados.get('arquivo_origem', ''),
             motivo, logistica
         ))
         return True
