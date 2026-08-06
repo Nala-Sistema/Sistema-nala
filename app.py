@@ -907,6 +907,7 @@ def main():
     _garantir_tabela_estoque(engine)
     _garantir_coluna_visivel_painel(engine)
     _garantir_tabela_tiktok_skus(engine)
+    _garantir_colunas_custos_extras(engine)
 
     if not st.session_state.logado:
         total = _contar_usuarios(engine)
@@ -965,6 +966,42 @@ def _garantir_tabela_estoque(engine):
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS ix_dim_estoque_data
             ON dim_estoque(data_atualizacao)
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _garantir_colunas_custos_extras(engine):
+    """
+    Acrescenta sku, codigo_anuncio e arquivo_origem a fact_custos_extras.
+
+    A tabela foi criada para custo agregado com rateio, mas os relatorios de
+    Full e de Ads trazem o custo ja identificado por anuncio. Sem essas
+    colunas o sistema teria que jogar essa precisao fora e ratear.
+
+    Quem tem anuncio preenche; quem nao tem (rateio por receita, por exemplo)
+    deixa nulo. arquivo_origem permite reprocessar/excluir um upload inteiro,
+    no mesmo padrao das demais tabelas de fato.
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            ALTER TABLE fact_custos_extras
+                ADD COLUMN IF NOT EXISTS sku VARCHAR(120),
+                ADD COLUMN IF NOT EXISTS codigo_anuncio VARCHAR(60),
+                ADD COLUMN IF NOT EXISTS arquivo_origem VARCHAR(255)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS ix_custos_extras_anuncio
+            ON fact_custos_extras(codigo_anuncio)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS ix_custos_extras_periodo
+            ON fact_custos_extras(tipo, loja, periodo_inicio)
         """)
         conn.commit()
         cursor.close()

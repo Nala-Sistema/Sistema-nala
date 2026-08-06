@@ -267,6 +267,75 @@ def ler_custos_armazenamento(caminho):
 # IDENTIFICAÇÃO DA LOJA
 # ============================================================
 
+def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
+                         forma_rateio='direto_por_anuncio'):
+    """
+    Grava as linhas normalizadas em fact_custos_extras.
+
+    IDEMPOTENTE POR DESENHO: apaga o que já existe daquele
+    (marketplace, loja, arquivo_origem) antes de inserir. Subir o mesmo
+    arquivo duas vezes produz o mesmo resultado, e corrigir um arquivo é
+    só subir de novo.
+
+    Isso é deliberadamente diferente da proteção de duplicata das vendas,
+    que bloqueia a reimportação — lá, corrigir um campo exigiu excluir o
+    lançamento antes, e um re-upload silenciosamente não fazia nada.
+
+    Devolve dict com {inseridos, removidos, total, mensagem}.
+    """
+    if df is None or df.empty:
+        return {'inseridos': 0, 'removidos': 0, 'total': 0.0,
+                'mensagem': 'Nada a gravar — o arquivo não produziu linhas de custo.'}
+
+    conn = engine.raw_connection()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """DELETE FROM fact_custos_extras
+               WHERE marketplace = %s AND loja = %s AND arquivo_origem = %s""",
+            (marketplace, loja, arquivo_nome),
+        )
+        removidos = cursor.rowcount
+
+        sql = """
+            INSERT INTO fact_custos_extras
+                (tipo, marketplace, loja, sku, codigo_anuncio, valor,
+                 periodo_inicio, periodo_fim, rateado, forma_rateio,
+                 referencia, data_lancamento, arquivo_origem, observacoes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, CURRENT_DATE, %s, %s)
+        """
+        inseridos = 0
+        for _, r in df.iterrows():
+            valor = float(r['valor'])
+            if valor == 0:
+                continue
+            ini = r['periodo_inicio']
+            fim = r['periodo_fim']
+            cursor.execute(sql, (
+                r['tipo'], marketplace, loja,
+                (r['sku'] or None), (r['codigo_anuncio'] or None), valor,
+                (ini.date() if hasattr(ini, 'date') else ini),
+                (fim.date() if hasattr(fim, 'date') else fim),
+                forma_rateio,
+                (r['produto'] or None),
+                arquivo_nome,
+                (r['observacao'] or None),
+            ))
+            inseridos += 1
+
+        conn.commit()
+        cursor.close()
+    finally:
+        conn.close()
+
+    total = float(df['valor'].sum())
+    msg = f'{inseridos} lançamento(s) gravado(s), somando R$ {total:,.2f}.'
+    if removidos:
+        msg += f' {removidos} linha(s) do upload anterior deste arquivo foram substituídas.'
+    return {'inseridos': inseridos, 'removidos': removidos, 'total': total, 'mensagem': msg}
+
+
 def identificar_loja(engine, codigos_anuncio, marketplace='MERCADO LIVRE'):
     """
     Descobre a que loja o relatório pertence cruzando os anúncios com as vendas.
