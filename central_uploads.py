@@ -1358,7 +1358,8 @@ def _secao_pend_sku(engine):
                         'frete':r['frete'],'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem','')} for _,r in sels.iterrows()]
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem',''),
+                        'logistica':r.get('logistica')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:
                         st.success(f"✅ {res['mensagem']}")
@@ -1415,7 +1416,8 @@ def _secao_pend_div(engine):
                         'quantidade':r['quantidade'],'marketplace_origem':r['marketplace_origem'],
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
-                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem','')} for _,r in sels.iterrows()]
+                        'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem',''),
+                        'logistica':r.get('logistica')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:
                         st.success(f"✅ {res['mensagem']}")
