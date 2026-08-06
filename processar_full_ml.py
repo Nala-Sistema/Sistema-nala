@@ -267,6 +267,37 @@ def ler_custos_armazenamento(caminho):
 # IDENTIFICAÇÃO DA LOJA
 # ============================================================
 
+def detectar_e_ler(arquivo):
+    """
+    Descobre qual dos dois relatórios de Full é o arquivo e o lê.
+
+    Os dois têm assinatura clara nos nomes das abas, então não faz sentido
+    pedir para quem sobe escolher o tipo — é um clique a mais e uma chance
+    a mais de errar.
+
+    Devolve (df_normalizado, avisos, rotulo). Se não reconhecer, devolve
+    df vazio e o aviso explicando o que foi encontrado.
+    """
+    try:
+        abas = [str(s).lower() for s in pd.ExcelFile(arquivo).sheet_names]
+    except Exception as e:
+        return pd.DataFrame(columns=COLUNAS_NORM), [f'Não consegui abrir o arquivo: {e}'], None
+
+    if any('coleta' in a for a in abas):
+        df, avisos = ler_relatorio_tarifas_full(arquivo)
+        return df, avisos, 'Tarifas Full (coleta + armazenamento antigo)'
+
+    if any('detalhe' in a for a in abas):
+        df, avisos = ler_custos_armazenamento(arquivo)
+        return df, avisos, 'Custos por serviço de armazenamento'
+
+    return pd.DataFrame(columns=COLUNAS_NORM), [
+        'Arquivo não reconhecido. Esperava um relatório de custos de '
+        'armazenamento (com aba "Detalhe") ou de tarifas do Full (com aba '
+        f'"Custo por serviço de coleta"). Abas encontradas: {", ".join(abas)}.'
+    ], None
+
+
 def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
                          forma_rateio='direto_por_anuncio'):
     """

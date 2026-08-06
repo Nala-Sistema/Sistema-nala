@@ -802,15 +802,144 @@ def _historico_uploads_estoque(engine):
 # ENTRYPOINT
 # ============================================================
 
+def _tab_despesas_full(engine):
+    st.subheader("💸 Despesas de Full")
+    st.caption(
+        "Suba aqui os relatórios de custo do Full: **custos de armazenagem** e "
+        "**custos de coleta**. O sistema reconhece sozinho qual é qual. "
+        "Diferente das vendas, subir o mesmo arquivo de novo substitui o "
+        "anterior — pode corrigir e resubir à vontade."
+    )
+
+    from processar_full_ml import detectar_e_ler, gravar_custos_extras, identificar_loja
+
+    # ---- Loja: quem sobe escolhe, igual ao fluxo de vendas ----
+    try:
+        lojas = pd.read_sql(
+            "SELECT loja FROM dim_lojas WHERE marketplace = 'MERCADO LIVRE' "
+            "AND COALESCE(visivel_no_painel, TRUE) ORDER BY loja", engine
+        )['loja'].tolist()
+    except Exception:
+        lojas = []
+
+    if not lojas:
+        st.error("Não consegui carregar as lojas de Mercado Livre.")
+        return
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        loja = st.selectbox("Loja", lojas, key="full_loja")
+    with col2:
+        arquivo = st.file_uploader(
+            "Relatório de custo de Full (.xlsx)", type=["xlsx"], key="full_upl"
+        )
+
+    if not arquivo:
+        _historico_despesas_full(engine)
+        return
+
+    df, avisos, rotulo = detectar_e_ler(arquivo)
+
+    if rotulo is None:
+        for a in avisos:
+            st.error(a)
+        return
+
+    st.success(f"Reconhecido: **{rotulo}**")
+    for a in avisos:
+        st.warning(a)
+
+    if df.empty:
+        st.warning("O arquivo foi lido mas não produziu nenhuma linha de custo.")
+        return
+
+    # ---- Conferência: os anúncios batem com a loja escolhida? ----
+    try:
+        loja_detectada, conf, detalhe = identificar_loja(
+            engine, df['codigo_anuncio'].tolist()
+        )
+        if loja_detectada and loja_detectada != loja:
+            st.error(
+                f"⚠️ Os anúncios deste arquivo aparecem nas vendas da **{loja_detectada}** "
+                f"({conf}% deles), mas você selecionou **{loja}**. "
+                f"Confira antes de gravar. — {detalhe}"
+            )
+        elif loja_detectada:
+            st.caption(f"✅ Anúncios conferem com {loja} ({conf}%).")
+        else:
+            st.caption(f"ℹ️ Não foi possível conferir a loja pelos anúncios: {detalhe}")
+    except Exception:
+        st.caption("ℹ️ Conferência de loja indisponível.")
+
+    # ---- Preview ----
+    resumo = (df.groupby('tipo')
+                .agg(lancamentos=('valor', 'size'),
+                     anuncios=('codigo_anuncio', 'nunique'),
+                     total=('valor', 'sum'))
+                .reset_index())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total do arquivo", formatar_valor(float(df['valor'].sum())))
+    c2.metric("Lançamentos", _fmt_int(len(df)))
+    c3.metric("Anúncios", _fmt_int(df['codigo_anuncio'].nunique()))
+
+    ini, fim = df['periodo_inicio'].min(), df['periodo_fim'].max()
+    if pd.notna(ini) and pd.notna(fim):
+        st.caption(f"Período detectado: **{ini:%d/%m/%Y} a {fim:%d/%m/%Y}**")
+
+    resumo['total'] = resumo['total'].apply(lambda v: formatar_valor(float(v)))
+    st.dataframe(resumo, use_container_width=True, hide_index=True)
+
+    with st.expander("Ver os 20 maiores lançamentos"):
+        top = df.nlargest(20, 'valor')[
+            ['tipo', 'sku', 'codigo_anuncio', 'produto', 'valor']
+        ].copy()
+        top['valor'] = top['valor'].apply(lambda v: formatar_valor(float(v)))
+        st.dataframe(top, use_container_width=True, hide_index=True)
+
+    if st.button("💾 Gravar despesas", type="primary", key="full_gravar"):
+        with st.spinner("Gravando..."):
+            res = gravar_custos_extras(
+                engine, df, 'MERCADO LIVRE', loja, arquivo.name
+            )
+        st.success(f"✅ {res['mensagem']}")
+        st.rerun()
+
+    _historico_despesas_full(engine)
+
+
+def _historico_despesas_full(engine):
+    st.markdown("### 🗂️ Despesas de Full já lançadas")
+    try:
+        df = pd.read_sql("""
+            SELECT loja, tipo,
+                   MIN(periodo_inicio) AS periodo_de, MAX(periodo_fim) AS periodo_ate,
+                   COUNT(*) AS lancamentos, SUM(valor) AS total,
+                   MAX(data_lancamento) AS lancado_em, arquivo_origem
+            FROM fact_custos_extras
+            WHERE tipo LIKE 'FULL%%'
+            GROUP BY loja, tipo, arquivo_origem
+            ORDER BY MAX(data_lancamento) DESC, loja
+            LIMIT 40
+        """, engine)
+        if df.empty:
+            st.caption("Nenhuma despesa de Full lançada ainda.")
+            return
+        df['total'] = df['total'].apply(lambda v: formatar_valor(float(v)))
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception:
+        st.caption("Histórico indisponível.")
+
+
 def main():
     st.header("📈 Análise de Produtos")
     engine = get_engine()
 
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "🏆 Mais Vendidos",
         "📈 Crescimento & Queda",
         "📦 Cobertura de Estoque",
         "⬆️ Atualizar Estoque (Upseller)",
+        "💸 Despesas de Full",
     ])
     with t1:
         _tab_mais_vendidos(engine)
@@ -820,6 +949,8 @@ def main():
         _tab_cobertura(engine)
     with t4:
         _tab_upload_estoque(engine)
+    with t5:
+        _tab_despesas_full(engine)
 
 
 if __name__ == "__main__":
