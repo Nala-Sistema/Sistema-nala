@@ -216,7 +216,16 @@ def renomear_colunas_ml(df):
         elif col_lower == 'total (brl)':
             rename_map[col] = 'total_brl'
         elif 'forma' in col_lower and 'entrega' in col_lower:
-            rename_map[col] = 'forma_entrega'
+            # O relatorio traz DUAS colunas "Forma de entrega": a do envio
+            # (grupo Envios) e a da devolucao (grupo Devolucoes). Renomear as
+            # duas para o mesmo nome fazia row.get('forma_entrega') devolver
+            # uma Series em vez de um texto — is_flex e a logistica acertavam
+            # so porque o str() da Series contem o valor. So a primeira (envio)
+            # interessa; a segunda ganha nome proprio.
+            if 'forma_entrega' in rename_map.values():
+                rename_map[col] = 'forma_entrega_devolucao'
+            else:
+                rename_map[col] = 'forma_entrega'
 
         # CORREÇÃO 09/03: Mapear código do anúncio (com e sem acento)
         elif '#' in col_norm and 'anuncio' in col_norm:
