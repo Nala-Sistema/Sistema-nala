@@ -318,6 +318,19 @@ def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
         return {'inseridos': 0, 'removidos': 0, 'total': 0.0,
                 'mensagem': 'Nada a gravar — o arquivo não produziu linhas de custo.'}
 
+    # Limites reais das colunas VARCHAR de fact_custos_extras. Cortar aqui, na
+    # camada que conhece o schema, em vez de confiar que quem monta o DataFrame
+    # lembrou do tamanho — o título do anúncio do ML passa de 100 caracteres
+    # com facilidade e derrubava o INSERT com StringDataRightTruncation.
+    LIM = {'tipo': 50, 'sku': 120, 'codigo_anuncio': 60, 'referencia': 100,
+           'forma_rateio': 100, 'arquivo_origem': 255}
+
+    def _cortar(valor, campo):
+        if valor is None:
+            return None
+        s = str(valor).strip()
+        return s[:LIM[campo]] if s else None
+
     conn = engine.raw_connection()
     try:
         cursor = conn.cursor()
@@ -344,14 +357,16 @@ def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
             ini = r['periodo_inicio']
             fim = r['periodo_fim']
             cursor.execute(sql, (
-                r['tipo'], marketplace, loja,
-                (r['sku'] or None), (r['codigo_anuncio'] or None), valor,
+                _cortar(r['tipo'], 'tipo'), marketplace, loja,
+                _cortar(r['sku'], 'sku'),
+                _cortar(r['codigo_anuncio'], 'codigo_anuncio'),
+                valor,
                 (ini.date() if hasattr(ini, 'date') else ini),
                 (fim.date() if hasattr(fim, 'date') else fim),
-                forma_rateio,
-                (r['produto'] or None),
-                arquivo_nome,
-                (r['observacao'] or None),
+                _cortar(forma_rateio, 'forma_rateio'),
+                _cortar(r['produto'], 'referencia'),
+                _cortar(arquivo_nome, 'arquivo_origem'),
+                (r['observacao'] or None),   # observacoes é TEXT, não corta
             ))
             inseridos += 1
 
