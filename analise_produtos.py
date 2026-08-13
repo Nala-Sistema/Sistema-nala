@@ -897,7 +897,7 @@ def _render_despesas_full(engine):
                      total=('valor', 'sum'))
                 .reset_index())
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total do arquivo", formatar_valor(float(df['valor'].sum())))
+    c1.metric("Total do arquivo", _fmt_brl(float(df['valor'].sum())))
     c2.metric("Lançamentos", _fmt_int(len(df)))
     c3.metric("Anúncios", _fmt_int(df['codigo_anuncio'].nunique()))
 
@@ -905,14 +905,14 @@ def _render_despesas_full(engine):
     if pd.notna(ini) and pd.notna(fim):
         st.caption(f"Período detectado: **{ini:%d/%m/%Y} a {fim:%d/%m/%Y}**")
 
-    resumo['total'] = resumo['total'].apply(lambda v: formatar_valor(float(v)))
+    resumo['total'] = resumo['total'].apply(lambda v: _fmt_brl(float(v)))
     st.dataframe(resumo, use_container_width=True, hide_index=True)
 
     with st.expander("Ver os 20 maiores lançamentos"):
         top = df.nlargest(20, 'valor')[
             ['tipo', 'sku', 'codigo_anuncio', 'produto', 'valor']
         ].copy()
-        top['valor'] = top['valor'].apply(lambda v: formatar_valor(float(v)))
+        top['valor'] = top['valor'].apply(lambda v: _fmt_brl(float(v)))
         st.dataframe(top, use_container_width=True, hide_index=True)
 
     if st.button("💾 Gravar despesas", type="primary", key="full_gravar"):
@@ -943,7 +943,7 @@ def _historico_despesas_full(engine):
         if df.empty:
             st.caption("Nenhuma despesa de Full lançada ainda.")
             return
-        df['total'] = df['total'].apply(lambda v: formatar_valor(float(v)))
+        df['total'] = df['total'].apply(lambda v: _fmt_brl(float(v)))
         st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception:
         st.caption("Histórico indisponível.")
