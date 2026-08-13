@@ -803,6 +803,25 @@ def _historico_uploads_estoque(engine):
 # ============================================================
 
 def _tab_despesas_full(engine):
+    """
+    Tab de upload dos relatorios de custo de Full.
+
+    Todo o corpo roda dentro de try/except de proposito: esta tab entra numa
+    tela que os gestores usam no dia a dia, e uma excecao aqui derrubaria a
+    pagina inteira, inclusive as tabs de estoque e cobertura que ja funcionam.
+    Falha nesta tab tem que ficar contida nesta tab.
+    """
+    try:
+        _render_despesas_full(engine)
+    except Exception as e:
+        st.error(
+            "Esta aba encontrou um erro e foi isolada — as demais abas continuam "
+            "funcionando normalmente."
+        )
+        st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
+
+
+def _render_despesas_full(engine):
     st.subheader("💸 Despesas de Full")
     st.caption(
         "Suba aqui os relatórios de custo do Full: **custos de armazenagem** e "
