@@ -87,6 +87,27 @@ def extrair_mlbs(valor):
     return ['MLB' + n for n in re.findall(r'(\d{9,})', s.replace('MLB', ''))]
 
 
+def dividir_em_centavos(valor, n):
+    """
+    Divide um valor entre n anúncios devolvendo centavos que somam exato.
+
+    Necessário porque a coluna `valor` é numeric(10,2): dividir e arredondar
+    cada parte independentemente faz a soma divergir do valor original. Pior,
+    Python arredonda meio-para-par e o Postgres meio-para-cima, então a
+    divergência nem é reproduzível fora do banco.
+
+    Aqui cada parte recebe o piso em centavos e o resto é distribuído de um
+    em um, então a soma das partes é sempre igual ao valor arredondado.
+    """
+    if n <= 1:
+        return [round(valor, 2)]
+    centavos = int(round(valor * 100))
+    base, resto = divmod(abs(centavos), n)
+    sinal = -1 if centavos < 0 else 1
+    partes = [base + (1 if i < resto else 0) for i in range(n)]
+    return [sinal * p / 100.0 for p in partes]
+
+
 def _achar_col(df, *termos):
     """Primeira coluna cujo nome contém todos os termos (case-insensitive)."""
     for c in df.columns:
@@ -156,13 +177,14 @@ def ler_relatorio_tarifas_full(caminho):
             data = datas.iloc[i] if datas is not None and pd.notna(datas.iloc[i]) else None
             # Linha com 2 anúncios: divide o valor igualmente entre eles.
             # É o único critério disponível dentro do próprio arquivo.
-            for mlb in mlbs:
+            partes = dividir_em_centavos(valor, len(mlbs))
+            for mlb, parte in zip(mlbs, partes):
                 linhas.append({
                     'tipo': tipo,
                     'sku': _texto(row[col_sku]) if col_sku else '',
                     'codigo_anuncio': mlb,
-                    'produto': _texto(row[col_prod])[:120] if col_prod else '',
-                    'valor': round(valor / len(mlbs), 4),
+                    'produto': _texto(row[col_prod])[:100] if col_prod else '',
+                    'valor': parte,
                     'unidades': _num(row[col_un]) if col_un else 0.0,
                     'periodo_inicio': data,
                     'periodo_fim': data,
@@ -229,13 +251,14 @@ def ler_custos_armazenamento(caminho):
         if not mlbs:
             mlbs = ['']
 
-        for mlb in mlbs:
+        partes = dividir_em_centavos(valor, len(mlbs))
+        for mlb, parte in zip(mlbs, partes):
             linhas.append({
                 'tipo': TIPO_ARMAZENAGEM,
                 'sku': sku,
                 'codigo_anuncio': mlb,
-                'produto': _texto(row[col_prod])[:120] if col_prod else '',
-                'valor': round(valor / len(mlbs), 4),
+                'produto': _texto(row[col_prod])[:100] if col_prod else '',
+                'valor': parte,
                 'unidades': 0.0,
                 'periodo_inicio': ini,
                 'periodo_fim': fim,
