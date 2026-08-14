@@ -14,7 +14,7 @@ O ML entrega DOIS relatórios diferentes, que se complementam:
   B) <dd-mm-aa>_<dd-mm-aa>_Custos_por_serviço_armazenamento.xlsx
      Abas Resumo e Detalhe (header do Detalhe na linha 4).
      O Detalhe traz o custo dia a dia POR ANÚNCIO — é daqui que sai a
-     armazenagem atribuída, sem rateio.
+     armazenagem atribuída, sem rateio, agregada por mês calendário.
 
 Regra de qual usar para quê:
   - armazenagem          -> arquivo B, aba Detalhe   (direta por anúncio)
@@ -22,7 +22,14 @@ Regra de qual usar para quê:
   - armazenamento longo  -> arquivo A, aba prolongado(direta por SKU/MLB)
 
 A aba "Tarifa de armazenamento" do arquivo A serve apenas como total de
-conferência — usá-la para atribuir obrigaria a ratear, o que é pior.
+conferência — usá-la para atribuir obrigaria a ratear, o que é pior. Ela
+diverge do arquivo B em ~2,5% no mesmo período, por causa ainda não
+identificada; como é 0,04% da receita, não bloqueia o uso, mas vale
+monitorar se a diferença crescer.
+
+O relatório acumulado (ex: 14/02 a 19/08) pode ser subido sempre: a
+deduplicação é por mês para armazenagem e pelo "Nº do custo" do ML para as
+cobranças de evento, então nunca duplica.
 
 Nenhum dos arquivos identifica a loja. `identificar_loja()` resolve isso
 cruzando os MLBs com fact_vendas_snapshot.
@@ -38,7 +45,7 @@ TIPO_PROLONGADO = 'FULL_ARMAZENAGEM_PROLONGADA'
 
 # Colunas do resultado normalizado, iguais para os três tipos de custo.
 COLUNAS_NORM = [
-    'tipo', 'sku', 'codigo_anuncio', 'produto',
+    'tipo', 'sku', 'codigo_anuncio', 'produto', 'referencia',
     'valor', 'unidades', 'periodo_inicio', 'periodo_fim', 'observacao',
 ]
 
@@ -143,6 +150,14 @@ def ler_relatorio_tarifas_full(caminho):
         col_sku = next((c for c in df.columns if c.strip().upper() == 'SKU'), None)
         col_prod = _achar_col(df, 'título') or _achar_col(df, 'titulo') or _achar_col(df, 'produto')
         col_un = _achar_col(df, 'unidades')
+        # Nº do custo/tarifa: identificador unico que o proprio ML da a cada
+        # cobranca. E a chave de deduplicacao das cobrancas de evento.
+        col_ref = next(
+            (c for c in df.columns
+             if c.strip().lower().startswith('n') and ('custo' in c.lower() or 'tarifa' in c.lower())
+             and 'estorn' not in c.lower() and 'valor' not in c.lower()),
+            None,
+        )
 
         # A coluna do anúncio não tem cabeçalho estável — acha pela presença de MLB
         col_mlb = next(
@@ -184,6 +199,7 @@ def ler_relatorio_tarifas_full(caminho):
                     'sku': _texto(row[col_sku]) if col_sku else '',
                     'codigo_anuncio': mlb,
                     'produto': _texto(row[col_prod])[:100] if col_prod else '',
+                    'referencia': _texto(row[col_ref]) if col_ref else '',
                     'valor': parte,
                     'unidades': _num(row[col_un]) if col_un else 0.0,
                     'periodo_inicio': data,
@@ -199,16 +215,30 @@ def ler_relatorio_tarifas_full(caminho):
 # ARQUIVO B — Custos por serviço de armazenamento
 # ============================================================
 
-def ler_custos_armazenamento(caminho):
+def ler_custos_armazenamento_mensal(caminho):
     """
-    Lê o detalhe de armazenagem, que traz o custo por anúncio.
+    Le o detalhe de armazenagem gerando UMA LINHA POR ANUNCIO POR MES.
 
-    A aba Detalhe alterna linhas: uma com o produto e os custos diários,
-    a seguinte com as unidades armazenadas de cada dia. Só a primeira
-    interessa para valor — a de unidades é identificada por não ter SKU.
+    A aba Detalhe traz uma coluna por dia do ciclo. Agregar por mes calendario
+    resolve tres coisas de uma vez:
 
-    Usa a coluna "Custos acumulados até <data>", que já é o total do ciclo
-    por anúncio, em vez de somar as colunas diárias.
+      1. Sobreposicao. O ML sempre oferece o relatorio acumulado desde o
+         inicio, entao todo download novo cobre periodos ja lancados. Com o
+         mes como chave, subir de novo regrava os mesmos meses.
+
+      2. Mes calendario. Os ciclos do ML vao do dia 20 ao 19 e variam por
+         loja, entao "custo de julho" nao sai de um ciclo. Somando as colunas
+         de dia por mes, a apuracao mensal e exata.
+
+      3. Precisao. Guardar dia a dia obrigaria a arredondar valores de
+         R$ 0,007 para centavos — o que distorce o custo dos itens pequenos,
+         justamente os que precisamos medir. Somando o mes com precisao cheia
+         e arredondando uma vez, o desvio contra o Resumo cai de R$ 0,25 para
+         R$ 0,06 no arquivo real, e o volume cai 95% (6.432 -> 292 linhas).
+
+    Processar o arquivo inteiro sempre, em vez de so os meses que faltam, e
+    proposital: o relatorio e acumulado porque o ML recalcula, e uma correcao
+    retroativa precisa entrar. Ler o arquivo completo leva ~0,5s.
 
     Devolve (df_normalizado, avisos).
     """
@@ -217,78 +247,73 @@ def ler_custos_armazenamento(caminho):
     df.columns = [str(c).strip() for c in df.columns]
 
     col_sku = next((c for c in df.columns if c.strip().upper() == 'SKU'), None)
-    col_anun = _achar_col(df, 'anúncio') or _achar_col(df, 'anuncio')
+    col_anun = _achar_col(df, 'anuncio') or _achar_col(df, 'anúncio')
     col_prod = _achar_col(df, 'produto')
-    col_acum = _achar_col(df, 'acumulados')
     col_tam = _achar_col(df, 'tamanho')
+    cols_dia = [c for c in df.columns if re.match(r'^\d{2}/\d{2}/\d{4}$', str(c).strip())]
 
-    if not (col_sku and col_anun and col_acum):
+    if not (col_sku and col_anun and cols_dia):
         return pd.DataFrame(columns=COLUNAS_NORM), [
-            'Arquivo de armazenamento sem as colunas esperadas (SKU / anúncio / acumulados).'
+            'Arquivo sem as colunas esperadas (SKU / anuncio / colunas de dia).'
         ]
 
-    # Período vem do título da aba, não de uma coluna
-    ini = fim = None
-    cab = pd.read_excel(caminho, sheet_name='Detalhe', header=None, nrows=1)
-    m = re.search(r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})', str(cab.iloc[0].tolist()))
-    if m:
-        ini = pd.to_datetime(m.group(1), dayfirst=True)
-        fim = pd.to_datetime(m.group(2), dayfirst=True)
-    else:
-        avisos.append('Não consegui ler o período no cabeçalho — informe manualmente.')
+    # A aba alterna linha de produto com linha de unidades; a de unidades nao
+    # tem SKU, entao filtrar por SKU preenchido ja descarta.
+    prod = df[df[col_sku].notna() & (df[col_sku].astype(str).str.strip() != '')]
 
     linhas = []
-    for _, row in df.iterrows():
+    for _, row in prod.iterrows():
         sku = _texto(row[col_sku])
-        mlbs = extrair_mlbs(row[col_anun])
-        valor = _num(row[col_acum])
-        if not sku or valor == 0:
-            continue  # linha de unidades, ou anúncio sem custo no ciclo
+        mlbs = extrair_mlbs(row[col_anun]) or ['']
+        produto = _texto(row[col_prod])[:100] if col_prod else ''
+        tamanho = _texto(row[col_tam]) if col_tam else ''
 
-        # Estoque no Full de produto sem anúncio ativo: mantém a linha com o
-        # SKU e anúncio vazio, em vez de descartar — senão o total não fecha
-        # com o Resumo. Nos arquivos reais isso é ~0,1% do valor.
-        if not mlbs:
-            mlbs = ['']
+        # Soma as colunas de dia por mes calendario, com precisao cheia
+        por_mes = {}
+        for c in cols_dia:
+            valor = _num(row[c])
+            if valor <= 0:
+                continue
+            dia = pd.to_datetime(c, dayfirst=True)
+            por_mes[(dia.year, dia.month)] = por_mes.get((dia.year, dia.month), 0.0) + valor
 
-        partes = dividir_em_centavos(valor, len(mlbs))
-        for mlb, parte in zip(mlbs, partes):
-            linhas.append({
-                'tipo': TIPO_ARMAZENAGEM,
-                'sku': sku,
-                'codigo_anuncio': mlb,
-                'produto': _texto(row[col_prod])[:100] if col_prod else '',
-                'valor': parte,
-                'unidades': 0.0,
-                'periodo_inicio': ini,
-                'periodo_fim': fim,
-                'observacao': (
-                    (f'{len(mlbs)} anúncios na linha; ' if len(mlbs) > 1 else '')
-                    + (f'tamanho {_texto(row[col_tam])}' if col_tam else '')
-                ).strip('; '),
-            })
+        for (ano, mes), total_mes in sorted(por_mes.items()):
+            ini = pd.Timestamp(year=ano, month=mes, day=1)
+            fim = ini + pd.offsets.MonthEnd(0)
+            for mlb, parte in zip(mlbs, dividir_em_centavos(total_mes, len(mlbs))):
+                if parte == 0:
+                    continue
+                linhas.append({
+                    'tipo': TIPO_ARMAZENAGEM,
+                    'sku': sku,
+                    'codigo_anuncio': mlb,
+                    'produto': produto,
+                    'referencia': '',
+                    'valor': parte,
+                    'unidades': 0.0,
+                    'periodo_inicio': ini,
+                    'periodo_fim': fim,
+                    'observacao': (f'tamanho {tamanho}' if tamanho else ''),
+                })
 
     df_out = pd.DataFrame(linhas, columns=COLUNAS_NORM)
 
-    # Conferência contra a aba Resumo — se divergir, o parser errou algo
     try:
         res = pd.read_excel(caminho, sheet_name='Resumo', header=None)
         total_resumo = pd.to_numeric(res[5], errors='coerce').dropna().max()
         total_lido = df_out['valor'].sum()
-        if total_resumo and abs(total_lido - total_resumo) > 0.05:
+        # Tolerancia relativa: o arredondamento por mes gera centavos de desvio
+        # em arquivos grandes, e um limite fixo viraria alarme falso.
+        if total_resumo and abs(total_lido - total_resumo) > max(0.50, total_resumo * 0.001):
             avisos.append(
-                f'DIVERGÊNCIA: Detalhe soma R$ {total_lido:,.2f} '
+                f'DIVERGENCIA: o detalhe soma R$ {total_lido:,.2f} '
                 f'mas o Resumo diz R$ {total_resumo:,.2f}.'
             )
     except Exception:
-        avisos.append('Não foi possível conferir contra a aba Resumo.')
+        avisos.append('Nao foi possivel conferir contra a aba Resumo.')
 
     return df_out, avisos
 
-
-# ============================================================
-# IDENTIFICAÇÃO DA LOJA
-# ============================================================
 
 def detectar_e_ler(arquivo):
     """
@@ -311,8 +336,8 @@ def detectar_e_ler(arquivo):
         return df, avisos, 'Tarifas Full (coleta + armazenamento antigo)'
 
     if any('detalhe' in a for a in abas):
-        df, avisos = ler_custos_armazenamento(arquivo)
-        return df, avisos, 'Custos por serviço de armazenamento'
+        df, avisos = ler_custos_armazenamento_mensal(arquivo)
+        return df, avisos, 'Custos por serviço de armazenamento (mensal)'
 
     return pd.DataFrame(columns=COLUNAS_NORM), [
         'Arquivo não reconhecido. Esperava um relatório de custos de '
@@ -324,27 +349,37 @@ def detectar_e_ler(arquivo):
 def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
                          forma_rateio='direto_por_anuncio'):
     """
-    Grava as linhas normalizadas em fact_custos_extras.
+    Grava as linhas normalizadas em fact_custos_extras, em lote.
 
-    IDEMPOTENTE POR DESENHO: apaga o que já existe daquele
-    (marketplace, loja, arquivo_origem) antes de inserir. Subir o mesmo
-    arquivo duas vezes produz o mesmo resultado, e corrigir um arquivo é
-    só subir de novo.
+    DEDUPLICACAO POR NATUREZA DO CUSTO, nao por nome de arquivo:
 
-    Isso é deliberadamente diferente da proteção de duplicata das vendas,
-    que bloqueia a reimportação — lá, corrigir um campo exigiu excluir o
-    lançamento antes, e um re-upload silenciosamente não fazia nada.
+      - Armazenagem e custo DIARIO. A chave e (loja, tipo, dia). Antes de
+        inserir, apaga o intervalo de dias que o arquivo cobre. Subir o
+        relatorio acumulado por cima de um recorte antigo regrava os mesmos
+        dias em vez de somar.
+
+      - Coleta e armazenamento prolongado sao cobrancas de EVENTO, e o ML da
+        um numero unico a cada uma ("N do custo"). A chave e esse numero.
+        Verificado nos arquivos reais: 40/40 e 74/74 numeros distintos.
+
+    Chavear por nome de arquivo — como era antes — nao resolvia: o ML oferece
+    sempre o acumulado desde o inicio, entao cada download tem nome novo e
+    cobre periodo ja lancado.
+
+    A gravacao e em lote (execute_values). Sao ~6.400 linhas por loja no
+    relatorio completo; uma a uma levaria dezenas de segundos contra o Neon.
 
     Devolve dict com {inseridos, removidos, total, mensagem}.
     """
     if df is None or df.empty:
         return {'inseridos': 0, 'removidos': 0, 'total': 0.0,
-                'mensagem': 'Nada a gravar — o arquivo não produziu linhas de custo.'}
+                'mensagem': 'Nada a gravar — o arquivo nao produziu linhas de custo.'}
+
+    from psycopg2.extras import execute_values
 
     # Limites reais das colunas VARCHAR de fact_custos_extras. Cortar aqui, na
-    # camada que conhece o schema, em vez de confiar que quem monta o DataFrame
-    # lembrou do tamanho — o título do anúncio do ML passa de 100 caracteres
-    # com facilidade e derrubava o INSERT com StringDataRightTruncation.
+    # camada que conhece o schema, em vez de confiar que quem monta o
+    # DataFrame lembrou do tamanho.
     LIM = {'tipo': 50, 'sku': 120, 'codigo_anuncio': 60, 'referencia': 100,
            'forma_rateio': 100, 'arquivo_origem': 255}
 
@@ -354,54 +389,79 @@ def gravar_custos_extras(engine, df, marketplace, loja, arquivo_nome,
         s = str(valor).strip()
         return s[:LIM[campo]] if s else None
 
+    def _data(v):
+        return v.date() if hasattr(v, 'date') else v
+
+    registros = []
+    for _, r in df.iterrows():
+        valor = float(r['valor'])
+        if valor == 0:
+            continue
+        registros.append((
+            _cortar(r['tipo'], 'tipo'), marketplace, loja,
+            _cortar(r.get('sku'), 'sku'),
+            _cortar(r.get('codigo_anuncio'), 'codigo_anuncio'),
+            valor,
+            _data(r['periodo_inicio']), _data(r['periodo_fim']),
+            _cortar(forma_rateio, 'forma_rateio'),
+            _cortar(r.get('referencia'), 'referencia'),
+            _cortar(arquivo_nome, 'arquivo_origem'),
+            # observacoes e TEXT: cabe o titulo do produto junto da nota
+            ' | '.join(x for x in [_texto(r.get('produto')), _texto(r.get('observacao'))] if x) or None,
+        ))
+
+    if not registros:
+        return {'inseridos': 0, 'removidos': 0, 'total': 0.0,
+                'mensagem': 'Nada a gravar — todas as linhas tinham valor zero.'}
+
     conn = engine.raw_connection()
     try:
         cursor = conn.cursor()
+        removidos = 0
 
-        cursor.execute(
-            """DELETE FROM fact_custos_extras
-               WHERE marketplace = %s AND loja = %s AND arquivo_origem = %s""",
-            (marketplace, loja, arquivo_nome),
-        )
-        removidos = cursor.rowcount
+        # --- Armazenagem: limpa o intervalo de dias coberto pelo arquivo ---
+        arm = df[df['tipo'] == TIPO_ARMAZENAGEM]
+        if not arm.empty:
+            ini = _data(arm['periodo_inicio'].min())
+            fim = _data(arm['periodo_fim'].max())
+            cursor.execute(
+                """DELETE FROM fact_custos_extras
+                   WHERE marketplace = %s AND loja = %s AND tipo = %s
+                     AND periodo_inicio BETWEEN %s AND %s""",
+                (marketplace, loja, TIPO_ARMAZENAGEM, ini, fim),
+            )
+            removidos += cursor.rowcount
 
-        sql = """
+        # --- Eventos: limpa pelos numeros de cobranca que vieram no arquivo ---
+        eventos = df[df['tipo'] != TIPO_ARMAZENAGEM]
+        refs = sorted({str(x).strip() for x in eventos.get('referencia', []) if str(x).strip()})
+        if refs:
+            cursor.execute(
+                """DELETE FROM fact_custos_extras
+                   WHERE marketplace = %s AND loja = %s AND referencia = ANY(%s)""",
+                (marketplace, loja, refs),
+            )
+            removidos += cursor.rowcount
+
+        execute_values(cursor, """
             INSERT INTO fact_custos_extras
                 (tipo, marketplace, loja, sku, codigo_anuncio, valor,
                  periodo_inicio, periodo_fim, rateado, forma_rateio,
                  referencia, data_lancamento, arquivo_origem, observacoes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, CURRENT_DATE, %s, %s)
-        """
-        inseridos = 0
-        for _, r in df.iterrows():
-            valor = float(r['valor'])
-            if valor == 0:
-                continue
-            ini = r['periodo_inicio']
-            fim = r['periodo_fim']
-            cursor.execute(sql, (
-                _cortar(r['tipo'], 'tipo'), marketplace, loja,
-                _cortar(r['sku'], 'sku'),
-                _cortar(r['codigo_anuncio'], 'codigo_anuncio'),
-                valor,
-                (ini.date() if hasattr(ini, 'date') else ini),
-                (fim.date() if hasattr(fim, 'date') else fim),
-                _cortar(forma_rateio, 'forma_rateio'),
-                _cortar(r['produto'], 'referencia'),
-                _cortar(arquivo_nome, 'arquivo_origem'),
-                (r['observacao'] or None),   # observacoes é TEXT, não corta
-            ))
-            inseridos += 1
+            VALUES %s
+        """, registros, template="(%s,%s,%s,%s,%s,%s,%s,%s,FALSE,%s,%s,CURRENT_DATE,%s,%s)",
+             page_size=500)
 
+        inseridos = len(registros)
         conn.commit()
         cursor.close()
     finally:
         conn.close()
 
     total = float(df['valor'].sum())
-    msg = f'{inseridos} lançamento(s) gravado(s), somando R$ {total:,.2f}.'
+    msg = f'{inseridos} lancamento(s) gravado(s), somando R$ {total:,.2f}.'
     if removidos:
-        msg += f' {removidos} linha(s) do upload anterior deste arquivo foram substituídas.'
+        msg += f' {removidos} lancamento(s) do mesmo periodo/cobranca foram substituidos.'
     return {'inseridos': inseridos, 'removidos': removidos, 'total': total, 'mensagem': msg}
 
 
