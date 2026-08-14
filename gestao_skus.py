@@ -38,14 +38,400 @@ def formatar_valor_br(valor):
 
 
 def converter_valor_para_float(valor_str):
-    """Converte string brasileira para float (ex: '1.234,56' -> 1234.56)"""
+    """
+    Converte string brasileira para float (ex: '1.234,56' -> 1234.56).
+
+    Usado nos formulários manuais (Tab 2), onde campo vazio = zero é o esperado.
+    v2.2 FIX: NaN não passa mais direto para o banco — vira 0.0.
+    """
+    valor = converter_valor_planilha(valor_str)
+    return 0.0 if valor is None else valor
+
+
+def converter_valor_planilha(valor_str):
+    """
+    Converte valor de planilha para float, ou None quando não há valor.
+
+    v2.2: usado na importação em massa. A diferença para
+    converter_valor_para_float é crítica: célula vazia devolve None
+    ("não informado", mantém o que está no banco) em vez de 0.0
+    ("custo é zero", apaga o cadastro).
+
+    Trata os dois formatos decimais:
+      '1.234,56' -> 1234.56   (BR)
+      '1,234.56' -> 1234.56   (US)
+      '134.71'   -> 134.71    (US simples — antes virava 13471.0)
+      '134,71'   -> 134.71    (BR simples)
+    """
+    if valor_str is None:
+        return None
+
+    # NaN do pandas passa no isinstance(float) — precisa ser barrado antes
+    if isinstance(valor_str, float) and valor_str != valor_str:
+        return None
+
+    if isinstance(valor_str, (int, float)):
+        return float(valor_str)
+
+    texto = str(valor_str).strip()
+    if texto == "" or texto.lower() in ("nan", "none", "-", "r$"):
+        return None
+
+    texto = texto.replace("R$", "").replace(" ", "").replace("\xa0", "")
+
+    tem_ponto = "." in texto
+    tem_virgula = "," in texto
+
+    if tem_ponto and tem_virgula:
+        # O separador decimal é o que aparece por último
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")   # BR: 1.234,56
+        else:
+            texto = texto.replace(",", "")                     # US: 1,234.56
+    elif tem_virgula:
+        texto = texto.replace(",", ".")                        # BR: 134,71
+    elif tem_ponto:
+        # Só ponto: milhar (1.234) ou decimal (134.71)?
+        # Milhar sempre tem exatamente 3 dígitos depois do último ponto.
+        depois = texto.rsplit(".", 1)[-1]
+        if len(depois) == 3 and texto.count(".") >= 1 and len(texto.replace(".", "")) > 3:
+            texto = texto.replace(".", "")                     # 1.234 -> 1234
+        # senão mantém como decimal: 134.71 -> 134.71
+
     try:
-        if isinstance(valor_str, (int, float)):
-            return float(valor_str)
-        valor_limpo = str(valor_str).replace(".", "").replace(",", ".")
-        return float(valor_limpo)
-    except:
-        return 0.0
+        return float(texto)
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# IMPORTAÇÃO EM MASSA — BLINDAGEM (v2.2)
+# ============================================================
+# Contexto: em 13/08/2026 uma importação sobrescreveu o custo de 948
+# dos 951 SKUs ativos com valores errados, sem aviso nenhum. As margens
+# de ML e Amazon foram para 36% e ninguém percebeu no ato.
+#
+# Três defesas foram adicionadas:
+#   1. Célula vazia / coluna ausente PRESERVA o valor do banco (COALESCE)
+#   2. Diff obrigatório na tela antes de gravar
+#   3. Circuit breaker: queda de custo em massa bloqueia a importação
+#   4. Transação única — ou grava tudo, ou não grava nada
+
+COLUNAS_OBRIGATORIAS = ['sku', 'nome']
+
+# Campos que vão para dim_produtos
+CAMPOS_PRODUTO = ['nome', 'categoria', 'status', 'preco_a_ser_considerado',
+                  'margem_minima', 'margem_desejavel',
+                  'largura', 'comprimento', 'altura', 'peso_bruto']
+
+# Campos que vão para dim_produtos_custos
+CAMPOS_CUSTO = ['cod_fornecedor', 'preco_compra', 'embalagem', 'mdo',
+                'custo_ads', 'outros_custos']
+
+TODOS_CAMPOS = CAMPOS_PRODUTO + CAMPOS_CUSTO
+
+CAMPOS_TEXTO = {'nome', 'categoria', 'status', 'cod_fornecedor'}
+
+# Circuit breaker: bloqueia se mais de 20% dos SKUs caírem mais de 30% de custo
+LIMIAR_PCT_SKUS_AFETADOS = 20.0
+LIMIAR_QUEDA_CUSTO = 30.0
+
+
+def _preparar_registros(df_import):
+    """
+    Converte o DataFrame da planilha em registros normalizados.
+
+    Cada campo vira None quando a coluna não existe ou a célula está vazia —
+    None significa "não informado, mantenha o banco", nunca "zere o valor".
+    """
+    registros = []
+    erros = []
+
+    for idx, row in df_import.iterrows():
+        linha_planilha = idx + 2  # +1 do header, +1 porque Excel começa em 1
+
+        sku = str(row.get('sku', '')).strip()
+        if sku == '' or sku.lower() == 'nan':
+            erros.append({'linha': linha_planilha, 'sku': '(vazio)',
+                          'problema': 'SKU vazio'})
+            continue
+
+        nome = str(row.get('nome', '')).strip()
+        if nome == '' or nome.lower() == 'nan':
+            erros.append({'linha': linha_planilha, 'sku': sku,
+                          'problema': 'Nome vazio'})
+            continue
+
+        registro = {'sku': sku, '_linha': linha_planilha}
+
+        for campo in TODOS_CAMPOS:
+            if campo not in df_import.columns:
+                registro[campo] = None
+                continue
+
+            bruto = row.get(campo)
+
+            if campo in CAMPOS_TEXTO:
+                texto = '' if bruto is None else str(bruto).strip()
+                registro[campo] = None if texto in ('', 'nan', 'None') else texto
+            else:
+                valor = converter_valor_planilha(bruto)
+                if valor is not None and valor < 0:
+                    erros.append({'linha': linha_planilha, 'sku': sku,
+                                  'problema': f'{campo} negativo ({valor})'})
+                registro[campo] = valor
+
+        registros.append(registro)
+
+    return registros, erros
+
+
+def _carregar_estado_atual(engine, skus):
+    """Busca os valores hoje no banco para os SKUs da planilha."""
+    if not skus:
+        return {}
+
+    query = text("""
+        SELECT p.sku, p.nome, p.preco_a_ser_considerado,
+               c.preco_compra, c.embalagem, c.mdo, c.custo_ads, c.outros_custos
+        FROM dim_produtos p
+        LEFT JOIN dim_produtos_custos c ON c.sku = p.sku
+        WHERE p.sku = ANY(:skus)
+    """)
+
+    with engine.connect() as conn:
+        linhas = conn.execute(query, {"skus": list(skus)}).fetchall()
+
+    def _num(valor):
+        """
+        NULL e NaN viram None.
+
+        O banco tem NaN real em colunas numeric (herança da importação de
+        13/08). Se um NaN chegasse ao _avaliar_risco, toda comparação com ele
+        seria False e o circuit breaker deixaria passar sem bloquear.
+        """
+        if valor is None:
+            return None
+        try:
+            convertido = float(valor)
+        except (TypeError, ValueError):
+            return None
+        return None if convertido != convertido else convertido
+
+    return {
+        linha[0]: {
+            'nome': linha[1],
+            'preco_a_ser_considerado': _num(linha[2]),
+            'preco_compra': _num(linha[3]),
+            'embalagem': _num(linha[4]),
+            'mdo': _num(linha[5]),
+            'custo_ads': _num(linha[6]),
+            'outros_custos': _num(linha[7]),
+        }
+        for linha in linhas
+    }
+
+
+def _montar_diff(registros, estado_atual):
+    """Monta o comparativo linha a linha entre planilha e banco."""
+    diff = []
+
+    def _valido(valor):
+        """None para NULL e NaN — NaN faria toda comparação virar False."""
+        return valor if (valor is not None and valor == valor) else None
+
+    for registro in registros:
+        sku = registro['sku']
+        atual = estado_atual.get(sku)
+        novo_custo = _valido(registro.get('preco_a_ser_considerado'))
+
+        if atual is None:
+            diff.append({
+                'sku': sku, 'nome': registro.get('nome') or '',
+                'situacao': 'NOVO', 'custo_atual': None,
+                'custo_novo': novo_custo, 'variacao_pct': None,
+            })
+            continue
+
+        custo_atual = _valido(atual['preco_a_ser_considerado'])
+
+        if novo_custo is None:
+            variacao = None
+            situacao = 'PRESERVA CUSTO'
+        elif custo_atual is None or custo_atual == 0:
+            variacao = None
+            situacao = 'DEFINE CUSTO'
+        else:
+            variacao = (novo_custo - custo_atual) / custo_atual * 100
+            if abs(variacao) < 0.01:
+                situacao = 'SEM MUDANÇA'
+            elif variacao < 0:
+                situacao = 'REDUZ CUSTO'
+            else:
+                situacao = 'AUMENTA CUSTO'
+
+        diff.append({
+            'sku': sku, 'nome': registro.get('nome') or atual['nome'] or '',
+            'situacao': situacao, 'custo_atual': custo_atual,
+            'custo_novo': novo_custo, 'variacao_pct': variacao,
+        })
+
+    return diff
+
+
+def _avaliar_risco(diff):
+    """
+    Circuit breaker. Devolve None se a importação parece segura,
+    ou um dict com o motivo do bloqueio.
+    """
+    comparaveis = [d for d in diff if d['variacao_pct'] is not None]
+    if not comparaveis:
+        return None
+
+    quedas = [d for d in comparaveis if d['variacao_pct'] <= -LIMIAR_QUEDA_CUSTO]
+    pct_afetado = len(quedas) / len(comparaveis) * 100
+
+    if pct_afetado <= LIMIAR_PCT_SKUS_AFETADOS:
+        return None
+
+    queda_media = sum(d['variacao_pct'] for d in quedas) / len(quedas)
+
+    return {
+        'n_quedas': len(quedas),
+        'mensagem': (
+            f"**{len(quedas)} de {len(comparaveis)} SKUs ({pct_afetado:.1f}%) "
+            f"teriam o custo reduzido em mais de {LIMIAR_QUEDA_CUSTO:.0f}%.**\n\n"
+            f"Queda média nesses SKUs: {queda_media:.1f}%. "
+            f"O limite de segurança é {LIMIAR_PCT_SKUS_AFETADOS:.0f}% dos SKUs."
+        ),
+    }
+
+
+def _render_diff(diff, colunas_no_arquivo):
+    """Mostra o resumo e a tabela de impacto antes de gravar."""
+    novos = [d for d in diff if d['situacao'] == 'NOVO']
+    reduz = [d for d in diff if d['situacao'] == 'REDUZ CUSTO']
+    aumenta = [d for d in diff if d['situacao'] == 'AUMENTA CUSTO']
+    preserva = [d for d in diff if d['situacao'] == 'PRESERVA CUSTO']
+
+    st.markdown("### 🔍 Impacto no custo")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("SKUs novos", len(novos))
+    c2.metric("Custo ↓", len(reduz))
+    c3.metric("Custo ↑", len(aumenta))
+    c4.metric("Preservados", len(preserva))
+
+    if 'preco_a_ser_considerado' not in colunas_no_arquivo:
+        st.success("✅ A planilha não traz `preco_a_ser_considerado` — "
+                   "nenhum custo será alterado.")
+
+    mudancas = [d for d in diff if d['variacao_pct'] is not None
+                and abs(d['variacao_pct']) >= 0.01]
+
+    if not mudancas:
+        st.info("Nenhuma alteração de custo em SKUs já cadastrados.")
+        return
+
+    ordenado = sorted(mudancas, key=lambda d: d['variacao_pct'])
+
+    # Sinalizador em texto: st.style.background_gradient exigiria matplotlib,
+    # que não está no requirements.txt — importar quebraria a página inteira.
+    def _sinal(variacao):
+        if variacao <= -LIMIAR_QUEDA_CUSTO:
+            return '🔴 queda forte'
+        if variacao < 0:
+            return '🟡 queda'
+        return '🟢 aumento'
+
+    df_diff = pd.DataFrame([{
+        'SKU': d['sku'],
+        'Produto': (d['nome'] or '')[:45],
+        'Custo atual': formatar_valor_br(d['custo_atual']),
+        'Custo novo': formatar_valor_br(d['custo_novo']),
+        'Variação %': f"{d['variacao_pct']:+.1f}%",
+        'Sinal': _sinal(d['variacao_pct']),
+    } for d in ordenado])
+
+    st.markdown("**Maiores quedas primeiro** — confira se fazem sentido:")
+    st.dataframe(df_diff, use_container_width=True, height=320, hide_index=True)
+
+
+def _executar_importacao(engine, registros, colunas_no_arquivo):
+    """
+    Grava tudo numa transação única.
+
+    O COALESCE é o que impede o acidente de 13/08: parâmetro None
+    (coluna ausente ou célula vazia) mantém o valor que já está no banco.
+    """
+    query_prod = text("""
+        INSERT INTO dim_produtos
+            (sku, nome, categoria, status, preco_a_ser_considerado,
+             margem_minima, margem_desejavel,
+             largura, comprimento, altura, peso_bruto)
+        VALUES (:sku, :nome, :categoria, COALESCE(:status, 'Ativo'),
+                :preco_a_ser_considerado, :margem_minima, :margem_desejavel,
+                :largura, :comprimento, :altura, :peso_bruto)
+        ON CONFLICT (sku) DO UPDATE SET
+            nome = COALESCE(EXCLUDED.nome, dim_produtos.nome),
+            categoria = COALESCE(EXCLUDED.categoria, dim_produtos.categoria),
+            status = COALESCE(EXCLUDED.status, dim_produtos.status),
+            preco_a_ser_considerado = COALESCE(EXCLUDED.preco_a_ser_considerado,
+                                               dim_produtos.preco_a_ser_considerado),
+            margem_minima = COALESCE(EXCLUDED.margem_minima, dim_produtos.margem_minima),
+            margem_desejavel = COALESCE(EXCLUDED.margem_desejavel, dim_produtos.margem_desejavel),
+            largura = COALESCE(EXCLUDED.largura, dim_produtos.largura),
+            comprimento = COALESCE(EXCLUDED.comprimento, dim_produtos.comprimento),
+            altura = COALESCE(EXCLUDED.altura, dim_produtos.altura),
+            peso_bruto = COALESCE(EXCLUDED.peso_bruto, dim_produtos.peso_bruto)
+    """)
+
+    query_custos = text("""
+        INSERT INTO dim_produtos_custos
+            (sku, cod_fornecedor, preco_compra, embalagem, mdo, custo_ads, outros_custos)
+        VALUES (:sku, :cod_fornecedor, :preco_compra, :embalagem,
+                :mdo, :custo_ads, :outros_custos)
+        ON CONFLICT (sku) DO UPDATE SET
+            cod_fornecedor = COALESCE(EXCLUDED.cod_fornecedor, dim_produtos_custos.cod_fornecedor),
+            preco_compra = COALESCE(EXCLUDED.preco_compra, dim_produtos_custos.preco_compra),
+            embalagem = COALESCE(EXCLUDED.embalagem, dim_produtos_custos.embalagem),
+            mdo = COALESCE(EXCLUDED.mdo, dim_produtos_custos.mdo),
+            custo_ads = COALESCE(EXCLUDED.custo_ads, dim_produtos_custos.custo_ads),
+            outros_custos = COALESCE(EXCLUDED.outros_custos, dim_produtos_custos.outros_custos)
+    """)
+
+    tem_campo_custo = any(c in colunas_no_arquivo for c in CAMPOS_CUSTO)
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(registros)
+
+    try:
+        # engine.begin() = transação única: erro em qualquer linha desfaz tudo
+        with engine.begin() as conn:
+            for i, registro in enumerate(registros):
+                params_prod = {'sku': registro['sku']}
+                params_prod.update({c: registro.get(c) for c in CAMPOS_PRODUTO})
+                conn.execute(query_prod, params_prod)
+
+                if tem_campo_custo:
+                    params_custo = {'sku': registro['sku']}
+                    params_custo.update({c: registro.get(c) for c in CAMPOS_CUSTO})
+                    conn.execute(query_custos, params_custo)
+
+                if i % 25 == 0 or i == total - 1:
+                    progress_bar.progress((i + 1) / total)
+                    status_text.text(f"Gravando... {i + 1}/{total}")
+
+        progress_bar.progress(1.0)
+        status_text.empty()
+        st.success(f"✅ Importação concluída: {total} SKUs gravados.")
+        st.balloons()
+
+    except Exception as e:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"❌ Importação revertida — nada foi gravado.\n\nErro: {e}")
 
 
 def main():
@@ -522,7 +908,8 @@ def main():
             with col2:
                 st.markdown("### 📤 Upload Arquivo")
                 st.info("Envie o arquivo Excel preenchido para importar em massa. "
-                        "SKUs existentes serão atualizados com os novos valores.")
+                        "Colunas ausentes ou células vazias **preservam** o valor "
+                        "cadastrado — só sobrescreve o que vier preenchido.")
 
                 uploaded_file = st.file_uploader("Selecione o arquivo Excel",
                                                  type=['xlsx', 'xls'])
@@ -531,130 +918,62 @@ def main():
                     try:
                         df_import = pd.read_excel(uploaded_file)
 
-                        colunas_obrigatorias = ['sku', 'nome']
-                        colunas_faltando = [c for c in colunas_obrigatorias
+                        colunas_faltando = [c for c in COLUNAS_OBRIGATORIAS
                                             if c not in df_import.columns]
 
                         if colunas_faltando:
                             st.error(f"❌ Colunas obrigatórias faltando: {', '.join(colunas_faltando)}")
                         else:
-                            st.success(f"✅ Arquivo válido! {len(df_import)} registros encontrados.")
+                            registros, erros_parse = _preparar_registros(df_import)
 
-                            st.markdown("**Preview dos dados:**")
-                            st.dataframe(df_import.head(10), use_container_width=True)
+                            if erros_parse:
+                                st.error(f"❌ {len(erros_parse)} linha(s) com problema — corrija a planilha:")
+                                st.dataframe(pd.DataFrame(erros_parse), use_container_width=True)
 
-                            if st.button("🚀 Importar Dados", type="primary"):
-                                sucesso = 0
-                                erros = 0
+                            elif not registros:
+                                st.warning("⚠️ Nenhuma linha válida encontrada no arquivo.")
 
-                                progress_bar = st.progress(0)
-                                status_text = st.empty()
+                            else:
+                                st.success(f"✅ Arquivo lido: {len(registros)} SKUs.")
 
-                                for idx, row in df_import.iterrows():
-                                    try:
-                                        preco_compra = converter_valor_para_float(
-                                            row.get('preco_compra', 0))
-                                        embalagem = converter_valor_para_float(
-                                            row.get('embalagem', 0))
-                                        mdo = converter_valor_para_float(
-                                            row.get('mdo', 0))
-                                        custo_ads = converter_valor_para_float(
-                                            row.get('custo_ads', 0))
-                                        outros_custos = converter_valor_para_float(
-                                            row.get('outros_custos', 0))
-                                        preco_final = converter_valor_para_float(
-                                            row.get('preco_a_ser_considerado', 0))
-                                        margem_min = converter_valor_para_float(
-                                            row.get('margem_minima', 0))
-                                        margem_des = converter_valor_para_float(
-                                            row.get('margem_desejavel', 0))
-                                        largura = converter_valor_para_float(
-                                            row.get('largura', 0))
-                                        comprimento = converter_valor_para_float(
-                                            row.get('comprimento', 0))
-                                        altura = converter_valor_para_float(
-                                            row.get('altura', 0))
-                                        peso_bruto = converter_valor_para_float(
-                                            row.get('peso_bruto', 0))
+                                colunas_no_arquivo = [c for c in TODOS_CAMPOS
+                                                      if c in df_import.columns]
+                                colunas_ausentes = [c for c in TODOS_CAMPOS
+                                                    if c not in df_import.columns]
+                                if colunas_ausentes:
+                                    st.info("ℹ️ Colunas ausentes na planilha (serão preservadas no "
+                                            f"banco): {', '.join(colunas_ausentes)}")
 
-                                        with engine.connect() as conn:
-                                            query_prod = text("""
-                                                INSERT INTO dim_produtos 
-                                                    (sku, nome, categoria, status, 
-                                                     preco_a_ser_considerado,
-                                                     margem_minima, margem_desejavel,
-                                                     largura, comprimento, altura, peso_bruto)
-                                                VALUES (:sku, :nome, :cat, :status, :preco,
-                                                        :margem_min, :margem_des,
-                                                        :largura, :comprimento, :altura, :peso_bruto)
-                                                ON CONFLICT (sku) 
-                                                DO UPDATE SET
-                                                    nome = EXCLUDED.nome,
-                                                    categoria = EXCLUDED.categoria,
-                                                    status = EXCLUDED.status,
-                                                    preco_a_ser_considerado = EXCLUDED.preco_a_ser_considerado,
-                                                    margem_minima = EXCLUDED.margem_minima,
-                                                    margem_desejavel = EXCLUDED.margem_desejavel,
-                                                    largura = EXCLUDED.largura,
-                                                    comprimento = EXCLUDED.comprimento,
-                                                    altura = EXCLUDED.altura,
-                                                    peso_bruto = EXCLUDED.peso_bruto
-                                            """)
+                                # ---- DIFF CONTRA O BANCO ----
+                                estado_atual = _carregar_estado_atual(
+                                    engine, [r['sku'] for r in registros])
+                                diff = _montar_diff(registros, estado_atual)
 
-                                            conn.execute(query_prod, {
-                                                "sku": str(row['sku']),
-                                                "nome": str(row['nome']),
-                                                "cat": str(row.get('categoria', '')),
-                                                "status": str(row.get('status', 'Ativo')),
-                                                "preco": preco_final,
-                                                "margem_min": margem_min,
-                                                "margem_des": margem_des,
-                                                "largura": largura,
-                                                "comprimento": comprimento,
-                                                "altura": altura,
-                                                "peso_bruto": peso_bruto,
-                                            })
+                                _render_diff(diff, colunas_no_arquivo)
 
-                                            query_custos = text("""
-                                                INSERT INTO dim_produtos_custos 
-                                                (sku, cod_fornecedor, preco_compra, embalagem, 
-                                                 mdo, custo_ads, outros_custos)
-                                                VALUES (:sku, :cod, :pc, :emb, :mdo, :ads, :outros)
-                                                ON CONFLICT (sku)
-                                                DO UPDATE SET
-                                                    cod_fornecedor = EXCLUDED.cod_fornecedor,
-                                                    preco_compra = EXCLUDED.preco_compra,
-                                                    embalagem = EXCLUDED.embalagem,
-                                                    mdo = EXCLUDED.mdo,
-                                                    custo_ads = EXCLUDED.custo_ads,
-                                                    outros_custos = EXCLUDED.outros_custos
-                                            """)
+                                # ---- CIRCUIT BREAKER ----
+                                bloqueio = _avaliar_risco(diff)
 
-                                            conn.execute(query_custos, {
-                                                "sku": str(row['sku']),
-                                                "cod": str(row.get('cod_fornecedor', '')),
-                                                "pc": preco_compra,
-                                                "emb": embalagem,
-                                                "mdo": mdo,
-                                                "ads": custo_ads,
-                                                "outros": outros_custos,
-                                            })
+                                pode_importar = True
+                                if bloqueio:
+                                    st.error(
+                                        f"🛑 **IMPORTAÇÃO BLOQUEADA POR SEGURANÇA**\n\n"
+                                        f"{bloqueio['mensagem']}\n\n"
+                                        f"Isso costuma indicar coluna trocada ou formato decimal "
+                                        f"errado na planilha. Confira o diff acima antes de liberar."
+                                    )
+                                    frase = f"CONFIRMO REDUZIR CUSTO DE {bloqueio['n_quedas']} SKUS"
+                                    st.markdown(
+                                        f"Para liberar mesmo assim, digite exatamente: `{frase}`")
+                                    digitado = st.text_input(
+                                        "Confirmação de segurança",
+                                        key="confirma_import_skus",
+                                        label_visibility="collapsed")
+                                    pode_importar = (digitado.strip() == frase)
 
-                                            conn.commit()
-
-                                        sucesso += 1
-
-                                    except Exception as e:
-                                        erros += 1
-                                        st.warning(f"Erro na linha {idx + 2} (SKU: {row['sku']}): {e}")
-
-                                    progress = (idx + 1) / len(df_import)
-                                    progress_bar.progress(progress)
-                                    status_text.text(f"Processando... {idx + 1}/{len(df_import)}")
-
-                                st.success(
-                                    f"✅ Importação concluída! Sucesso: {sucesso} | Erros: {erros}")
-                                st.balloons()
+                                if st.button("🚀 Importar Dados", type="primary",
+                                             disabled=not pode_importar):
+                                    _executar_importacao(engine, registros, colunas_no_arquivo)
 
                     except Exception as e:
                         st.error(f"❌ Erro ao processar arquivo: {e}")
