@@ -1,5 +1,16 @@
 """
 PROCESSADOR MAGALU - Sistema Nala
+VERSAO 1.2 (17/08/2026):
+  - FIX CRITICO: comissao gravava sempre 0. A Magalu renomeou as colunas de tarifa
+    (entre 15/04 e 18/05/2026) acrescentando o sufixo "(Forma de pagamento 1/2)" e
+    um 4o componente. Agora resolvemos os dois layouts e somamos as duas formas de pgto.
+  - FIX CRITICO: margem descontava desconto_parceiro DUAS vezes (ele ja estava
+    embutido no liquido do relatorio) e nunca devolvia o subsidio da Magalu.
+  - FIX CRITICO: coparticipacao de frete era gravada mas nao entrava na margem.
+  - FIX: valor_liquido calculado a partir dos componentes. A coluna "Valor liquido
+    estimado a receber" do CSV nao devolve o subsidio Magalu nem desconta o frete,
+    divergindo do painel da Magalu.
+  - FIX: tarifa fixa lida do relatorio (fallback R$ 5,00/un) em vez de sempre R$ 5,00.
 VERSAO 1.1 (17/03/2026):
   - FIX: Periodo extraido automaticamente dos dados (nao precisa informar datas)
   - FIX: Valores arredondados com 2 casas decimais
@@ -22,13 +33,47 @@ from database_utils import (
 
 
 def _limpar_valor_magalu(valor):
-    if pd.isna(valor) or str(valor).strip() in ('', 'Não se aplica', 'nan'):
+    if pd.isna(valor) or str(valor).strip() in ('', '-', 'Não se aplica', 'nan'):
         return 0.0
-    s = str(valor).replace('R$', '').replace(' ', '').replace(',', '.')
+    s = str(valor).replace('R$', '').replace(' ', '').replace('\xa0', '')
+    # A Magalu exporta com ponto decimal ("R$ -4.83"), mas se vier virgula tratamos
+    # os dois formatos em vez de devolver 0.0 silenciosamente.
+    if ',' in s and '.' in s:
+        s = s.replace(',', '') if s.rfind('.') > s.rfind(',') else s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
     try:
         return float(s)
     except (ValueError, TypeError):
         return 0.0
+
+
+# A Magalu mudou o layout do relatorio de pedidos entre 15/04 e 18/05/2026:
+# as tarifas passaram a ter sufixo "(Forma de pagamento 1)" / "(Forma de pagamento 2)"
+# e o pacote de servicos ganhou um 4o componente (Adm e gestao de recebiveis).
+COLS_COMISSAO = (
+    'Serviços do marketplace (1+2+3+4) (Forma de pagamento 1)',
+    'Serviços do marketplace (1+2+3+4) (Forma de pagamento 2)',
+    'Serviços do marketplace (1+2+3) (Forma de pagamento 1)',
+    'Serviços do marketplace (1+2+3) (Forma de pagamento 2)',
+    'Serviços do marketplace (1+2+3+4)',
+    'Serviços do marketplace (1+2+3)',
+)
+COLS_TARIFA_FIXA = (
+    'Tarifa fixa (Forma de pagamento 1)',
+    'Tarifa fixa (Forma de pagamento 2)',
+    'Tarifa fixa',
+)
+
+
+def _somar_colunas(row, nomes):
+    """Soma o modulo das colunas presentes (formas de pagamento 1 e 2 de um pedido
+    parcelado em dois meios sao cobradas separadamente)."""
+    total = 0.0
+    for nome in nomes:
+        if nome in row.index:
+            total += abs(_limpar_valor_magalu(row.get(nome)))
+    return total
 
 
 def _normalizar_sku_magalu(sku_magalu):
@@ -58,6 +103,15 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
     if faltando:
         return None, f"Colunas nao encontradas em pedidos: {', '.join(faltando)}"
 
+    # A Magalu ja renomeou essas colunas uma vez e a comissao passou a gravar 0 sem
+    # nenhum aviso. Falhar alto e melhor do que importar margem inflada.
+    if not any(c in df_ped.columns for c in COLS_COMISSAO):
+        return None, (
+            "Coluna de comissao (Serviços do marketplace) nao encontrada no relatorio de "
+            "pedidos — a Magalu provavelmente mudou o layout. Colunas recebidas: "
+            + ', '.join(df_ped.columns[-12:])
+        )
+
     # Status/logistica dos pacotes
     status_dict = {}
     for _, row in df_pac.iterrows():
@@ -81,6 +135,7 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
     linhas_descartadas = 0
     datas_encontradas = []
     carrinhos_count = 0
+    divergencias = []
 
     pedido_grupos = df_ped.groupby('Número do pedido')
 
@@ -120,10 +175,9 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
             if n_itens > 1:
                 carrinhos_count += 1
 
-            valor_bruto_pedido = _limpar_valor_magalu(primeira_linha.get('Valor bruto do pedido', 0))
-            valor_liquido_pedido = _limpar_valor_magalu(primeira_linha.get('Valor líquido estimado a receber', 0))
-            tarifa_fixa_pedido = abs(_limpar_valor_magalu(primeira_linha.get('Tarifa fixa', 0)))
-            comissao_mkt_pedido = abs(_limpar_valor_magalu(primeira_linha.get('Serviços do marketplace (1+2+3)', 0)))
+            liquido_relatorio = _limpar_valor_magalu(primeira_linha.get('Valor líquido estimado a receber', 0))
+            tarifa_fixa_pedido = _somar_colunas(primeira_linha, COLS_TARIFA_FIXA)
+            comissao_mkt_pedido = _somar_colunas(primeira_linha, COLS_COMISSAO)
             copart_frete = abs(_limpar_valor_magalu(primeira_linha.get('Coparticipação de Fretes estimada', 0)))
 
             itens_precos = []
@@ -136,6 +190,15 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
             if soma_precos <= 0:
                 soma_precos = 1
 
+            total_unidades = sum(i['qtd'] for i in itens_precos) or 1
+            # A tarifa fixa e cobrada por unidade; se a coluna nao existir no layout,
+            # cai no padrao historico de R$ 5,00 por unidade.
+            if tarifa_fixa_pedido <= 0:
+                tarifa_fixa_pedido = 5.0 * total_unidades
+
+            liq_calc_pedido = 0.0
+            subsidio_magalu_pedido = 0.0
+
             for item_info in itens_precos:
                 item_row = item_info['row']
                 preco_item = item_info['preco']
@@ -144,8 +207,7 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
 
                 proporcao = (preco_item * qtd) / soma_precos
 
-                receita_liquida_item = valor_liquido_pedido * proporcao
-                tarifa_fixa_item = 5.0 * qtd
+                tarifa_fixa_item = tarifa_fixa_pedido * (qtd / total_unidades)
                 comissao_item = comissao_mkt_pedido * proporcao
                 frete_item = copart_frete * proporcao
 
@@ -159,8 +221,13 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
                 desconto_parceiro = desc_parceiro_vista + desc_parceiro_promo + desc_parceiro_cupom
                 desconto_marketplace = desc_magalu_vista + desc_magalu_promo + desc_magalu_cupom
 
+                # Receita efetiva = o que o cliente realmente pagou (base da NF e do imposto).
                 receita_efetiva = (preco_item * qtd) - desconto_parceiro - desconto_marketplace
                 imposto_val = receita_efetiva * (imposto_pct / 100)
+
+                # A Magalu reembolsa a coparticipacao dela, entao o subsidio Magalu NAO
+                # reduz o que recebemos: a base de repasse desconta so o desconto nosso.
+                base_repasse_item = (preco_item * qtd) - desconto_parceiro
 
                 sku_final = sku_raw
                 if sku_raw in mapeamento_skus:
@@ -180,9 +247,13 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
                     skus_sem_custo.add(sku_final)
 
                 total_tarifas = comissao_item + tarifa_fixa_item + frete_item
-                valor_liquido_item = receita_liquida_item
-                margem = valor_liquido_item - custo_total - imposto_val - desconto_parceiro
+                valor_liquido_item = base_repasse_item - total_tarifas
+                # desconto_parceiro ja esta dentro de base_repasse_item — nao descontar de novo.
+                margem = valor_liquido_item - custo_total - imposto_val
                 margem_pct = (margem / receita_efetiva * 100) if receita_efetiva > 0 else 0
+
+                liq_calc_pedido += valor_liquido_item
+                subsidio_magalu_pedido += desconto_marketplace
 
                 id_sintetico = f"MGLU_{loja}_{pedido_id}_{sku_raw}"
 
@@ -202,7 +273,7 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
                         'desconto_parceiro': round(desconto_parceiro / qtd, 2),
                         'desconto_marketplace': round(desconto_marketplace / qtd, 2),
                         'comissao': round(comissao_item / qtd, 2),
-                        'tarifa_fixa': 5.0,
+                        'tarifa_fixa': round(tarifa_fixa_item / qtd, 2),
                         'frete': round(frete_item / qtd, 2),
                         'imposto': round(imposto_val / qtd, 2),
                         'custo': round(custo_un, 2),
@@ -212,6 +283,20 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
                         'margem_pct': round(margem_pct, 2),
                         'tem_custo': custo_un > 0,
                         'status': status,
+                    })
+
+            # Reconciliacao: o liquido do CSV nao devolve o subsidio Magalu nem desconta
+            # a coparticipacao de frete. Se sobrar diferenca, alguma premissa mudou.
+            if liquido_relatorio > 0:
+                esperado = liquido_relatorio + subsidio_magalu_pedido - copart_frete
+                if abs(liq_calc_pedido - esperado) > 0.05:
+                    divergencias.append({
+                        'pedido': pedido_id,
+                        'liquido_calculado': round(liq_calc_pedido, 2),
+                        'liquido_relatorio': round(liquido_relatorio, 2),
+                        'subsidio_magalu': round(subsidio_magalu_pedido, 2),
+                        'copart_frete': round(copart_frete, 2),
+                        'diferenca': round(liq_calc_pedido - esperado, 2),
                     })
 
         except Exception:
@@ -237,7 +322,7 @@ def processar_arquivo_magalu(arquivo_pedidos, arquivo_pacotes, loja, imposto_pct
         'periodo_fim': periodo_fim,
         'skus_sem_custo': len(skus_sem_custo),
         'arquivo_nome': arquivo_pedidos.name,
-        'divergencias': [],
+        'divergencias': divergencias,
         'carrinhos_encontrados': carrinhos_count,
         'skus_corrigidos': skus_corrigidos,
         'descartes': descartes,
