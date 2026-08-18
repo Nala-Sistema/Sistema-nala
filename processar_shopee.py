@@ -95,6 +95,7 @@ from database_utils import (
     get_engine,
     gravar_venda_pendente,
     gravar_venda_descartada,
+    buscar_mapeamento_skus,
 )
 
 
@@ -427,6 +428,17 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             # Layout antigo, sem colunas brutas: só resta o valor declarado.
             df['_ajuste_derivado'] = df['Ajuste por participação em ação comercial']
 
+        # v2.6: mapeamento de SKU (de→para). A Shopee era o único módulo que
+        # não consultava dim_sku_mapeamento — ML, Amazon, Magalu, Shein e
+        # TikTok já faziam. Sem isso, um SKU já mapeado ia para pendentes a
+        # cada upload e a venda nunca chegava no snapshot: o anúncio da LPT
+        # exporta 'K-10-LKE-3104-4030' e o cadastro tem 'K10-LKE-3104-4030'.
+        # Carregado antes dos filtros porque a lista de descartes também
+        # precisa do SKU corrigido — é por (pedido, sku) que a venda cancelada
+        # é localizada e removida do snapshot.
+        mapeamento_skus = buscar_mapeamento_skus(engine)
+        skus_corrigidos = 0
+
         # --------------------------------------------------
         # 4. FILTRAR REGISTROS INVÁLIDOS
         # --------------------------------------------------
@@ -470,6 +482,9 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             _ped = str(_row.get('ID do pedido', '') or '').strip()
             if not _ped or _sku.lower() in ('nan', 'none', ''):
                 continue
+            # mesmo mapeamento das vendas válidas — o snapshot guarda o SKU
+            # corrigido, então a remoção precisa procurar por ele
+            _sku = mapeamento_skus.get(_sku, _sku)
             if mask_cancelado.get(_row.name, False):
                 _motivo = 'Pedido cancelado'
             elif mask_devolucao.get(_row.name, False):
@@ -554,6 +569,11 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             sku = str(row['Número de referência SKU']).strip()
             if not sku or sku.lower() in ('nan', 'none', ''):
                 continue
+
+            # v2.6: aplicar mapeamento antes de qualquer validação
+            if sku in mapeamento_skus:
+                sku = mapeamento_skus[sku]
+                skus_corrigidos += 1
 
             # Código do anúncio (SKU pai / agrupador)
             codigo_anuncio = ''
@@ -737,6 +757,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             'periodo_fim':        periodo_fim,
             'linhas_descartadas': linhas_descartadas,
             'descartes':          descartes,   # v2.5: pedidos a remover do snapshot
+            'skus_corrigidos':    skus_corrigidos,  # v2.6: via dim_sku_mapeamento
             'skus_sem_custo':     skus_sem_custo,
             'carrinhos':          len(ids_carrinho),
             'alertas_comissao':   alertas_comissao,
