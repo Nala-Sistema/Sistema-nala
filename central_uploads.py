@@ -118,6 +118,40 @@ def _converter_data_br_para_banco(data_str):
     except: return str(data_str).strip()
 
 
+def _exibir_alerta_arquivo_incompleto(info):
+    """
+    Shopee v2.4 — rede de segurança contra o Erro E2.
+
+    Já aconteceu de o arquivo chegar com a comissão já abatida do subsídio mas
+    sem o valor do desconto declarado. O sistema lia "comissão baixa, desconto
+    nenhum" e contava o subsídio da Shopee como lucro nosso — um SKU chegou a
+    aparecer com 20,9% de margem quando a real era 14,6%.
+
+    Aqui o aviso sai na hora do upload, não meses depois.
+    """
+    alertas = info.get('alertas_arquivo_incompleto') or []
+    if not alertas:
+        return
+
+    falta = sum(a['diferenca'] for a in alertas)
+    st.error(
+        f"🚨 **{len(alertas)} linha(s) com comissão abaixo da tabela oficial "
+        f"(faltam {formatar_valor(falta)})**\n\n"
+        "O arquivo pode ter sido exportado antes de a Shopee liquidar o ajuste "
+        "comercial. Nesse caso a margem sai **inflada**. Reexporte o período no "
+        "Seller Center e suba de novo antes de gravar."
+    )
+    with st.expander(f"🔍 Ver linhas suspeitas ({len(alertas)})", expanded=False):
+        df_a = pd.DataFrame(alertas).rename(columns={
+            'pedido': 'Pedido', 'sku': 'SKU',
+            'comissao_no_arquivo': 'No arquivo (R$)',
+            'comissao_tabela': 'Pela tabela (R$)',
+            'diferenca': 'Falta (R$)'})
+        for c in ['No arquivo (R$)', 'Pela tabela (R$)', 'Falta (R$)']:
+            df_a[c] = df_a[c].apply(formatar_valor)
+        st.dataframe(df_a, use_container_width=True, hide_index=True)
+
+
 def _exibir_alertas_comissao(alertas):
     if not alertas: return
     st.warning(f"⚠️ **{len(alertas)} pedido(s) com comissão diferente da tabela vigente**")
@@ -421,7 +455,19 @@ def _excluir_lancamento(engine, log_id, marketplace, loja, arquivo_nome, periodo
         cursor = conn.cursor()
 
         # 1. Excluir vendas associadas
-        where_vendas = "marketplace_origem = %s AND loja_origem = %s AND arquivo_origem = %s"
+        #
+        # FIX: antes o filtro era só `arquivo_origem = %s`, e vendas gravadas
+        # sem rastreabilidade de arquivo (as que passaram por reprocessamento
+        # de pendentes) NUNCA eram alcançadas. Elas sobreviviam à exclusão e
+        # depois bloqueavam a reimportação: o upsert encontrava a linha órfã
+        # e a versão corrigida não entrava.
+        #
+        # Agora leva também as órfãs do mesmo período. Continua cirúrgico —
+        # não encosta em linhas de outros arquivos identificados, o que
+        # importa porque subir um arquivo mensal por cima dos semanais é
+        # prática normal aqui.
+        where_vendas = ("marketplace_origem = %s AND loja_origem = %s "
+                        "AND (arquivo_origem = %s OR COALESCE(arquivo_origem, '') = '')")
         params_vendas = [marketplace, loja, arquivo_nome]
 
         if periodo_inicio and periodo_fim:
@@ -704,6 +750,7 @@ def tab_processar_upload(engine):
             st.warning(f"⚠️ {len(info['pendentes_carrinho'])} venda(s) com divergência financeira")
         if mp_key == 'SHOPEE':
             _exibir_alertas_comissao(info.get('alertas_comissao', []))
+            _exibir_alerta_arquivo_incompleto(info)
         if mp_key == 'TIKTOK' and info.get('skus_nao_mapeados', 0) > 0:
             st.warning(f"⚠️ {info['skus_nao_mapeados']} SKU(s) TikTok sem mapeamento — irão para pendentes. Mapeie na aba 'Vendas Pendentes' e reprocesse.")
         if mp_key == 'TIKTOK' and info.get('pendentes_emespera'):
@@ -748,9 +795,9 @@ def tab_processar_upload(engine):
                         df_proc, mktp, loja, arquivo_nome, engine,
                         descartes=info.get('descartes', []), pendentes_carrinho=info.get('pendentes_carrinho', []))
                 elif mp_key == 'SHOPEE':
-                    registros, erros, skus_invalidos, duplicatas, pendentes = gravar_vendas_shopee(
-                        df_proc, mktp, loja, arquivo_nome, engine)
-                    descartadas = 0; atualizados = 0
+                    registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_shopee(
+                        df_proc, mktp, loja, arquivo_nome, engine,
+                        descartes=info.get('descartes', []))
                 elif mp_key == 'AMAZON':
                     d_ini = st.session_state.get('data_ini'); d_fim = st.session_state.get('data_fim')
                     registros, erros, skus_invalidos, duplicatas, pendentes, descartadas, atualizados = gravar_vendas_amazon(
@@ -1294,8 +1341,16 @@ def _secao_pend_sku(engine):
     if df.empty: st.success("✅ Nenhuma pendente por SKU."); return
 
     skus_v = buscar_skus_validos(engine)
-    df_e = df[['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
-        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete','motivo','arquivo_origem']].copy()
+    # v3.7: desconto_parceiro e outros_custos entram aqui para não serem
+    # perdidos no reprocessamento — sem eles a linha voltava com ajuste zero
+    # e margem inflada.
+    _cols_pend = ['id','sku','numero_pedido','data_venda','loja_origem','marketplace_origem',
+        'valor_venda_efetivo','codigo_anuncio','quantidade','comissao','imposto','frete',
+        'motivo','arquivo_origem','desconto_parceiro','outros_custos']
+    df_e = df[[c for c in _cols_pend if c in df.columns]].copy()
+    for _c in ('desconto_parceiro','outros_custos'):
+        if _c not in df_e.columns:
+            df_e[_c] = 0.0
     df_e['sku_original'] = df_e['sku'].copy()
 
     # Enriquece linhas TikTok com nome_produto/nome_sku_variante de dim_tiktok_skus
@@ -1359,6 +1414,7 @@ def _secao_pend_sku(engine):
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
                         'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem',''),
+                        'desconto_parceiro':r.get('desconto_parceiro',0),'outros_custos':r.get('outros_custos',0),
                         'logistica':r.get('logistica')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:
@@ -1417,6 +1473,7 @@ def _secao_pend_div(engine):
                         'loja_origem':r['loja_origem'],'numero_pedido':r['numero_pedido'],
                         'data_venda':pd.to_datetime(r['data_venda'],format='%d/%m/%Y',errors='coerce'),
                         'codigo_anuncio':r.get('codigo_anuncio',''),'arquivo_origem':r.get('arquivo_origem',''),
+                        'desconto_parceiro':r.get('desconto_parceiro',0),'outros_custos':r.get('outros_custos',0),
                         'logistica':r.get('logistica')} for _,r in sels.iterrows()]
                     res = reprocessar_pendentes_manual(engine, itens)
                     if res['sucesso'] > 0:

@@ -552,12 +552,18 @@ def reprocessar_pendentes_por_sku(engine, sku):
     sucesso, erros, sem_config = 0, 0, 0
     ids_repro = []
 
+    # v3.7 FIX: o INSERT não carregava desconto_parceiro nem outros_custos.
+    # A venda pendente guarda os dois (gravar_venda_pendente grava), mas o
+    # reprocessamento descartava — toda venda que passou por aqui entrou no
+    # snapshot com ajuste zerado. Efeito: o subsídio da Shopee virava lucro.
+    # Das 103 linhas sem arquivo_origem no banco, NENHUMA tinha ajuste.
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (marketplace_origem, loja_origem, numero_pedido, data_venda, sku,
-            codigo_anuncio, quantidade, preco_venda, valor_venda_efetivo, custo_unitario, custo_total,
+            codigo_anuncio, quantidade, preco_venda, desconto_parceiro, valor_venda_efetivo,
+            custo_unitario, custo_total,
             imposto, comissao, frete, tarifa_fixa, outros_custos, total_tarifas, valor_liquido,
             margem_total, margem_percentual, data_processamento, arquivo_origem, logistica)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
     """
     for _, row in df_pendentes.iterrows():
         try:
@@ -602,17 +608,26 @@ def reprocessar_pendentes_por_sku(engine, sku):
                 v_taxa_fixa = float(row['tarifa_fixa'])
                 v_frete = float(row['frete'])
                 logistica_final = row.get('logistica', None)
-            
-            total_tarifas = v_comissao + v_taxa_fixa + v_frete
+
+            # v3.7: preservar o que a venda pendente já carregava. Antes ambos
+            # eram descartados (outros_custos entrava como 0 no INSERT).
+            v_desconto_parceiro = float(row.get('desconto_parceiro', 0) or 0)
+            v_outros_custos     = float(row.get('outros_custos', 0) or 0)
+
+            total_tarifas = v_comissao + v_taxa_fixa + v_frete + v_outros_custos
             valor_liquido = receita - total_tarifas - imposto_val
             margem_total = valor_liquido - custo_total
-            margem_pct = (margem_total / receita * 100) if receita > 0 else 0
+            # Base do percentual é a receita de NF (receita menos o desconto do
+            # parceiro), coerente com processar_shopee v2.4.
+            base_pct = receita - v_desconto_parceiro
+            margem_pct = (margem_total / base_pct * 100) if base_pct > 0 else 0
             preco_venda = receita / qtd if qtd > 0 else receita
-            
+
             cursor.execute(sql_ins, (
                 row['marketplace_origem'], row['loja_origem'], row['numero_pedido'], row['data_venda'], sku,
-                row['codigo_anuncio'], qtd, preco_venda, receita, custo_unit, custo_total,
-                imposto_val, v_comissao, v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
+                row['codigo_anuncio'], qtd, preco_venda, v_desconto_parceiro, receita,
+                custo_unit, custo_total,
+                imposto_val, v_comissao, v_frete, v_taxa_fixa, v_outros_custos, total_tarifas, valor_liquido,
                 margem_total, margem_pct, row['arquivo_origem'], logistica_final
             ))
             ids_repro.append(int(row['id']))
@@ -906,12 +921,22 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 logistica_final = item.get('logistica', None)
                 codigo_anuncio_final = item.get('codigo_anuncio', '')
 
+            # v3.7 FIX: os dois caminhos de reprocessamento gravavam zero fixo
+            # em desconto_parceiro e outros_custos. A venda pendente carrega os
+            # dois valores, mas eles eram descartados aqui — a linha entrava no
+            # snapshot sem o ajuste comercial e a margem saía inflada nesse
+            # valor. Mesmo bug que reprocessar_pendentes_por_sku tinha.
+            v_desconto_parceiro = float(item.get('desconto_parceiro', 0) or 0)
+            v_outros_custos     = float(item.get('outros_custos', 0) or 0)
+
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_total = custo_unit * qtd
-            total_tarifas = v_comissao + v_taxa_fixa + v_frete
+            total_tarifas = v_comissao + v_taxa_fixa + v_frete + v_outros_custos
             valor_liquido = receita - total_tarifas - imposto_val
             margem_total = valor_liquido - custo_total
-            margem_pct = (margem_total / receita * 100) if receita > 0 else 0
+            # Base do percentual é a receita de NF, coerente com a v2.4 da Shopee.
+            base_pct = receita - v_desconto_parceiro
+            margem_pct = (margem_total / base_pct * 100) if base_pct > 0 else 0
 
             cursor.execute(f"SAVEPOINT manual_{id_pendente}")
 
@@ -922,9 +947,9 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 item.get('data_venda'),
                 sku,
                 codigo_anuncio_final,
-                qtd, preco_venda, 0, 0,
+                qtd, preco_venda, v_desconto_parceiro, 0,
                 receita, custo_unit, custo_total, imposto_val, v_comissao,
-                v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
+                v_frete, v_taxa_fixa, v_outros_custos, total_tarifas, valor_liquido,
                 margem_total, margem_pct,
                 item.get('arquivo_origem', ''),
                 logistica_final
