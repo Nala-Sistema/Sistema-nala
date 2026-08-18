@@ -93,8 +93,8 @@ from datetime import datetime
 from formatadores import formatar_valor, formatar_percentual
 from database_utils import (
     get_engine,
-    buscar_duplicatas_loja,
     gravar_venda_pendente,
+    gravar_venda_descartada,
 )
 
 
@@ -456,6 +456,34 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
         df_valido = df[~mask_descartar].copy()
         linhas_descartadas = total_original - len(df_valido)
 
+        # v2.5: guardar QUAIS pedidos foram descartados, não só quantos.
+        #
+        # Antes essa informação morria aqui. Um pedido gravado como válido na
+        # semana e cancelado depois continuava no banco para sempre — subir o
+        # arquivo do mês fechado não removia, porque a linha cancelada era
+        # jogada fora antes de chegar na gravação. Agora a lista segue adiante
+        # e gravar_vendas_shopee apaga essas vendas do snapshot.
+        df_descartes = df[mask_descartar].copy()
+        descartes = []
+        for _, _row in df_descartes.iterrows():
+            _sku = str(_row.get('Número de referência SKU', '') or '').strip()
+            _ped = str(_row.get('ID do pedido', '') or '').strip()
+            if not _ped or _sku.lower() in ('nan', 'none', ''):
+                continue
+            if mask_cancelado.get(_row.name, False):
+                _motivo = 'Pedido cancelado'
+            elif mask_devolucao.get(_row.name, False):
+                _motivo = 'Devolução / reembolso'
+            else:
+                _motivo = 'Sem receita (Total global = 0)'
+            descartes.append({
+                'pedido':          _ped,
+                'sku':             _sku,
+                'status_original': str(_row.get('Status do pedido', '') or '').strip(),
+                'motivo':          _motivo,
+                'receita':         _limpar_numero(_row.get('Subtotal do produto', 0)),
+            })
+
         if df_valido.empty:
             return None, "Nenhuma venda válida encontrada após filtros."
 
@@ -708,6 +736,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             'periodo_inicio':     periodo_inicio,
             'periodo_fim':        periodo_fim,
             'linhas_descartadas': linhas_descartadas,
+            'descartes':          descartes,   # v2.5: pedidos a remover do snapshot
             'skus_sem_custo':     skus_sem_custo,
             'carrinhos':          len(ids_carrinho),
             'alertas_comissao':   alertas_comissao,
@@ -730,7 +759,7 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
 # ============================================================
 
 def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
-                          arquivo_nome: str, engine):
+                          arquivo_nome: str, engine, descartes: list = None):
     """
     Grava vendas da Shopee na tabela fact_vendas_snapshot.
 
@@ -756,23 +785,32 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
         engine       : conexão SQLAlchemy
 
     Retorna:
-        (registros_gravados, erros, skus_invalidos, duplicatas_count, pendentes_count)
+        (registros, erros, skus_invalidos, duplicatas_count,
+         pendentes_count, descartadas_count, atualizados_count)
+
+        v2.5: assinatura alinhada com ML, Amazon, Shein, Magalu e TikTok.
+        duplicatas_count fica sempre 0 — nao existe mais salto por duplicata,
+        o upsert atualiza. O que era pulado agora aparece em atualizados_count.
     """
     registros      = 0
     erros          = 0
     skus_invalidos = set()
-    duplicatas_count = 0
     pendentes_count  = 0
+    duplicatas_count = 0   # sempre 0 na v2.5 — mantido pela assinatura comum
 
-    if df_vendas.empty:
-        return 0, 0, set(), 0, 0
+    if df_vendas.empty and not descartes:
+        return 0, 0, set(), 0, 0, 0, 0
 
     # Verificar SKUs cadastrados em dim_produtos (CORRIGIDO)
     skus_todos   = df_vendas['sku'].unique().tolist()
     skus_validos = _buscar_skus_validos(skus_todos, engine)
 
-    # CARREGAR DUPLICATAS EXISTENTES (proteção contra reimportação)
-    duplicatas_existentes = buscar_duplicatas_loja(engine, loja)
+    # v2.5: a proteção por duplicata deixou de existir. Ela comparava só
+    # (pedido, sku) e pulava a linha — não sabia diferenciar "isso é repetido"
+    # de "isso é a versão corrigida". Resultado: subir arquivo corrigido por
+    # cima não corrigia nada. Agora o INSERT faz upsert, mesmo modelo já usado
+    # no TikTok. Reimportar passou a ser o caminho normal de correção.
+    atualizados_count = 0
 
     total    = len(df_vendas)
     progress = st.progress(0)
@@ -814,10 +852,73 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
             %s, %s, %s, %s, %s,
             %s, %s, %s, NOW(), %s, %s
         )
+        ON CONFLICT (numero_pedido, sku, loja_origem) DO UPDATE SET
+            pedido_original      = EXCLUDED.pedido_original,
+            data_venda           = EXCLUDED.data_venda,
+            codigo_anuncio       = EXCLUDED.codigo_anuncio,
+            quantidade           = EXCLUDED.quantidade,
+            preco_venda          = EXCLUDED.preco_venda,
+            desconto_parceiro    = EXCLUDED.desconto_parceiro,
+            desconto_marketplace = EXCLUDED.desconto_marketplace,
+            valor_venda_efetivo  = EXCLUDED.valor_venda_efetivo,
+            custo_unitario       = EXCLUDED.custo_unitario,
+            custo_total          = EXCLUDED.custo_total,
+            imposto              = EXCLUDED.imposto,
+            comissao             = EXCLUDED.comissao,
+            frete                = EXCLUDED.frete,
+            tarifa_fixa          = EXCLUDED.tarifa_fixa,
+            outros_custos        = EXCLUDED.outros_custos,
+            total_tarifas        = EXCLUDED.total_tarifas,
+            valor_liquido        = EXCLUDED.valor_liquido,
+            margem_total         = EXCLUDED.margem_total,
+            margem_percentual    = EXCLUDED.margem_percentual,
+            arquivo_origem       = EXCLUDED.arquivo_origem,
+            logistica            = EXCLUDED.logistica,
+            data_processamento   = NOW()
+        RETURNING (xmax = 0) AS inseriu
     """
 
     conn   = engine.raw_connection()
     cursor = conn.cursor()
+
+    # ------------------------------------------------------------------
+    # v2.5: REMOVER DO SNAPSHOT O QUE VEIO CANCELADO / DEVOLVIDO
+    #
+    # Roda antes das gravações. É o que faz o upload do mês fechado limpar
+    # os pedidos que foram cancelados depois do upload semanal — antes isso
+    # não acontecia e a venda cancelada ficava no banco indefinidamente.
+    # ------------------------------------------------------------------
+    removidas_count = 0
+    for d in (descartes or []):
+        try:
+            cursor.execute("SAVEPOINT sp_desc")
+            cursor.execute(
+                """DELETE FROM fact_vendas_snapshot
+                    WHERE marketplace_origem = %s AND loja_origem = %s
+                      AND numero_pedido = %s AND sku = %s""",
+                (marketplace, loja, d['pedido'], d['sku'])
+            )
+            if cursor.rowcount:
+                removidas_count += cursor.rowcount
+                try:
+                    gravar_venda_descartada(cursor, {
+                        'marketplace':     marketplace,
+                        'loja':            loja,
+                        'numero_pedido':   d['pedido'],
+                        'status_original': d.get('status_original', ''),
+                        'motivo_descarte': d.get('motivo', ''),
+                        'receita_estimada': d.get('receita', 0.0),
+                        'arquivo_origem':  arquivo_nome,
+                    })
+                except Exception:
+                    # Rastreio é desejável, mas não pode impedir a remoção.
+                    pass
+            cursor.execute("RELEASE SAVEPOINT sp_desc")
+        except Exception:
+            try:
+                cursor.execute("ROLLBACK TO SAVEPOINT sp_desc")
+            except Exception:
+                pass
 
     for idx, (_, row) in enumerate(df_vendas.iterrows()):
         sku = row['sku']
@@ -828,11 +929,8 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
         progress.progress(min((idx + 1) / total, 1.0))
         status_text.text(f"Gravando venda {idx + 1} de {total}...")
 
-        # ---- PROTEÇÃO DUPLICATA ----
-        chave = (pedido, sku)
-        if chave in duplicatas_existentes:
-            duplicatas_count += 1
-            continue
+        # v2.5: sem salto por duplicata — o upsert resolve. Contamos só para
+        # o relatório de upload continuar informando o que foi atualizado.
 
         # ---- SKU NÃO CADASTRADO → SALVAR COMO PENDENTE ----
         if sku not in skus_validos:
@@ -930,11 +1028,15 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
                 arquivo_nome,
                 row.get('logistica') or None,
             ))
+            # v2.5: o RETURNING devolve xmax = 0 quando foi INSERT e diferente
+            # de zero quando foi UPDATE. rowcount não serve — o Postgres reporta
+            # 1 nos dois casos. Serve para o relatório distinguir venda nova de
+            # linha corrigida.
+            _res = cursor.fetchone()
+            if _res is not None and not _res[0]:
+                atualizados_count += 1
             cursor.execute(f"RELEASE SAVEPOINT sp_shopee_{idx}")
             registros += 1
-
-            # Adicionar ao set de duplicatas (evita duplicata intra-arquivo)
-            duplicatas_existentes.add(chave)
 
         except Exception:
             try:
@@ -963,4 +1065,5 @@ def gravar_vendas_shopee(df_vendas: pd.DataFrame, marketplace: str, loja: str,
     except Exception:
         pass
 
-    return registros, erros, skus_invalidos, duplicatas_count, pendentes_count
+    return (registros, erros, skus_invalidos, duplicatas_count,
+            pendentes_count, removidas_count, atualizados_count)

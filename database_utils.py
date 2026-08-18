@@ -921,12 +921,22 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 logistica_final = item.get('logistica', None)
                 codigo_anuncio_final = item.get('codigo_anuncio', '')
 
+            # v3.7 FIX: os dois caminhos de reprocessamento gravavam zero fixo
+            # em desconto_parceiro e outros_custos. A venda pendente carrega os
+            # dois valores, mas eles eram descartados aqui — a linha entrava no
+            # snapshot sem o ajuste comercial e a margem saía inflada nesse
+            # valor. Mesmo bug que reprocessar_pendentes_por_sku tinha.
+            v_desconto_parceiro = float(item.get('desconto_parceiro', 0) or 0)
+            v_outros_custos     = float(item.get('outros_custos', 0) or 0)
+
             preco_venda = receita / qtd if qtd > 0 else receita
             custo_total = custo_unit * qtd
-            total_tarifas = v_comissao + v_taxa_fixa + v_frete
+            total_tarifas = v_comissao + v_taxa_fixa + v_frete + v_outros_custos
             valor_liquido = receita - total_tarifas - imposto_val
             margem_total = valor_liquido - custo_total
-            margem_pct = (margem_total / receita * 100) if receita > 0 else 0
+            # Base do percentual é a receita de NF, coerente com a v2.4 da Shopee.
+            base_pct = receita - v_desconto_parceiro
+            margem_pct = (margem_total / base_pct * 100) if base_pct > 0 else 0
 
             cursor.execute(f"SAVEPOINT manual_{id_pendente}")
 
@@ -937,9 +947,9 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 item.get('data_venda'),
                 sku,
                 codigo_anuncio_final,
-                qtd, preco_venda, 0, 0,
+                qtd, preco_venda, v_desconto_parceiro, 0,
                 receita, custo_unit, custo_total, imposto_val, v_comissao,
-                v_frete, v_taxa_fixa, 0, total_tarifas, valor_liquido,
+                v_frete, v_taxa_fixa, v_outros_custos, total_tarifas, valor_liquido,
                 margem_total, margem_pct,
                 item.get('arquivo_origem', ''),
                 logistica_final
