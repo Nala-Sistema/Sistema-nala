@@ -2,6 +2,27 @@
 PROCESSADOR SHOPEE - Sistema Nala
 Processa arquivos de vendas da Shopee (.xlsx exportado do painel)
 
+VERSÃO 2.4 (18/08/2026) — auditoria do subsídio PIX:
+  - FIX (A): carrinho não soma mais o ajuste uma vez por linha. O arquivo repete os
+         valores do PEDIDO em cada linha (validado em 8 carrinhos de 4 arquivos —
+         só 'Subtotal do produto' é por linha). Agora os valores do pedido são
+         rateados entre as linhas na proporção do subtotal.
+  - FIX (B): imposto passa a incidir sobre o valor da NOTA, não sobre o preço de
+         tabela. Confirmado por 3 documentos fiscais (DANFE 4833/7, DANFE 4141/7,
+         NF-e 43085/6): a nota sai sempre pelo valor com desconto.
+  - FIX (C): margem % passa a ser calculada sobre a receita de NF, não sobre o
+         subtotal bruto. É o mesmo efeito que a Shopee mostra (81% cartão vs 88% PIX).
+  - FIX (E2): o ajuste é DERIVADO de (bruta − líquida) em vez de lido da coluna.
+         Pedidos chegaram com 'Ajuste por ação comercial' zerado enquanto a comissão
+         já vinha abatida — o sistema contava o subsídio da Shopee como lucro nosso.
+  - NOVO: alerta no upload quando a comissão bruta vem abaixo da tabela oficial
+         (rede de segurança caso bruta e líquida cheguem ambas já abatidas).
+  - NOVO: lê 'Incentivo de cupom' — é CRÉDITO da Shopee, não custo. Entra na renda
+         e fica fora da base de imposto.
+  - Fórmula validada contra o relatório de transações da Shopee:
+         485 de 517 pedidos fecharam no centavo (os 32 restantes são cobrança de
+         frete por divergência de peso, que não existe no export de pedidos).
+
 VERSÃO 2.3 (08/04/2026):
   - FIX: Inclui coluna "Ajuste por participação em ação comercial" no cálculo de margem
          Essa coluna captura descontos PIX e outros ajustes promocionais que a Shopee aplica.
@@ -20,15 +41,27 @@ VERSÃO 2.1 (18/03/2026):
   - FIX: Barra de progresso agora mostra texto com contagem de pedidos
   - Mantido: Toda lógica v2.0 intacta
 
-REGRAS DE NEGÓCIO:
-- Receita = Subtotal do produto (Preço acordado × Qtd)
-- Comissão pedidos simples: Net Commission Fee + Taxa de serviço líquida (valor do arquivo)
-- Comissão carrinhos compostos: calculada pela tabela oficial (arquivo repete valor total em cada linha)
-- Imposto: Subtotal × alíquota da loja (dim_lojas)
-- Cupom do vendedor: deduzido da margem quando > 0
-- Ajuste por participação em ação comercial: deduzido da margem (PIX, promos, etc.) — v2.3
-- Frete: IGNORADO (Shopee retém, não passa ao vendedor)
-- Verificação de comissão: alerta quando valor cobrado diverge da tabela vigente
+REGRAS DE NEGÓCIO (v2.4):
+
+    ajuste      = (comissão bruta − líquida) + (serviço bruta − líquida)
+    receita_nf  = subtotal − ajuste − incentivo_cupom − cupom_vendedor
+    renda       = subtotal − ajuste − cupom_vendedor − taxas_líquidas
+    imposto     = receita_nf × alíquota da loja (dim_lojas)
+    margem      = renda − imposto − custo
+    margem_%    = margem ÷ receita_nf
+
+- valor_venda_efetivo continua sendo o SUBTOTAL BRUTO, por compatibilidade com os
+  demais marketplaces e com os 139 pontos do sistema que leem esse campo.
+  Quem precisar do faturamento real usa: valor_venda_efetivo − desconto_parceiro.
+- O subsídio da Shopee (PIX + cupom dela) é NEUTRO: ela desconta do comprador e
+  devolve ao vendedor abatendo a comissão. Por isso entra dos dois lados.
+- Incentivo de cupom: CRÉDITO da Shopee. Já está embutido na renda (porque o
+  ajuste vem líquido dele) e é excluído da base de imposto.
+- Carrinhos: valores do pedido rateados por linha na proporção do subtotal.
+- Frete: IGNORADO. Existe cobrança por divergência de peso (medida em R$ 79,13
+  em 29 de 517 pedidos), mas ela não aparece no export de pedidos — só no
+  relatório de transações. Tratada fora do sistema por enquanto.
+- Verificação de comissão: alerta quando o valor do arquivo diverge da tabela vigente
 
 TABELA DE COMISSÕES (válida a partir de 01/03/2026, aplicada POR ITEM):
 - Até R$ 79,99:         20% + R$ 4,00
@@ -252,14 +285,28 @@ def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
         col_norm = str(col).lower().strip()
         
+        # v2.4: Comissão BRUTA — base para derivar o ajuste comercial.
+        # Precisa vir antes da líquida para não ser capturada pela condição abaixo.
+        if col_norm in ['taxa de comissão bruta', 'taxa de comissao bruta']:
+            rename_map[col] = 'Taxa de comissão bruta'
+
         # Mapeamento: Net Commission Fee / Taxa de comissão líquida
-        if col_norm in ['net commission fee', 'taxa de comissão líquida', 'taxa de comissao liquida']:
+        elif col_norm in ['net commission fee', 'taxa de comissão líquida', 'taxa de comissao liquida']:
             rename_map[col] = 'Net Commission Fee'
-            
+
+        # v2.4: Serviço BRUTA — segunda metade do ajuste
+        elif ('taxa de serviço' in col_norm or 'taxa de servico' in col_norm) and 'bruta' in col_norm:
+            rename_map[col] = 'Taxa de serviço bruta'
+
         # Mapeamento: Taxa de serviço líquida (exclui 'bruta' — Shopee passou a exportar ambas)
         elif ('taxa de serviço' in col_norm or 'taxa de servico' in col_norm) and 'bruta' not in col_norm:
             rename_map[col] = 'Taxa de serviço líquida'
-            
+
+        # v2.4: parte do cupom da Shopee paga como crédito direto em vez de
+        # abatimento de comissão. No extrato aparece com sinal POSITIVO.
+        elif col_norm in ['incentivo de cupom', 'incentivo do cupom']:
+            rename_map[col] = 'Incentivo de cupom'
+
         # Mapeamento: ID do Pedido (Garante que espaços não quebrem a detecção)
         elif col_norm == 'id do pedido':
             rename_map[col] = 'ID do pedido'
@@ -349,6 +396,37 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
         else:
             df['Ajuste por participação em ação comercial'] = 0.0
 
+        # v2.4: Incentivo de cupom — parte do cupom que a Shopee paga como crédito
+        # direto. É receita, não custo, e fica fora da base de imposto.
+        if 'Incentivo de cupom' in df.columns:
+            df['Incentivo de cupom'] = df['Incentivo de cupom'].apply(_limpar_numero)
+        else:
+            df['Incentivo de cupom'] = 0.0
+
+        # v2.4: taxas BRUTAS — usadas para derivar o ajuste
+        for _col_bruta in ('Taxa de comissão bruta', 'Taxa de serviço bruta'):
+            if _col_bruta in df.columns:
+                df[_col_bruta] = df[_col_bruta].apply(_limpar_numero)
+            else:
+                df[_col_bruta] = 0.0
+
+        # v2.4 FIX (E2): o ajuste é DERIVADO da diferença bruta − líquida, não lido
+        # da coluna. Houve pedidos com a coluna zerada enquanto a comissão já vinha
+        # abatida — o sistema lia "comissão baixa, desconto nenhum" e contava o
+        # subsídio da Shopee como lucro nosso.
+        # A identidade fechou em 1.433 de 1.433 linhas em 4 arquivos.
+        tem_brutas = (df['Taxa de comissão bruta'].abs().sum() > 0
+                      or df['Taxa de serviço bruta'].abs().sum() > 0)
+
+        if tem_brutas:
+            df['_ajuste_derivado'] = (
+                (df['Taxa de comissão bruta'] - df['Net Commission Fee'])
+                + (df['Taxa de serviço bruta'] - df['Taxa de serviço líquida'])
+            ).clip(lower=0).round(2)
+        else:
+            # Layout antigo, sem colunas brutas: só resta o valor declarado.
+            df['_ajuste_derivado'] = df['Ajuste por participação em ação comercial']
+
         # --------------------------------------------------
         # 4. FILTRAR REGISTROS INVÁLIDOS
         # --------------------------------------------------
@@ -382,16 +460,56 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             return None, "Nenhuma venda válida encontrada após filtros."
 
         # --------------------------------------------------
-        # 5. DETECTAR CARRINHOS COMPOSTOS
+        # 5. CARRINHOS: RATEAR OS VALORES DO PEDIDO ENTRE AS LINHAS
+        #
+        # v2.4 FIX (A): o arquivo repete os valores do PEDIDO INTEIRO em cada
+        # linha — só 'Subtotal do produto' é por linha. Validado em 8 carrinhos
+        # de 4 arquivos: ajuste, taxas líquidas e cupom do vendedor vieram
+        # idênticos em 8/8; o subtotal variou em 8/8.
+        #
+        # Antes, cada linha subtraía o ajuste do pedido inteiro. Um pedido de
+        # R$ 69,98 com ajuste de R$ 20,60 tinha R$ 41,20 descontados e virava
+        # prejuízo de R$ 34,72 quando o lucro real era R$ 8,39.
         # --------------------------------------------------
         contagem_pedidos = df_valido['ID do pedido'].value_counts()
         ids_carrinho = set(contagem_pedidos[contagem_pedidos > 1].index)
 
+        _grupo = df_valido.groupby('ID do pedido')
+        _subtotal_pedido = _grupo['Subtotal do produto'].transform('sum')
+
+        # Proporção da linha dentro do pedido. Pedido de item único → 1,0.
+        df_valido['_proporcao'] = np.where(
+            _subtotal_pedido > 0,
+            df_valido['Subtotal do produto'] / _subtotal_pedido,
+            1.0 / _grupo['Subtotal do produto'].transform('size'),
+        )
+
+        df_valido['_taxas_liquidas_linha'] = (
+            df_valido['Net Commission Fee'] + df_valido['Taxa de serviço líquida']
+        )
+
+        # Valores do pedido: pega UMA vez (não soma) e rateia.
+        _rateio = {
+            '_ajuste':     '_ajuste_derivado',
+            '_taxas_liq':  '_taxas_liquidas_linha',
+            '_cupom_vend': 'Cupom do vendedor',
+            '_inc_cupom':  'Incentivo de cupom',
+        }
+
+        for destino, origem in _rateio.items():
+            df_valido[destino] = (
+                df_valido.groupby('ID do pedido')[origem].transform('first')
+                * df_valido['_proporcao']
+            ).round(2)
+
         # --------------------------------------------------
         # 6. PROCESSAR LINHA A LINHA
         # --------------------------------------------------
-        resultados      = []
+        resultados       = []
         alertas_comissao = []
+        # v2.4: linhas em que a comissão cheia ficou abaixo da tabela oficial —
+        # sinal de arquivo exportado antes da liquidação do ajuste.
+        alertas_arquivo_incompleto = []
 
         # Identificar coluna de data disponível
         colunas_data_candidatas = [
@@ -417,12 +535,13 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             if not codigo_anuncio:
                 codigo_anuncio = sku
 
-            # Valores financeiros
+            # Valores financeiros — já rateados por linha (v2.4)
             preco_unitario  = _limpar_numero(row['Preço acordado'])
             quantidade      = int(_limpar_numero(row['Quantidade']))
             subtotal        = _limpar_numero(row['Subtotal do produto'])
-            cupom_vendedor  = _limpar_numero(row.get('Cupom do vendedor', 0))
-            ajuste_comercial = _limpar_numero(row.get('Ajuste por participação em ação comercial', 0))  # v2.3
+            cupom_vendedor  = _limpar_numero(row.get('_cupom_vend', 0))
+            ajuste_comercial = _limpar_numero(row.get('_ajuste', 0))
+            incentivo_cupom = _limpar_numero(row.get('_inc_cupom', 0))
 
             if subtotal == 0 and preco_unitario > 0:
                 subtotal = preco_unitario * quantidade
@@ -442,36 +561,58 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
                 data_venda = datetime.now().date()
 
             # --------------------------------------------------
-            # 7. CALCULAR COMISSÃO
+            # 7. COMISSÃO
+            #
+            # v2.4: sempre o valor líquido do arquivo, rateado. Não existe mais
+            # caminho separado para carrinho — o rateio já resolveu a repetição.
+            # A tabela oficial serve só de conferência.
             # --------------------------------------------------
-            if is_carrinho:
-                # Arquivo repete o total do pedido em cada linha — usar tabela por item
-                comissao       = calcular_comissao_shopee(preco_unitario, quantidade)
-                fonte_comissao = 'calculada_tabela'
-            else:
-                # Pedido simples: valor direto do arquivo é confiável
-                comissao       = _limpar_numero(row['Net Commission Fee']) + \
-                                 _limpar_numero(row['Taxa de serviço líquida'])
-                fonte_comissao = 'arquivo'
+            comissao       = round(_limpar_numero(row.get('_taxas_liq', 0)), 2)
+            fonte_comissao = 'arquivo'
 
-                # Verificar divergência com tabela oficial
-                comissao_esperada = calcular_comissao_shopee(preco_unitario, quantidade)
-                divergencia       = comissao - comissao_esperada
-                tolerancia        = max(0.50, comissao_esperada * 0.05)  # 5% ou R$0,50
+            comissao_esperada = calcular_comissao_shopee(preco_unitario, quantidade)
+            tolerancia        = max(0.50, comissao_esperada * 0.05)  # 5% ou R$0,50
 
-                if abs(divergencia) > tolerancia:
-                    alertas_comissao.append({
-                        'pedido':             pedido_id,
-                        'sku':                sku,
-                        'comissao_arquivo':   round(comissao, 2),
-                        'comissao_esperada':  round(comissao_esperada, 2),
-                        'divergencia':        round(divergencia, 2),
-                    })
+            # A comissão CHEIA é a líquida somada ao subsídio devolvido. É ela que
+            # deve bater com a tabela — comparar a líquida sozinha acusaria
+            # divergência em todo pedido com desconto.
+            comissao_cheia = comissao + ajuste_comercial
+            divergencia    = comissao_cheia - comissao_esperada
+
+            if abs(divergencia) > tolerancia:
+                alertas_comissao.append({
+                    'pedido':             pedido_id,
+                    'sku':                sku,
+                    'comissao_arquivo':   round(comissao_cheia, 2),
+                    'comissao_esperada':  round(comissao_esperada, 2),
+                    'divergencia':        round(divergencia, 2),
+                })
+
+            # v2.4: rede de segurança contra o Erro E2. Se a comissão CHEIA vier
+            # bem abaixo da tabela, o arquivo provavelmente chegou com bruta e
+            # líquida ambas já abatidas — e aí o ajuste derivado dá zero e o
+            # subsídio da Shopee some do cálculo, inflando a margem.
+            if comissao_cheia < comissao_esperada - tolerancia:
+                alertas_arquivo_incompleto.append({
+                    'pedido':            pedido_id,
+                    'sku':               sku,
+                    'comissao_no_arquivo': round(comissao_cheia, 2),
+                    'comissao_tabela':   round(comissao_esperada, 2),
+                    'diferenca':         round(comissao_esperada - comissao_cheia, 2),
+                })
 
             # --------------------------------------------------
-            # 8. IMPOSTO
+            # 8. RECEITA DE NF E IMPOSTO
+            #
+            # v2.4 FIX (B): a nota sai pelo valor com desconto — confirmado em
+            # DANFE 4833/7, DANFE 4141/7 e NF-e 43085/6. O imposto acompanha.
+            # O incentivo de cupom é crédito da Shopee: entra na renda, mas não
+            # no faturamento, então sai da base.
             # --------------------------------------------------
-            imposto_valor = round(subtotal * (imposto / 100), 2)
+            receita_nf    = round(subtotal - ajuste_comercial - incentivo_cupom - cupom_vendedor, 2)
+            if receita_nf < 0:
+                receita_nf = 0.0
+            imposto_valor = round(receita_nf * (imposto / 100), 2)
 
             # Título do produto (Nome do Produto) — usado para o dicionário
             # título→SKU do módulo de Ads (match automático anúncio↔SKU).
@@ -489,11 +630,13 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
                 'logistica':         classificar_logistica_shopee(row),
                 'qtd':               quantidade,
                 'preco_unit':        preco_unitario,
-                'receita':           subtotal,
+                'receita':           subtotal,      # subtotal bruto (compat. c/ outros canais)
+                'receita_nf':        receita_nf,    # v2.4: base do imposto e da margem %
                 'tarifa':            round(comissao, 2),
                 'imposto':           imposto_valor,
                 'cupom_vendedor':    cupom_vendedor,
                 'ajuste_comercial':  ajuste_comercial,  # v2.3: PIX, promos, etc.
+                'incentivo_cupom':   incentivo_cupom,   # v2.4: crédito da Shopee
                 'frete':             0.0,
                 'custo':             0.0,       # preenchido após busca no banco
                 'custo_unit':        0.0,
@@ -518,21 +661,33 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
         df_proc['tem_custo']  = df_proc['custo'] > 0
 
         # --------------------------------------------------
-        # 10. CALCULAR MARGEM
-        # v2.3: Inclui ajuste_comercial na dedução
-        # Fórmula: Subtotal - Comissão - Imposto - Cupom - Ajuste - Custo
+        # 10. CALCULAR MARGEM (v2.4)
+        #
+        #   renda    = subtotal − ajuste − cupom_vendedor − taxas_líquidas
+        #   margem   = renda − imposto − custo
+        #   margem_% = margem ÷ receita_nf        ← FIX (C)
+        #
+        # A renda reproduz o que a Shopee efetivamente deposita: validada contra
+        # o relatório de transações em 485 de 517 pedidos, no centavo.
+        # O incentivo de cupom não aparece aqui porque já está embutido — o
+        # ajuste vem líquido dele, então não subtraí-lo equivale a somá-lo.
         # --------------------------------------------------
-        df_proc['margem'] = (
+        df_proc['renda'] = (
             df_proc['receita']
-            - df_proc['tarifa']
-            - df_proc['imposto']
-            - df_proc['cupom_vendedor']
             - df_proc['ajuste_comercial']
+            - df_proc['cupom_vendedor']
+            - df_proc['tarifa']
+        ).round(2)
+
+        df_proc['margem'] = (
+            df_proc['renda']
+            - df_proc['imposto']
             - df_proc['custo']
         ).round(2)
 
+        # FIX (C): denominador é a receita de NF, não o preço de tabela.
         df_proc['margem_pct'] = df_proc.apply(
-            lambda r: round((r['margem'] / r['receita'] * 100), 2) if r['receita'] > 0 else 0.0,
+            lambda r: round((r['margem'] / r['receita_nf'] * 100), 2) if r['receita_nf'] > 0 else 0.0,
             axis=1
         )
 
@@ -556,6 +711,12 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
             'skus_sem_custo':     skus_sem_custo,
             'carrinhos':          len(ids_carrinho),
             'alertas_comissao':   alertas_comissao,
+            # v2.4: rede de segurança do Erro E2
+            'alertas_arquivo_incompleto': alertas_arquivo_incompleto,
+            'ajuste_derivado':    bool(tem_brutas),
+            'total_ajuste':       round(float(df_proc['ajuste_comercial'].sum()), 2),
+            'receita_bruta':      round(float(df_proc['receita'].sum()), 2),
+            'receita_nf':         round(float(df_proc['receita_nf'].sum()), 2),
         }
 
         return df_proc, info

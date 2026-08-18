@@ -118,6 +118,40 @@ def _converter_data_br_para_banco(data_str):
     except: return str(data_str).strip()
 
 
+def _exibir_alerta_arquivo_incompleto(info):
+    """
+    Shopee v2.4 — rede de segurança contra o Erro E2.
+
+    Já aconteceu de o arquivo chegar com a comissão já abatida do subsídio mas
+    sem o valor do desconto declarado. O sistema lia "comissão baixa, desconto
+    nenhum" e contava o subsídio da Shopee como lucro nosso — um SKU chegou a
+    aparecer com 20,9% de margem quando a real era 14,6%.
+
+    Aqui o aviso sai na hora do upload, não meses depois.
+    """
+    alertas = info.get('alertas_arquivo_incompleto') or []
+    if not alertas:
+        return
+
+    falta = sum(a['diferenca'] for a in alertas)
+    st.error(
+        f"🚨 **{len(alertas)} linha(s) com comissão abaixo da tabela oficial "
+        f"(faltam {formatar_valor(falta)})**\n\n"
+        "O arquivo pode ter sido exportado antes de a Shopee liquidar o ajuste "
+        "comercial. Nesse caso a margem sai **inflada**. Reexporte o período no "
+        "Seller Center e suba de novo antes de gravar."
+    )
+    with st.expander(f"🔍 Ver linhas suspeitas ({len(alertas)})", expanded=False):
+        df_a = pd.DataFrame(alertas).rename(columns={
+            'pedido': 'Pedido', 'sku': 'SKU',
+            'comissao_no_arquivo': 'No arquivo (R$)',
+            'comissao_tabela': 'Pela tabela (R$)',
+            'diferenca': 'Falta (R$)'})
+        for c in ['No arquivo (R$)', 'Pela tabela (R$)', 'Falta (R$)']:
+            df_a[c] = df_a[c].apply(formatar_valor)
+        st.dataframe(df_a, use_container_width=True, hide_index=True)
+
+
 def _exibir_alertas_comissao(alertas):
     if not alertas: return
     st.warning(f"⚠️ **{len(alertas)} pedido(s) com comissão diferente da tabela vigente**")
@@ -704,6 +738,7 @@ def tab_processar_upload(engine):
             st.warning(f"⚠️ {len(info['pendentes_carrinho'])} venda(s) com divergência financeira")
         if mp_key == 'SHOPEE':
             _exibir_alertas_comissao(info.get('alertas_comissao', []))
+            _exibir_alerta_arquivo_incompleto(info)
         if mp_key == 'TIKTOK' and info.get('skus_nao_mapeados', 0) > 0:
             st.warning(f"⚠️ {info['skus_nao_mapeados']} SKU(s) TikTok sem mapeamento — irão para pendentes. Mapeie na aba 'Vendas Pendentes' e reprocesse.")
         if mp_key == 'TIKTOK' and info.get('pendentes_emespera'):
