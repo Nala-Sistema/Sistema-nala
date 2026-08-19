@@ -261,6 +261,8 @@ def ler_custos_armazenamento_mensal(caminho):
     # tem SKU, entao filtrar por SKU preenchido ja descarta.
     prod = df[df[col_sku].notna() & (df[col_sku].astype(str).str.strip() != '')]
 
+    ultimo_dia_relatorio = max(pd.to_datetime(c, dayfirst=True) for c in cols_dia)
+
     linhas = []
     for _, row in prod.iterrows():
         sku = _texto(row[col_sku])
@@ -279,7 +281,11 @@ def ler_custos_armazenamento_mensal(caminho):
 
         for (ano, mes), total_mes in sorted(por_mes.items()):
             ini = pd.Timestamp(year=ano, month=mes, day=1)
-            fim = ini + pd.offsets.MonthEnd(0)
+            # periodo_fim e o ultimo dia COBERTO PELO RELATORIO, nao o fim do
+            # mes calendario. O mes corrente vem sempre parcial (o ciclo do ML
+            # vai ate o dia 19), e gravar 31/08 faria o painel de status dizer
+            # que agosto esta completo quando falta metade.
+            fim = min(ini + pd.offsets.MonthEnd(0), ultimo_dia_relatorio)
             for mlb, parte in zip(mlbs, dividir_em_centavos(total_mes, len(mlbs))):
                 if parte == 0:
                     continue

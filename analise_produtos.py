@@ -802,6 +802,100 @@ def _historico_uploads_estoque(engine):
 # ENTRYPOINT
 # ============================================================
 
+# ============================================================
+# PAINEL DE STATUS DOS CUSTOS DE FULL
+# ============================================================
+
+_TIPOS_FULL = [
+    ('FULL_ARMAZENAGEM',            'Armazenagem',   'Custos por serviço de armazenamento'),
+    ('FULL_COLETA',                 'Coleta',        'Relatório de Tarifas Full'),
+    ('FULL_ARMAZENAGEM_PROLONGADA', 'Estoque antigo','Relatório de Tarifas Full'),
+]
+
+
+def _painel_status_full(engine):
+    """
+    Matriz loja x tipo de custo com a data até onde cada um está atualizado.
+
+    Mesma ideia do panorama da tela de Início, que mostra até quando as vendas
+    de cada loja foram carregadas. Aqui o gestor precisa saber duas coisas de
+    relance: o que já subiu e o que está atrasado.
+
+    O semáforo usa a data final do período coberto, não a data em que o
+    arquivo foi subido — subir hoje um relatório que vai até junho não deixa
+    o dado atualizado, e mostrar a data de upload esconderia isso.
+    """
+    st.markdown("#### 📊 Status dos custos de Full")
+
+    try:
+        dados = pd.read_sql("""
+            SELECT l.loja,
+                   c.tipo,
+                   MAX(c.periodo_fim)     AS ate,
+                   MAX(c.data_lancamento) AS subido_em
+            FROM dim_lojas l
+            LEFT JOIN fact_custos_extras c
+                   ON c.loja = l.loja AND c.tipo LIKE 'FULL%%'
+            WHERE l.marketplace = 'MERCADO LIVRE'
+              AND COALESCE(l.visivel_no_painel, TRUE)
+            GROUP BY l.loja, c.tipo
+        """, engine)
+    except Exception:
+        st.caption("Status indisponível.")
+        return
+
+    if dados.empty:
+        st.caption("Nenhuma loja de Mercado Livre cadastrada.")
+        return
+
+    hoje = pd.Timestamp(date.today())
+    idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows() if pd.notna(r['tipo'])}
+    lojas = sorted(dados['loja'].dropna().unique())
+
+    def _celula(loja, tipo):
+        r = idx.get((loja, tipo))
+        if r is None or pd.isna(r['ate']):
+            return ('#fdecea', '#b71c1c', 'nunca enviado')
+        ate = pd.Timestamp(r['ate'])
+        dias = (hoje - ate).days
+        txt = f"até {ate:%d/%m/%Y}"
+        if dias <= 20:
+            return ('#e8f5e9', '#1b5e20', txt)          # em dia
+        if dias <= 50:
+            return ('#fff8e1', '#8d6e00', f"{txt} · {dias}d")   # atenção
+        return ('#fdecea', '#b71c1c', f"{txt} · {dias}d")       # atrasado
+
+    html = ["<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"]
+    html.append("<tr style='background:#f2f2f2'><th style='padding:8px;text-align:left'>Loja</th>")
+    for _, rotulo, _ in _TIPOS_FULL:
+        html.append(f"<th style='padding:8px;text-align:center'>{rotulo}</th>")
+    html.append("<th style='padding:8px;text-align:left'>O que falta subir</th></tr>")
+
+    for loja in lojas:
+        html.append(f"<tr><td style='padding:8px;border-top:1px solid #eee'><b>{loja}</b></td>")
+        pendentes = set()
+        for tipo, _, arquivo in _TIPOS_FULL:
+            bg, fg, txt = _celula(loja, tipo)
+            if bg != '#e8f5e9':
+                pendentes.add(arquivo)
+            html.append(
+                f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
+                f"background:{bg};color:{fg}'>{txt}</td>"
+            )
+        acao = ' + '.join(sorted(pendentes)) if pendentes else '—'
+        html.append(
+            f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>"
+        )
+    html.append("</table>")
+    st.markdown(''.join(html), unsafe_allow_html=True)
+    st.caption(
+        "A data é até onde o custo está coberto, não quando o arquivo foi subido. "
+        "Verde: coberto nos últimos 20 dias · Amarelo: até 50 dias · Vermelho: mais que isso ou nunca enviado. "
+        "Baixe sempre o relatório acumulado mais completo — subir de novo não duplica."
+    )
+    st.divider()
+
+
 def _tab_despesas_full(engine):
     """
     Tab de upload dos relatorios de custo de Full.
@@ -823,6 +917,7 @@ def _tab_despesas_full(engine):
 
 def _render_despesas_full(engine):
     st.subheader("💸 Despesas de Full")
+    _painel_status_full(engine)
     st.caption(
         "Suba aqui os relatórios de custo do Full: **custos de armazenagem** e "
         "**custos de coleta**. O sistema reconhece sozinho qual é qual. "
