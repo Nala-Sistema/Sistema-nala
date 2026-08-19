@@ -730,6 +730,136 @@ def _render_tab_geral(engine, ano_mes):
 # MAIN
 # ============================================================
 
+# ============================================================
+# TAB — MARGEM REAL (fechamento mensal)
+# ============================================================
+
+def _render_tab_margem_real(engine, ano_mes):
+    """
+    Fechamento mensal: margem contabil menos os custos que nao estao na venda.
+
+    Deliberadamente separada das telas de Inicio e Vendas. As vendas entram
+    diariamente; os custos de Full fecham por quinzena e chegam com atraso.
+    Descontar um do outro num painel diario faria a margem parecer alta nos
+    dias sem custo lancado e despencar no dia do lancamento — daria aparencia
+    de queda onde houve apenas contabilizacao.
+
+    Mes sem custo lancado aparece como NAO APURADO, nunca com a margem
+    contabil disfarcada de real. Mostrar 11,6% como se fosse liquido e
+    exatamente o problema que este trabalho existe para corrigir.
+    """
+    from permissoes import ve_todas_lojas, get_lojas_usuario
+
+    ano, mes = int(ano_mes[:4]), int(ano_mes[5:7])
+    ini = date(ano, mes, 1)
+    fim = date(ano + (mes == 12), (mes % 12) + 1, 1)
+
+    lojas_rbac = None if ve_todas_lojas() else get_lojas_usuario(engine)
+    if lojas_rbac is not None and not lojas_rbac:
+        st.info("Nenhuma loja atribuída ao seu perfil.")
+        return
+
+    filtro = ""
+    params = {'ini': ini, 'fim': fim}
+    if lojas_rbac:
+        filtro = " AND loja_origem = ANY(%(lojas)s)"
+        params['lojas'] = list(lojas_rbac)
+
+    try:
+        vendas = pd.read_sql(f"""
+            SELECT loja_origem AS loja,
+                   SUM(valor_venda_efetivo) AS receita,
+                   SUM(margem_total)        AS margem_contabil
+            FROM fact_vendas_snapshot
+            WHERE data_venda >= %(ini)s AND data_venda < %(fim)s {filtro}
+            GROUP BY loja_origem
+        """, engine, params=params)
+
+        filtro_c = filtro.replace('loja_origem', 'loja')
+        custos = pd.read_sql(f"""
+            SELECT loja,
+                   SUM(valor) FILTER (WHERE tipo LIKE 'FULL%%') AS full_total,
+                   SUM(valor) FILTER (WHERE tipo = 'ADS')       AS ads_total,
+                   SUM(valor) FILTER (WHERE tipo NOT LIKE 'FULL%%' AND tipo <> 'ADS') AS outros
+            FROM fact_custos_extras
+            WHERE periodo_inicio >= %(ini)s AND periodo_inicio < %(fim)s {filtro_c}
+            GROUP BY loja
+        """, engine, params=params)
+    except Exception as e:
+        st.error(f"Não foi possível carregar o fechamento: {e}")
+        return
+
+    if vendas.empty:
+        st.info("Sem vendas no mês selecionado.")
+        return
+
+    df = vendas.merge(custos, on='loja', how='left')
+    for c in ('receita', 'margem_contabil', 'full_total', 'ads_total', 'outros'):
+        df[c] = pd.to_numeric(df.get(c), errors='coerce').fillna(0.0)
+
+    df['apurado'] = df['full_total'] > 0
+    df['margem_real'] = df['margem_contabil'] - df['full_total'] - df['ads_total'] - df['outros']
+    df = df.sort_values('receita', ascending=False)
+
+    apuradas = df[df['apurado']]
+    n_pend = int((~df['apurado']).sum())
+
+    if apuradas.empty:
+        st.warning(
+            f"Nenhuma loja com custo de Full lançado em {ano_mes}. "
+            "Suba os relatórios em **Análise de Produtos → Despesas de Full** "
+            "para este mês ser apurado."
+        )
+    else:
+        rec = apuradas['receita'].sum()
+        mc = apuradas['margem_contabil'].sum()
+        mr = apuradas['margem_real'].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Receita (lojas apuradas)", _brl(rec))
+        c2.metric("Margem contábil", f"{100*mc/rec:.1f}%" if rec else "—", _brl(mc))
+        c3.metric("Margem real", f"{100*mr/rec:.1f}%" if rec else "—",
+                  f"{_brl(mr)}  ({_brl(mr-mc)})", delta_color="inverse")
+        if n_pend:
+            st.caption(
+                f"⚠️ {n_pend} loja(s) fora do cálculo por não terem custo de Full lançado "
+                f"neste mês — aparecem como *não apurado* na tabela."
+            )
+
+    linhas = []
+    for _, r in df.iterrows():
+        if r['apurado']:
+            pct = f"{100*r['margem_real']/r['receita']:.1f}%" if r['receita'] else "—"
+            real, marca = _brl(r['margem_real']), pct
+        else:
+            real, marca = "não apurado", "—"
+        linhas.append({
+            'Loja': r['loja'],
+            'Receita': _brl(r['receita']),
+            'Margem contábil': _brl(r['margem_contabil']),
+            '% contábil': f"{100*r['margem_contabil']/r['receita']:.1f}%" if r['receita'] else "—",
+            '− Full': _brl(-r['full_total']) if r['full_total'] else "—",
+            '− Ads': _brl(-r['ads_total']) if r['ads_total'] else "—",
+            'Margem real': real,
+            '% real': marca,
+        })
+    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+
+    if (df['ads_total'] == 0).all():
+        st.caption(
+            "A coluna de Ads ainda está vazia: o módulo de Ads passará a gravar o "
+            "gasto por anúncio em `fact_custos_extras`. Até lá a margem real está "
+            "líquida apenas de Full, então ainda é otimista."
+        )
+
+
+def _brl(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "R$ 0,00"
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 MARKETPLACES = [
     ("🛒 Mercado Livre", "MERCADO LIVRE"),
     ("📦 Amazon", "AMAZON"),
@@ -747,7 +877,7 @@ def main():
     engine = get_engine()
     ano_mes = _seletor_mes()
 
-    tab_names = [m[0] for m in MARKETPLACES]
+    tab_names = [m[0] for m in MARKETPLACES] + ["💰 Margem Real"]
     tabs = st.tabs(tab_names)
 
     for i, (label, mktp_code) in enumerate(MARKETPLACES):
@@ -756,6 +886,13 @@ def main():
                 _render_tab_geral(engine, ano_mes)
             else:
                 _render_tab_marketplace(engine, mktp_code, ano_mes)
+
+    with tabs[len(MARKETPLACES)]:
+        try:
+            _render_tab_margem_real(engine, ano_mes)
+        except Exception as e:
+            st.error("Esta aba encontrou um erro e foi isolada.")
+            st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":
