@@ -514,8 +514,11 @@ def identificar_loja(engine, codigos_anuncio, marketplace='MERCADO LIVRE'):
 # STATUS / COBRANCA DE ROTINA
 # ============================================================
 
-# Prazos de envio: a cada 15 dias, ate o dia 3 e ate o dia 18.
-# Escolhidos com o Thiago a partir do ciclo do ML, que fecha no dia 19.
+# Rotina de envio por QUINZENA, com 3 dias de folga para fechar:
+#   quinzena 01-15  -> prazo dia 18 do mesmo mes
+#   quinzena 16-fim -> prazo dia 03 do mes seguinte
+# (Nao confundir com o ciclo de faturamento do ML, que vai do dia 20 ao 19 —
+#  sao coisas diferentes.)
 DIAS_PRAZO = (3, 18)
 
 TIPOS_FULL = [
@@ -561,22 +564,24 @@ def proximo_prazo(hoje=None):
     return min(futuros)
 
 
-def status_custos_full(engine, marketplace='MERCADO LIVRE'):
+def status_custos_full(engine, marketplace='MERCADO LIVRE', lojas=None):
     """
-    Status de envio dos custos de Full, por loja e tipo.
+    Status dos custos de Full por loja e tipo, cobrando a quinzena vencida.
 
-    A cobranca e sobre a ROTINA: houve upload desde o ultimo prazo? Uma loja
-    pode estar com o dado coberto ate ontem e ainda assim precisar de um envio
-    novo no proximo ciclo, e e isso que o gestor precisa ver.
+    A cobranca e sobre COBERTURA (`periodo_fim`), nao sobre data de upload:
+    nos dados reais o Thiago subiu tudo no mesmo dia e ainda assim varias
+    lojas seguiam descobertas, porque os arquivos disponiveis eram de julho.
+    Um semaforo baseado em "enviei hoje" ficaria todo verde escondendo a
+    lacuna.
 
-    A data de cobertura vai junto porque diz outra coisa: ate quando o custo
-    esta lancado. Subir hoje um relatorio que termina em junho cumpre a rotina
-    mas nao atualiza o dado — as duas informacoes se complementam.
+    `lojas` restringe o resultado (RBAC): o gestor de loja so deve ver e ser
+    cobrado pelas lojas dele.
 
-    Devolve DataFrame com loja, tipo, ate (cobertura), subido_em e atrasado.
+    Devolve DataFrame com loja, tipo, ate, subido_em e atrasado.
     """
-    prazo = ultimo_prazo()
-    df = pd.read_sql("""
+    fim_quinzena, _prazo, _rotulo = quinzena_cobrada()
+
+    sql = """
         SELECT l.loja, t.tipo,
                MAX(c.periodo_fim)     AS ate,
                MAX(c.data_lancamento) AS subido_em
@@ -586,11 +591,49 @@ def status_custos_full(engine, marketplace='MERCADO LIVRE'):
                ON c.loja = l.loja AND c.tipo = t.tipo AND c.marketplace = %(mkt)s
         WHERE l.marketplace = %(mkt)s
           AND COALESCE(l.visivel_no_painel, TRUE)
-        GROUP BY l.loja, t.tipo
-        ORDER BY l.loja, t.tipo
-    """, engine, params={'mkt': marketplace, 'tipos': [t[0] for t in TIPOS_FULL]})
+    """
+    params = {'mkt': marketplace, 'tipos': [t[0] for t in TIPOS_FULL]}
+    if lojas:
+        sql += " AND l.loja = ANY(%(lojas)s)"
+        params['lojas'] = list(lojas)
+    sql += " GROUP BY l.loja, t.tipo ORDER BY l.loja, t.tipo"
 
+    df = pd.read_sql(sql, engine, params=params)
     df['subido_em'] = pd.to_datetime(df['subido_em']).dt.date
     df['ate'] = pd.to_datetime(df['ate']).dt.date
-    df['atrasado'] = df['subido_em'].isna() | (df['subido_em'] < prazo)
+    df['atrasado'] = df['ate'].isna() | (df['ate'] < fim_quinzena)
     return df
+
+
+def quinzena_cobrada(hoje=None):
+    """
+    Devolve (fim_da_quinzena, prazo, rotulo) da ultima quinzena ja vencida.
+
+    A cobranca e sobre COBERTURA, nao sobre data de upload: subir hoje um
+    relatorio que termina em julho cumpre "enviei" mas nao fecha a quinzena.
+    Foi o que os dados reais mostraram — tudo enviado no mesmo dia, e ainda
+    assim varias lojas descobertas.
+    """
+    import datetime as _dt
+    import calendar as _cal
+    hoje = hoje or _dt.date.today()
+
+    def _fim_mes(ano, mes):
+        return _dt.date(ano, mes, _cal.monthrange(ano, mes)[1])
+
+    # candidatas: (fim da quinzena, prazo de envio)
+    cands = []
+    for delta in (0, -1):
+        ano, mes = hoje.year, hoje.month + delta
+        if mes < 1:
+            ano, mes = ano - 1, mes + 12
+        cands.append((_dt.date(ano, mes, 15), _dt.date(ano, mes, 18)))
+        fim = _fim_mes(ano, mes)
+        prox_ano, prox_mes = (ano + 1, 1) if mes == 12 else (ano, mes + 1)
+        cands.append((fim, _dt.date(prox_ano, prox_mes, 3)))
+
+    vencidas = [c for c in cands if c[1] <= hoje]
+    fim, prazo = max(vencidas, key=lambda c: c[1]) if vencidas else min(cands, key=lambda c: c[1])
+    inicio = fim.replace(day=1) if fim.day > 15 else fim.replace(day=1)
+    rotulo = f"{'16' if fim.day > 15 else '01'} a {fim:%d/%m}"
+    return fim, prazo, rotulo

@@ -820,13 +820,19 @@ def _painel_status_full(engine):
     junho cumpre a rotina mas nao atualiza o dado.
     """
     from processar_full_ml import (
-        status_custos_full, ultimo_prazo, proximo_prazo, TIPOS_FULL,
+        status_custos_full, quinzena_cobrada, proximo_prazo, TIPOS_FULL,
     )
 
-    st.markdown("#### 📊 Status de envio dos custos de Full")
+    st.markdown("#### 📊 Status dos custos de Full")
+
+    # RBAC: gestor de loja so ve e so e cobrado pelas lojas dele
+    lojas_rbac = None if ve_todas_lojas() else get_lojas_usuario(engine)
+    if lojas_rbac is not None and not lojas_rbac:
+        st.caption("Nenhuma loja atribuída ao seu perfil.")
+        return
 
     try:
-        dados = status_custos_full(engine)
+        dados = status_custos_full(engine, lojas=lojas_rbac)
     except Exception:
         st.caption("Status indisponível.")
         return
@@ -835,17 +841,18 @@ def _painel_status_full(engine):
         st.caption("Nenhuma loja de Mercado Livre cadastrada.")
         return
 
-    prazo = ultimo_prazo()
+    fim_q, prazo, rotulo = quinzena_cobrada()
     prox = proximo_prazo()
     atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
 
     if atrasadas:
         st.warning(
-            f"⏰ **{len(atrasadas)} loja(s) sem envio desde {prazo:%d/%m}**: "
-            f"{', '.join(atrasadas)}. Próximo prazo: {prox:%d/%m}."
+            f"⏰ **Quinzena {rotulo} incompleta** (prazo era {prazo:%d/%m}) — "
+            f"{len(atrasadas)} loja(s): {', '.join(atrasadas)}. "
+            f"Próximo prazo: {prox:%d/%m}."
         )
     else:
-        st.success(f"✅ Envios em dia. Próximo prazo: {prox:%d/%m}.")
+        st.success(f"✅ Quinzena {rotulo} fechada. Próximo prazo: {prox:%d/%m}.")
 
     idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows()}
     lojas = sorted(dados['loja'].unique())
@@ -862,19 +869,16 @@ def _painel_status_full(engine):
         for tipo, _, arquivo in TIPOS_FULL:
             r = idx.get((loja, tipo))
             atrasado = r is None or bool(r['atrasado'])
+            if r is None or pd.isna(r['ate']):
+                bg, fg, txt = '#fdecea', '#b71c1c', 'nunca enviado'
+            else:
+                bg, fg = ('#fdecea', '#b71c1c') if atrasado else ('#e8f5e9', '#1b5e20')
+                txt = f"cobre até {r['ate']:%d/%m}"
             if atrasado:
                 pendentes.add(arquivo)
-                bg, fg = '#fdecea', '#b71c1c'
-                if r is None or pd.isna(r['subido_em']):
-                    txt = 'nunca enviado'
-                else:
-                    txt = f"enviado {r['subido_em']:%d/%m}"
-            else:
-                bg, fg = '#e8f5e9', '#1b5e20'
-                txt = f"enviado {r['subido_em']:%d/%m}"
             cobertura = ''
-            if r is not None and not pd.isna(r['ate']):
-                cobertura = f"<br><span style='font-size:0.76rem;opacity:.75'>cobre até {r['ate']:%d/%m}</span>"
+            if r is not None and not pd.isna(r['subido_em']):
+                cobertura = f"<br><span style='font-size:0.76rem;opacity:.75'>enviado {r['subido_em']:%d/%m}</span>"
             html.append(
                 f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
                 f"background:{bg};color:{fg}'>{txt}{cobertura}</td>"
@@ -884,10 +888,10 @@ def _painel_status_full(engine):
     html.append("</table>")
     st.markdown(''.join(html), unsafe_allow_html=True)
     st.caption(
-        f"Rotina: enviar a cada 15 dias, até o dia 3 e até o dia 18. "
-        f"Verde = houve envio desde {prazo:%d/%m}. "
-        f"\"Cobre até\" é a data final do custo lançado — subir um relatório antigo "
-        f"cumpre o prazo mas não atualiza o dado. "
+        f"Rotina por quinzena: 01–15 vence dia 18, 16–fim do mês vence dia 3. "
+        f"Verde = o custo cobre até {fim_q:%d/%m}, o fim da quinzena vencida. "
+        f"O semáforo olha a cobertura, não a data de envio — subir um relatório "
+        f"antigo não fecha a quinzena. "
         f"Baixe sempre o acumulado mais completo: subir de novo não duplica."
     )
     st.divider()
