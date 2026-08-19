@@ -738,15 +738,20 @@ def _render_tab_margem_real(engine, ano_mes):
     """
     Fechamento mensal: margem contabil menos os custos que nao estao na venda.
 
-    Deliberadamente separada das telas de Inicio e Vendas. As vendas entram
-    diariamente; os custos de Full fecham por quinzena e chegam com atraso.
-    Descontar um do outro num painel diario faria a margem parecer alta nos
-    dias sem custo lancado e despencar no dia do lancamento — daria aparencia
-    de queda onde houve apenas contabilizacao.
+    REGRA CENTRAL: so chamar de "margem real" quando TODOS os custos do mes
+    estiverem carregados. Faltando qualquer fonte, o numero e PARCIAL e a
+    falta de dado e a informacao principal da tela — nao um rodape.
 
-    Mes sem custo lancado aparece como NAO APURADO, nunca com a margem
-    contabil disfarcada de real. Mostrar 11,6% como se fosse liquido e
-    exatamente o problema que este trabalho existe para corrigir.
+    O motivo e concreto: uma margem parcial parece final e e sempre otimista,
+    porque todo custo que falta so faz o numero cair. Apresentar 9,4% como
+    "real" quando o Ads ainda nao entrou leva a decisao de preco errada com
+    aparencia de precisao — que e exatamente o problema que este trabalho
+    existe para corrigir.
+
+    Separada das telas de Inicio e Vendas por decisao do Thiago: vendas
+    entram diariamente, custos fecham por quinzena com atraso, e misturar as
+    duas cadencias faria a margem despencar no dia do lancamento como se
+    fosse queda de performance.
     """
     from permissoes import ve_todas_lojas, get_lojas_usuario
 
@@ -778,9 +783,11 @@ def _render_tab_margem_real(engine, ano_mes):
         filtro_c = filtro.replace('loja_origem', 'loja')
         custos = pd.read_sql(f"""
             SELECT loja,
-                   SUM(valor) FILTER (WHERE tipo LIKE 'FULL%%') AS full_total,
-                   SUM(valor) FILTER (WHERE tipo = 'ADS')       AS ads_total,
-                   SUM(valor) FILTER (WHERE tipo NOT LIKE 'FULL%%' AND tipo <> 'ADS') AS outros
+                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM'), 0) AS armazenagem,
+                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_COLETA'), 0)      AS coleta,
+                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM_PROLONGADA'), 0) AS antigo,
+                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'ADS'), 0)              AS ads,
+                   COALESCE(SUM(valor) FILTER (WHERE tipo NOT LIKE 'FULL%%' AND tipo <> 'ADS'), 0) AS outros
             FROM fact_custos_extras
             WHERE periodo_inicio >= %(ini)s AND periodo_inicio < %(fim)s {filtro_c}
             GROUP BY loja
@@ -794,62 +801,73 @@ def _render_tab_margem_real(engine, ano_mes):
         return
 
     df = vendas.merge(custos, on='loja', how='left')
-    for c in ('receita', 'margem_contabil', 'full_total', 'ads_total', 'outros'):
+    for c in ('receita', 'margem_contabil', 'armazenagem', 'coleta', 'antigo', 'ads', 'outros'):
         df[c] = pd.to_numeric(df.get(c), errors='coerce').fillna(0.0)
 
-    df['apurado'] = df['full_total'] > 0
-    df['margem_real'] = df['margem_contabil'] - df['full_total'] - df['ads_total'] - df['outros']
+    # O que falta em cada loja. Ads hoje falta em todas — o modulo de Ads
+    # ainda nao grava custo em fact_custos_extras.
+    def _faltantes(r):
+        faltam = []
+        if r['armazenagem'] == 0:
+            faltam.append('armazenagem de Full')
+        if r['coleta'] == 0:
+            faltam.append('coleta de Full')
+        if r['ads'] == 0:
+            faltam.append('Ads')
+        return faltam
+
+    df['faltam'] = df.apply(_faltantes, axis=1)
+    df['completo'] = df['faltam'].str.len() == 0
+    df['custo_extra'] = df[['armazenagem', 'coleta', 'antigo', 'ads', 'outros']].sum(axis=1)
+    df['margem_ate_agora'] = df['margem_contabil'] - df['custo_extra']
     df = df.sort_values('receita', ascending=False)
 
-    apuradas = df[df['apurado']]
-    n_pend = int((~df['apurado']).sum())
+    n_incompletas = int((~df['completo']).sum())
 
-    if apuradas.empty:
-        st.warning(
-            f"Nenhuma loja com custo de Full lançado em {ano_mes}. "
-            "Suba os relatórios em **Análise de Produtos → Despesas de Full** "
-            "para este mês ser apurado."
+    # --- A falta de dado e a informacao principal, nao um rodape ---
+    if n_incompletas:
+        fontes = sorted({f for lst in df.loc[~df['completo'], 'faltam'] for f in lst})
+        st.error(
+            f"### ⚠️ {ano_mes} ainda NÃO está fechado\n\n"
+            f"**{n_incompletas} de {len(df)} loja(s)** estão sem pelo menos um custo lançado. "
+            f"Falta carregar: **{', '.join(fontes)}**.\n\n"
+            f"Os valores abaixo são **parciais** e por definição **otimistas** — todo custo "
+            f"que ainda entrar só faz a margem cair. **Não use para decidir preço ou cortar SKU.**"
         )
     else:
-        rec = apuradas['receita'].sum()
-        mc = apuradas['margem_contabil'].sum()
-        mr = apuradas['margem_real'].sum()
+        rec = df['receita'].sum()
+        mc = df['margem_contabil'].sum()
+        mr = df['margem_ate_agora'].sum()
+        st.success(f"✅ {ano_mes} fechado — todos os custos lançados em todas as lojas.")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Receita (lojas apuradas)", _brl(rec))
+        c1.metric("Receita", _brl(rec))
         c2.metric("Margem contábil", f"{100*mc/rec:.1f}%" if rec else "—", _brl(mc))
         c3.metric("Margem real", f"{100*mr/rec:.1f}%" if rec else "—",
                   f"{_brl(mr)}  ({_brl(mr-mc)})", delta_color="inverse")
-        if n_pend:
-            st.caption(
-                f"⚠️ {n_pend} loja(s) fora do cálculo por não terem custo de Full lançado "
-                f"neste mês — aparecem como *não apurado* na tabela."
-            )
 
     linhas = []
     for _, r in df.iterrows():
-        if r['apurado']:
-            pct = f"{100*r['margem_real']/r['receita']:.1f}%" if r['receita'] else "—"
-            real, marca = _brl(r['margem_real']), pct
+        pct = (100 * r['margem_ate_agora'] / r['receita']) if r['receita'] else 0
+        if r['completo']:
+            situacao = "✅ fechado"
+            rotulo_margem = f"{pct:.1f}%"
         else:
-            real, marca = "não apurado", "—"
+            situacao = "🟡 falta " + ", ".join(r['faltam'])
+            rotulo_margem = f"{pct:.1f}% (parcial)"
         linhas.append({
             'Loja': r['loja'],
             'Receita': _brl(r['receita']),
-            'Margem contábil': _brl(r['margem_contabil']),
             '% contábil': f"{100*r['margem_contabil']/r['receita']:.1f}%" if r['receita'] else "—",
-            '− Full': _brl(-r['full_total']) if r['full_total'] else "—",
-            '− Ads': _brl(-r['ads_total']) if r['ads_total'] else "—",
-            'Margem real': real,
-            '% real': marca,
+            'Custos lançados': _brl(-r['custo_extra']) if r['custo_extra'] else "—",
+            'Margem até agora': rotulo_margem,
+            'Situação': situacao,
         })
-    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
 
-    if (df['ads_total'] == 0).all():
-        st.caption(
-            "A coluna de Ads ainda está vazia: o módulo de Ads passará a gravar o "
-            "gasto por anúncio em `fact_custos_extras`. Até lá a margem real está "
-            "líquida apenas de Full, então ainda é otimista."
-        )
+    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+    st.caption(
+        "\"Margem até agora\" só vira **margem real** quando a linha estiver ✅ fechado. "
+        "Enquanto houver custo por lançar, o número é um teto — nunca o resultado."
+    )
 
 
 def _brl(v):
