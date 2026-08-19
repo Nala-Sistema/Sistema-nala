@@ -806,40 +806,27 @@ def _historico_uploads_estoque(engine):
 # PAINEL DE STATUS DOS CUSTOS DE FULL
 # ============================================================
 
-_TIPOS_FULL = [
-    ('FULL_ARMAZENAGEM',            'Armazenagem',   'Custos por serviço de armazenamento'),
-    ('FULL_COLETA',                 'Coleta',        'Relatório de Tarifas Full'),
-    ('FULL_ARMAZENAGEM_PROLONGADA', 'Estoque antigo','Relatório de Tarifas Full'),
-]
-
-
 def _painel_status_full(engine):
     """
-    Matriz loja x tipo de custo com a data até onde cada um está atualizado.
+    Matriz loja x tipo de custo cobrando a rotina de envio.
 
-    Mesma ideia do panorama da tela de Início, que mostra até quando as vendas
-    de cada loja foram carregadas. Aqui o gestor precisa saber duas coisas de
-    relance: o que já subiu e o que está atrasado.
+    A cobranca principal e sobre a ROTINA, nao sobre "nunca enviado": o que
+    interessa ao gestor e se houve envio desde o ultimo prazo. Uma loja pode
+    estar com o dado coberto ate ontem e ainda assim precisar de envio novo no
+    proximo ciclo.
 
-    O semáforo usa a data final do período coberto, não a data em que o
-    arquivo foi subido — subir hoje um relatório que vai até junho não deixa
-    o dado atualizado, e mostrar a data de upload esconderia isso.
+    A data de cobertura aparece como informacao secundaria porque diz outra
+    coisa: ate quando o custo esta lancado. Subir um relatorio que termina em
+    junho cumpre a rotina mas nao atualiza o dado.
     """
-    st.markdown("#### 📊 Status dos custos de Full")
+    from processar_full_ml import (
+        status_custos_full, ultimo_prazo, proximo_prazo, TIPOS_FULL,
+    )
+
+    st.markdown("#### 📊 Status de envio dos custos de Full")
 
     try:
-        dados = pd.read_sql("""
-            SELECT l.loja,
-                   c.tipo,
-                   MAX(c.periodo_fim)     AS ate,
-                   MAX(c.data_lancamento) AS subido_em
-            FROM dim_lojas l
-            LEFT JOIN fact_custos_extras c
-                   ON c.loja = l.loja AND c.tipo LIKE 'FULL%%'
-            WHERE l.marketplace = 'MERCADO LIVRE'
-              AND COALESCE(l.visivel_no_painel, TRUE)
-            GROUP BY l.loja, c.tipo
-        """, engine)
+        dados = status_custos_full(engine)
     except Exception:
         st.caption("Status indisponível.")
         return
@@ -848,50 +835,60 @@ def _painel_status_full(engine):
         st.caption("Nenhuma loja de Mercado Livre cadastrada.")
         return
 
-    hoje = pd.Timestamp(date.today())
-    idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows() if pd.notna(r['tipo'])}
-    lojas = sorted(dados['loja'].dropna().unique())
+    prazo = ultimo_prazo()
+    prox = proximo_prazo()
+    atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
 
-    def _celula(loja, tipo):
-        r = idx.get((loja, tipo))
-        if r is None or pd.isna(r['ate']):
-            return ('#fdecea', '#b71c1c', 'nunca enviado')
-        ate = pd.Timestamp(r['ate'])
-        dias = (hoje - ate).days
-        txt = f"até {ate:%d/%m/%Y}"
-        if dias <= 20:
-            return ('#e8f5e9', '#1b5e20', txt)          # em dia
-        if dias <= 50:
-            return ('#fff8e1', '#8d6e00', f"{txt} · {dias}d")   # atenção
-        return ('#fdecea', '#b71c1c', f"{txt} · {dias}d")       # atrasado
+    if atrasadas:
+        st.warning(
+            f"⏰ **{len(atrasadas)} loja(s) sem envio desde {prazo:%d/%m}**: "
+            f"{', '.join(atrasadas)}. Próximo prazo: {prox:%d/%m}."
+        )
+    else:
+        st.success(f"✅ Envios em dia. Próximo prazo: {prox:%d/%m}.")
+
+    idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows()}
+    lojas = sorted(dados['loja'].unique())
 
     html = ["<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"]
     html.append("<tr style='background:#f2f2f2'><th style='padding:8px;text-align:left'>Loja</th>")
-    for _, rotulo, _ in _TIPOS_FULL:
+    for _, rotulo, _ in TIPOS_FULL:
         html.append(f"<th style='padding:8px;text-align:center'>{rotulo}</th>")
-    html.append("<th style='padding:8px;text-align:left'>O que falta subir</th></tr>")
+    html.append("<th style='padding:8px;text-align:left'>O que subir</th></tr>")
 
     for loja in lojas:
         html.append(f"<tr><td style='padding:8px;border-top:1px solid #eee'><b>{loja}</b></td>")
         pendentes = set()
-        for tipo, _, arquivo in _TIPOS_FULL:
-            bg, fg, txt = _celula(loja, tipo)
-            if bg != '#e8f5e9':
+        for tipo, _, arquivo in TIPOS_FULL:
+            r = idx.get((loja, tipo))
+            atrasado = r is None or bool(r['atrasado'])
+            if atrasado:
                 pendentes.add(arquivo)
+                bg, fg = '#fdecea', '#b71c1c'
+                if r is None or pd.isna(r['subido_em']):
+                    txt = 'nunca enviado'
+                else:
+                    txt = f"enviado {r['subido_em']:%d/%m}"
+            else:
+                bg, fg = '#e8f5e9', '#1b5e20'
+                txt = f"enviado {r['subido_em']:%d/%m}"
+            cobertura = ''
+            if r is not None and not pd.isna(r['ate']):
+                cobertura = f"<br><span style='font-size:0.76rem;opacity:.75'>cobre até {r['ate']:%d/%m}</span>"
             html.append(
                 f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
-                f"background:{bg};color:{fg}'>{txt}</td>"
+                f"background:{bg};color:{fg}'>{txt}{cobertura}</td>"
             )
         acao = ' + '.join(sorted(pendentes)) if pendentes else '—'
-        html.append(
-            f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>"
-        )
+        html.append(f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>")
     html.append("</table>")
     st.markdown(''.join(html), unsafe_allow_html=True)
     st.caption(
-        "A data é até onde o custo está coberto, não quando o arquivo foi subido. "
-        "Verde: coberto nos últimos 20 dias · Amarelo: até 50 dias · Vermelho: mais que isso ou nunca enviado. "
-        "Baixe sempre o relatório acumulado mais completo — subir de novo não duplica."
+        f"Rotina: enviar a cada 15 dias, até o dia 3 e até o dia 18. "
+        f"Verde = houve envio desde {prazo:%d/%m}. "
+        f"\"Cobre até\" é a data final do custo lançado — subir um relatório antigo "
+        f"cumpre o prazo mas não atualiza o dado. "
+        f"Baixe sempre o acumulado mais completo: subir de novo não duplica."
     )
     st.divider()
 

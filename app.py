@@ -808,6 +808,7 @@ def _area_logada(engine):
         st.title("📊 Painel de Controle")
 
         mostrar_badge_filtro_loja()
+        _alerta_custos_full(engine)
 
         # ─── SELETOR DE MÊS ───
         opcoes_meses = _gerar_opcoes_meses(12)
@@ -971,6 +972,38 @@ def _garantir_tabela_estoque(engine):
         cursor.close()
         conn.close()
     except Exception:
+        pass
+
+
+def _alerta_custos_full(engine):
+    """
+    Avisa na tela inicial quando o envio dos custos de Full atrasou.
+
+    Fica aqui, e nao so na tab de upload, porque a tab so e vista por quem ja
+    lembrou de ir la — que e justamente quem nao precisa do lembrete. O gestor
+    abre o sistema no Painel de Controle, entao e ai que a cobranca alcanca
+    quem esqueceu.
+
+    Silencioso quando esta tudo em dia: alerta que aparece sempre vira ruido e
+    para de ser lido.
+    """
+    try:
+        from processar_full_ml import status_custos_full, ultimo_prazo, proximo_prazo
+        dados = status_custos_full(engine)
+        if dados.empty:
+            return
+        atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
+        if not atrasadas:
+            return
+        prazo, prox = ultimo_prazo(), proximo_prazo()
+        st.warning(
+            f"⏰ **Custos de Full sem envio desde {prazo:%d/%m}** — "
+            f"{len(atrasadas)} loja(s): {', '.join(atrasadas)}. "
+            f"Próximo prazo: {prox:%d/%m}. "
+            f"Suba em **Análise de Produtos → Despesas de Full**."
+        )
+    except Exception:
+        # Nunca derrubar o painel por causa de um lembrete
         pass
 
 

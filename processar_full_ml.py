@@ -508,3 +508,89 @@ def identificar_loja(engine, codigos_anuncio, marketplace='MERCADO LIVRE'):
     conf = 100.0 * n / total
     detalhe = ' | '.join(f'{l}: {q}' for l, q in linhas)
     return loja, round(conf, 1), detalhe
+
+
+# ============================================================
+# STATUS / COBRANCA DE ROTINA
+# ============================================================
+
+# Prazos de envio: a cada 15 dias, ate o dia 3 e ate o dia 18.
+# Escolhidos com o Thiago a partir do ciclo do ML, que fecha no dia 19.
+DIAS_PRAZO = (3, 18)
+
+TIPOS_FULL = [
+    (TIPO_ARMAZENAGEM, 'Armazenagem', 'Custos por serviço de armazenamento'),
+    (TIPO_COLETA, 'Coleta', 'Relatório de Tarifas Full'),
+    (TIPO_PROLONGADO, 'Estoque antigo', 'Relatório de Tarifas Full'),
+]
+
+
+def ultimo_prazo(hoje=None):
+    """
+    Devolve o prazo de envio mais recente que ja passou.
+
+    Com prazos nos dias 3 e 18, em 20/08 o ultimo prazo foi 18/08; em 10/08
+    foi 03/08; em 02/08 foi 18/07. Serve de referencia para cobrar o envio:
+    se nao houve upload desde esse prazo, a rotina atrasou.
+    """
+    import datetime as _dt
+    hoje = hoje or _dt.date.today()
+    candidatos = []
+    for delta_mes in (0, -1):
+        ano, mes = hoje.year, hoje.month + delta_mes
+        if mes < 1:
+            ano, mes = ano - 1, mes + 12
+        for d in DIAS_PRAZO:
+            candidatos.append(_dt.date(ano, mes, d))
+    passados = [d for d in candidatos if d <= hoje]
+    return max(passados) if passados else min(candidatos)
+
+
+def proximo_prazo(hoje=None):
+    """Proximo prazo de envio a vencer."""
+    import datetime as _dt
+    hoje = hoje or _dt.date.today()
+    candidatos = []
+    for delta_mes in (0, 1):
+        ano, mes = hoje.year, hoje.month + delta_mes
+        if mes > 12:
+            ano, mes = ano + 1, mes - 12
+        for d in DIAS_PRAZO:
+            candidatos.append(_dt.date(ano, mes, d))
+    futuros = [d for d in candidatos if d > hoje]
+    return min(futuros)
+
+
+def status_custos_full(engine, marketplace='MERCADO LIVRE'):
+    """
+    Status de envio dos custos de Full, por loja e tipo.
+
+    A cobranca e sobre a ROTINA: houve upload desde o ultimo prazo? Uma loja
+    pode estar com o dado coberto ate ontem e ainda assim precisar de um envio
+    novo no proximo ciclo, e e isso que o gestor precisa ver.
+
+    A data de cobertura vai junto porque diz outra coisa: ate quando o custo
+    esta lancado. Subir hoje um relatorio que termina em junho cumpre a rotina
+    mas nao atualiza o dado — as duas informacoes se complementam.
+
+    Devolve DataFrame com loja, tipo, ate (cobertura), subido_em e atrasado.
+    """
+    prazo = ultimo_prazo()
+    df = pd.read_sql("""
+        SELECT l.loja, t.tipo,
+               MAX(c.periodo_fim)     AS ate,
+               MAX(c.data_lancamento) AS subido_em
+        FROM dim_lojas l
+        CROSS JOIN (SELECT unnest(%(tipos)s::text[]) AS tipo) t
+        LEFT JOIN fact_custos_extras c
+               ON c.loja = l.loja AND c.tipo = t.tipo AND c.marketplace = %(mkt)s
+        WHERE l.marketplace = %(mkt)s
+          AND COALESCE(l.visivel_no_painel, TRUE)
+        GROUP BY l.loja, t.tipo
+        ORDER BY l.loja, t.tipo
+    """, engine, params={'mkt': marketplace, 'tipos': [t[0] for t in TIPOS_FULL]})
+
+    df['subido_em'] = pd.to_datetime(df['subido_em']).dt.date
+    df['ate'] = pd.to_datetime(df['ate']).dt.date
+    df['atrasado'] = df['subido_em'].isna() | (df['subido_em'] < prazo)
+    return df
