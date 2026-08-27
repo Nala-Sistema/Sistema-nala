@@ -20,8 +20,8 @@ def modulo_ads(engine):
     st.title("📊 Análise de Ads")
     st.caption("Meta TACOS: máximo 3% | Análise multi-marketplace de campanhas pagas")
 
-    tab_shopee, tab_amazon, tab_outros = st.tabs([
-        "🟠 Shopee", "📦 Amazon", "🔜 Outros"
+    tab_shopee, tab_ml, tab_amazon, tab_outros = st.tabs([
+        "🟠 Shopee", "🟡 Mercado Livre", "📦 Amazon", "🔜 Outros"
     ])
 
     with tab_shopee:
@@ -36,6 +36,18 @@ def modulo_ads(engine):
         except Exception as e:
             st.error(f"❌ Erro ao carregar módulo Shopee: {str(e)[:300]}")
 
+    with tab_ml:
+        try:
+            from analise_ads_ml import modulo_ads_ml
+            modulo_ads_ml(engine)
+        except ImportError as e:
+            st.error(
+                "❌ Módulo `analise_ads_ml.py` não encontrado ou com erro de import. "
+                f"Detalhe: {str(e)[:200]}"
+            )
+        except Exception as e:
+            st.error(f"❌ Erro ao carregar módulo Mercado Livre: {str(e)[:300]}")
+
     with tab_amazon:
         st.info("📦 Módulo Amazon Ads em desenvolvimento.")
         st.caption(
@@ -46,5 +58,5 @@ def modulo_ads(engine):
     with tab_outros:
         st.info("🔜 Em breve.")
         st.caption(
-            "Mercado Livre Ads, Magalu Ads e Shein Ads serão adicionados nas próximas releases."
+            "Magalu Ads e Shein Ads serão adicionados nas próximas releases."
         )
