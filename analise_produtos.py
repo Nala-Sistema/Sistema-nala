@@ -802,6 +802,101 @@ def _historico_uploads_estoque(engine):
 # ENTRYPOINT
 # ============================================================
 
+# ============================================================
+# PAINEL DE STATUS DOS CUSTOS DE FULL
+# ============================================================
+
+def _painel_status_full(engine):
+    """
+    Matriz loja x tipo de custo cobrando a rotina de envio.
+
+    A cobranca principal e sobre a ROTINA, nao sobre "nunca enviado": o que
+    interessa ao gestor e se houve envio desde o ultimo prazo. Uma loja pode
+    estar com o dado coberto ate ontem e ainda assim precisar de envio novo no
+    proximo ciclo.
+
+    A data de cobertura aparece como informacao secundaria porque diz outra
+    coisa: ate quando o custo esta lancado. Subir um relatorio que termina em
+    junho cumpre a rotina mas nao atualiza o dado.
+    """
+    from processar_full_ml import (
+        status_custos_full, quinzena_cobrada, proximo_prazo, TIPOS_FULL,
+    )
+
+    st.markdown("#### 📊 Status dos custos de Full")
+
+    # RBAC: gestor de loja so ve e so e cobrado pelas lojas dele
+    lojas_rbac = None if ve_todas_lojas() else get_lojas_usuario(engine)
+    if lojas_rbac is not None and not lojas_rbac:
+        st.caption("Nenhuma loja atribuída ao seu perfil.")
+        return
+
+    try:
+        dados = status_custos_full(engine, lojas=lojas_rbac)
+    except Exception:
+        st.caption("Status indisponível.")
+        return
+
+    if dados.empty:
+        st.caption("Nenhuma loja de Mercado Livre cadastrada.")
+        return
+
+    fim_q, prazo, rotulo = quinzena_cobrada()
+    prox = proximo_prazo()
+    atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
+
+    if atrasadas:
+        st.warning(
+            f"⏰ **Quinzena {rotulo} incompleta** (prazo era {prazo:%d/%m}) — "
+            f"{len(atrasadas)} loja(s): {', '.join(atrasadas)}. "
+            f"Próximo prazo: {prox:%d/%m}."
+        )
+    else:
+        st.success(f"✅ Quinzena {rotulo} fechada. Próximo prazo: {prox:%d/%m}.")
+
+    idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows()}
+    lojas = sorted(dados['loja'].unique())
+
+    html = ["<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"]
+    html.append("<tr style='background:#f2f2f2'><th style='padding:8px;text-align:left'>Loja</th>")
+    for _, rotulo, _ in TIPOS_FULL:
+        html.append(f"<th style='padding:8px;text-align:center'>{rotulo}</th>")
+    html.append("<th style='padding:8px;text-align:left'>O que subir</th></tr>")
+
+    for loja in lojas:
+        html.append(f"<tr><td style='padding:8px;border-top:1px solid #eee'><b>{loja}</b></td>")
+        pendentes = set()
+        for tipo, _, arquivo in TIPOS_FULL:
+            r = idx.get((loja, tipo))
+            atrasado = r is None or bool(r['atrasado'])
+            if r is None or pd.isna(r['ate']):
+                bg, fg, txt = '#fdecea', '#b71c1c', 'nunca enviado'
+            else:
+                bg, fg = ('#fdecea', '#b71c1c') if atrasado else ('#e8f5e9', '#1b5e20')
+                txt = f"cobre até {r['ate']:%d/%m}"
+            if atrasado:
+                pendentes.add(arquivo)
+            cobertura = ''
+            if r is not None and not pd.isna(r['subido_em']):
+                cobertura = f"<br><span style='font-size:0.76rem;opacity:.75'>enviado {r['subido_em']:%d/%m}</span>"
+            html.append(
+                f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
+                f"background:{bg};color:{fg}'>{txt}{cobertura}</td>"
+            )
+        acao = ' + '.join(sorted(pendentes)) if pendentes else '—'
+        html.append(f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>")
+    html.append("</table>")
+    st.markdown(''.join(html), unsafe_allow_html=True)
+    st.caption(
+        f"Rotina por quinzena: 01–15 vence dia 18, 16–fim do mês vence dia 3. "
+        f"Verde = o custo cobre até {fim_q:%d/%m}, o fim da quinzena vencida. "
+        f"O semáforo olha a cobertura, não a data de envio — subir um relatório "
+        f"antigo não fecha a quinzena. "
+        f"Baixe sempre o acumulado mais completo: subir de novo não duplica."
+    )
+    st.divider()
+
+
 def _tab_despesas_full(engine):
     """
     Tab de upload dos relatorios de custo de Full.
@@ -823,6 +918,7 @@ def _tab_despesas_full(engine):
 
 def _render_despesas_full(engine):
     st.subheader("💸 Despesas de Full")
+    _painel_status_full(engine)
     st.caption(
         "Suba aqui os relatórios de custo do Full: **custos de armazenagem** e "
         "**custos de coleta**. O sistema reconhece sozinho qual é qual. "

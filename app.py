@@ -808,6 +808,7 @@ def _area_logada(engine):
         st.title("📊 Painel de Controle")
 
         mostrar_badge_filtro_loja()
+        _alerta_custos_full(engine)
 
         # ─── SELETOR DE MÊS ───
         opcoes_meses = _gerar_opcoes_meses(12)
@@ -971,6 +972,55 @@ def _garantir_tabela_estoque(engine):
         cursor.close()
         conn.close()
     except Exception:
+        pass
+
+
+def _alerta_custos_full(engine):
+    """
+    Avisa na tela inicial quando a quinzena vencida ficou sem custo de Full.
+
+    Fica aqui, e nao so na tab de upload, porque a tab so e vista por quem ja
+    lembrou de ir la — justamente quem nao precisa do lembrete. O gestor abre
+    o sistema no Painel de Controle, entao e ai que a cobranca alcanca quem
+    esqueceu.
+
+    QUEM VE: so quem pode agir. DIRETOR tem acesso 'leitura' a Analise de
+    Produtos — cobrar dele um upload que ele nao pode fazer e ruido. E o
+    GESTOR, que tem acesso 'parcial' filtrado por loja, so e cobrado pelas
+    lojas dele.
+
+    Silencioso quando esta tudo em dia: alerta que aparece sempre para de ser
+    lido, e ai nao funciona quando importa.
+    """
+    try:
+        from permissoes import get_nivel_acesso, ve_todas_lojas, get_lojas_usuario
+
+        if get_nivel_acesso('analise_produtos') not in ('completo', 'parcial'):
+            return
+
+        lojas = None if ve_todas_lojas() else get_lojas_usuario(engine)
+        if lojas is not None and not lojas:
+            return
+
+        from processar_full_ml import status_custos_full, quinzena_cobrada, proximo_prazo
+
+        dados = status_custos_full(engine, lojas=lojas)
+        if dados.empty:
+            return
+
+        atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
+        if not atrasadas:
+            return
+
+        _fim, prazo, rotulo = quinzena_cobrada()
+        st.warning(
+            f"⏰ **Custos de Full da quinzena {rotulo} incompletos** "
+            f"(prazo era {prazo:%d/%m}) — {len(atrasadas)} loja(s): "
+            f"{', '.join(atrasadas)}. Próximo prazo: {proximo_prazo():%d/%m}. "
+            f"Suba em **Análise de Produtos → Despesas de Full**."
+        )
+    except Exception:
+        # Nunca derrubar o painel por causa de um lembrete
         pass
 
 
