@@ -23,6 +23,23 @@ VERSÃO 2.4 (18/08/2026) — auditoria do subsídio PIX:
          485 de 517 pedidos fecharam no centavo (os 32 restantes são cobrança de
          frete por divergência de peso, que não existe no export de pedidos).
 
+VERSÃO 2.7 (28/08/2026) — layout novo do export:
+  - FIX: a Shopee acrescentou 'Taxa de Serviço Instantâneo pago pelo comprador'
+         (presente no export de 25/08, ausente no de 09/08). O matcher genérico
+         de 'taxa de serviço' capturava essa coluna e a renomeava para
+         'Taxa de serviço líquida', criando duas colunas com o mesmo nome — o
+         upload morria com 'cannot reindex on an axis with duplicate labels'.
+         Agora taxas cobradas DO COMPRADOR são ignoradas: não são custo nosso.
+         Cuidado ao reabrir isso: a coluna nova vem ANTES da verdadeira no
+         arquivo, então "ficar com a primeira" pegaria a taxa errada (zerada em
+         30/30 linhas) e descartaria R$ 243,71 de taxa de serviço real,
+         inflando a margem sem nenhum erro na tela.
+  - NOVO: trava de colisão no rename — um nome-destino só pode ser reivindicado
+         por uma coluna, e quem já chega com o nome certo tem prioridade.
+         Vale também para 'coin cashback' e 'FBS', que têm matcher solto.
+  - NOVO: se ainda assim sobrar nome duplicado, o upload para dizendo QUAIS
+         colunas colidiram, em vez do erro ilegível do pandas.
+
 VERSÃO 2.3 (08/04/2026):
   - FIX: Inclui coluna "Ajuste por participação em ação comercial" no cálculo de margem
          Essa coluna captura descontos PIX e outros ajustes promocionais que a Shopee aplica.
@@ -272,55 +289,110 @@ def classificar_logistica_shopee(row) -> str | None:
     return None
 
 
+# Nomes que o resto do módulo espera encontrar. Servem de trava: se o arquivo
+# já traz uma coluna com esse nome exato, nenhuma outra pode roubá-lo.
+_DESTINOS_SHOPEE = (
+    'ID do pedido',
+    'Taxa de comissão bruta',
+    'Net Commission Fee',
+    'Taxa de serviço bruta',
+    'Taxa de serviço líquida',
+    'Incentivo de cupom',
+    'Seller Absorbed Coin Cashback',
+    'Pedido FBS',
+)
+
+
+def _classificar_taxa_servico(col_norm: str) -> str | None:
+    """
+    Diz se a coluna é uma taxa de serviço NOSSA e, se for, qual delas.
+
+    v2.7: a Shopee passou a exportar 'Taxa de Serviço Instantâneo pago pelo
+    comprador'. O nome contém 'taxa de serviço', então o matcher antigo a
+    tratava como a nossa taxa líquida. Taxa paga pelo comprador não é custo
+    nosso e não entra em cálculo nenhum — por isso o corte por 'comprador'.
+
+    Devolve None quando a coluna não é taxa de serviço nossa.
+    """
+    if 'taxa de serviço' not in col_norm and 'taxa de servico' not in col_norm:
+        return None
+    if 'comprador' in col_norm:
+        return None
+    if 'bruta' in col_norm:
+        return 'Taxa de serviço bruta'
+    if 'líquida' in col_norm or 'liquida' in col_norm:
+        return 'Taxa de serviço líquida'
+    if col_norm in ('taxa de serviço', 'taxa de servico'):
+        # Layout antigo, anterior à separação bruta/líquida.
+        return 'Taxa de serviço líquida'
+    return None
+
+
 def renomear_colunas_shopee(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Padroniza nomes de colunas do arquivo Shopee (v2.2).
+    Padroniza nomes de colunas do arquivo Shopee (v2.7).
     Suporta variações em Inglês e Português para evitar erros de mapeamento.
 
     v2.2 FIX: Shopee passou a exportar colunas 'bruta' (Taxa de comissão bruta,
     Taxa de serviço bruta). A condição genérica com 'in' renomeava tanto bruta
     quanto líquida para o mesmo nome, gerando duplicata e KeyError: 0.
     Agora exclui explicitamente colunas contendo 'bruta'.
+
+    v2.7 FIX: o mesmo tipo de colisão voltou por outra porta ('Taxa de Serviço
+    Instantâneo pago pelo comprador'). Além do corte específico, agora existe
+    trava geral: cada nome-destino é reivindicado por UMA coluna só, e quem já
+    chega no arquivo com o nome certo tem prioridade sobre quem casaria por
+    pedaço do nome. Sem isso, a coluna nova (que vem antes no arquivo) ficava
+    com o nome da verdadeira e o valor real era descartado em silêncio.
     """
     rename_map = {}
+
+    # Quem já vem com o nome certo do arquivo não precisa de rename e trava o
+    # destino contra candidatas parecidas.
+    reivindicados = {str(c) for c in df.columns if str(c) in _DESTINOS_SHOPEE}
+
+    def reivindicar(coluna, destino):
+        if destino in reivindicados:
+            return
+        rename_map[coluna] = destino
+        reivindicados.add(destino)
+
     for col in df.columns:
         col_norm = str(col).lower().strip()
+
+        # Taxas de serviço: bruta, líquida, ou nenhuma das duas (v2.7)
+        destino_servico = _classificar_taxa_servico(col_norm)
+        if destino_servico:
+            reivindicar(col, destino_servico)
+            continue
         
         # v2.4: Comissão BRUTA — base para derivar o ajuste comercial.
         # Precisa vir antes da líquida para não ser capturada pela condição abaixo.
         if col_norm in ['taxa de comissão bruta', 'taxa de comissao bruta']:
-            rename_map[col] = 'Taxa de comissão bruta'
+            reivindicar(col, 'Taxa de comissão bruta')
 
         # Mapeamento: Net Commission Fee / Taxa de comissão líquida
         elif col_norm in ['net commission fee', 'taxa de comissão líquida', 'taxa de comissao liquida']:
-            rename_map[col] = 'Net Commission Fee'
-
-        # v2.4: Serviço BRUTA — segunda metade do ajuste
-        elif ('taxa de serviço' in col_norm or 'taxa de servico' in col_norm) and 'bruta' in col_norm:
-            rename_map[col] = 'Taxa de serviço bruta'
-
-        # Mapeamento: Taxa de serviço líquida (exclui 'bruta' — Shopee passou a exportar ambas)
-        elif ('taxa de serviço' in col_norm or 'taxa de servico' in col_norm) and 'bruta' not in col_norm:
-            rename_map[col] = 'Taxa de serviço líquida'
+            reivindicar(col, 'Net Commission Fee')
 
         # v2.4: parte do cupom da Shopee paga como crédito direto em vez de
         # abatimento de comissão. No extrato aparece com sinal POSITIVO.
         elif col_norm in ['incentivo de cupom', 'incentivo do cupom']:
-            rename_map[col] = 'Incentivo de cupom'
+            reivindicar(col, 'Incentivo de cupom')
 
         # Mapeamento: ID do Pedido (Garante que espaços não quebrem a detecção)
         elif col_norm == 'id do pedido':
-            rename_map[col] = 'ID do pedido'
+            reivindicar(col, 'ID do pedido')
 
         # Mapeamento: Cashback — só 'Coin Cashback' (Shopee adicionou 'Compensar Moedas' separado)
         elif 'coin cashback' in col_norm:
-            rename_map[col] = 'Seller Absorbed Coin Cashback'
+            reivindicar(col, 'Seller Absorbed Coin Cashback')
 
         # Mapeamento: flag de FBS (Fulfillment by Shopee) — o nome varia entre
         # exports e a coluna nem sempre está presente. Normaliza para que
         # classificar_logistica_shopee() tenha um nome único para procurar.
         elif col_norm == 'fbs' or ('fbs' in col_norm and 'pedido' in col_norm):
-            rename_map[col] = 'Pedido FBS'
+            reivindicar(col, 'Pedido FBS')
 
     return df.rename(columns=rename_map)
 
@@ -353,6 +425,20 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
 
         df = pd.read_excel(arquivo, skiprows=skiprows)
         df = renomear_colunas_shopee(df)
+
+        # v2.7: rede de segurança. Se a Shopee mexer no layout de novo e duas
+        # colunas terminarem com o mesmo nome, o pandas quebra lá na frente com
+        # 'cannot reindex on an axis with duplicate labels' — mensagem que não
+        # diz nada para quem está subindo o arquivo. Melhor parar aqui dizendo
+        # quais colunas colidiram.
+        _duplicadas = df.columns[df.columns.duplicated()].unique().tolist()
+        if _duplicadas:
+            return None, (
+                "Colunas duplicadas após padronização: "
+                + ", ".join(str(c) for c in _duplicadas)
+                + ". Provável mudança no layout do export da Shopee — "
+                  "envie o arquivo para o time técnico."
+            )
 
         if df.empty:
             return None, "Arquivo vazio ou sem dados válidos."
