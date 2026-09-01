@@ -42,6 +42,19 @@ import pandas as pd
 TIPO_ARMAZENAGEM = 'FULL_ARMAZENAGEM'
 TIPO_COLETA = 'FULL_COLETA'
 TIPO_PROLONGADO = 'FULL_ARMAZENAGEM_PROLONGADA'
+TIPO_EXCESSO = 'FULL_EXCESSO_ESPACO'
+TIPO_RETIRADA = 'FULL_RETIRADA_ESTOQUE'
+
+# Abas do Relatorio de Tarifas Full que ja vem atribuidas por anuncio ou que
+# sao cobranca da loja inteira. Qualquer aba nova do ML cai no tratamento
+# generico e e gravada ao nivel da loja — nunca descartada, porque foi
+# efetivamente cobrada.
+_ABAS_CONHECIDAS = (
+    ('coleta',     TIPO_COLETA),
+    ('prolonga',   TIPO_PROLONGADO),
+    ('exceder',    TIPO_EXCESSO),
+    ('retirada',   TIPO_RETIRADA),
+)
 
 # Colunas do resultado normalizado, iguais para os três tipos de custo.
 COLUNAS_NORM = [
@@ -206,28 +219,44 @@ def ler_relatorio_tarifas_full(caminho):
             None,
         )
 
-        if 'coleta' in nome:
-            tipo = TIPO_COLETA
-        elif 'prolonga' in nome:
-            tipo = TIPO_PROLONGADO
-        else:
-            total = pd.to_numeric(df[col_valor], errors='coerce').sum() if col_valor else 0.0
-            avisos.append(
-                f"Aba '{aba}': R$ {total:,.2f} não atribuído — esta aba não traz SKU. "
-                f"Use o relatório de Custos por serviço de armazenamento para atribuir."
-            )
-            continue
+        tipo = next((t for chave, t in _ABAS_CONHECIDAS if chave in nome), None)
 
-        if not col_mlb or not col_valor:
-            avisos.append(f"Aba '{aba}': ignorada, não encontrei coluna de anúncio ou de valor.")
+        if tipo is None:
+            total = pd.to_numeric(df[col_valor], errors='coerce').sum() if col_valor else 0.0
+            if 'armazenamento' in nome or 'armazenagem' in nome:
+                # Esta aba e a FATURA do mesmo custo que vem detalhado por
+                # anuncio no relatorio de Custos por servico de armazenamento.
+                # Gravar as duas contaria em dobro — por isso e ignorada aqui,
+                # e nao porque o dinheiro esteja se perdendo.
+                avisos.append(
+                    f"Aba '{aba}': R$ {total:,.2f} não é lançado por aqui para não "
+                    f"contar em dobro — este mesmo custo entra detalhado por anúncio "
+                    f"pelo relatório de Custos por serviço de armazenamento."
+                )
+                continue
+            # Aba desconhecida com valor: grava ao nivel da loja em vez de
+            # descartar. Foi cobrado, entao tem que aparecer na margem.
+            tipo = 'FULL_' + re.sub(r'[^A-Z0-9]+', '_',
+                                    _texto(aba).upper()).strip('_')[:44]
+            avisos.append(
+                f"Aba '{aba}' não é conhecida pelo sistema: R$ {total:,.2f} foi "
+                f"lançado ao nível da loja, sem anúncio, como '{tipo}'."
+            )
+
+        if not col_valor:
+            avisos.append(f"Aba '{aba}': ignorada, não encontrei coluna de valor.")
             continue
 
         datas = pd.to_datetime(df[col_data], errors='coerce') if col_data else None
 
         for i, row in df.iterrows():
             valor = _num(row[col_valor])
-            mlbs = extrair_mlbs(row[col_mlb])
-            if valor == 0 or not mlbs:
+            # Cobranca da loja inteira (excesso de espaco, por exemplo) nao
+            # tem anuncio: grava com codigo_anuncio vazio em vez de descartar.
+            mlbs = extrair_mlbs(row[col_mlb]) if col_mlb else []
+            if not mlbs:
+                mlbs = ['']
+            if valor == 0:
                 continue
             data = datas.iloc[i] if datas is not None and pd.notna(datas.iloc[i]) else None
             # Linha com 2 anúncios: divide o valor igualmente entre eles.
