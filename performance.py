@@ -787,7 +787,13 @@ def _render_tab_margem_real(engine, ano_mes):
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_COLETA'), 0)      AS coleta,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM_PROLONGADA'), 0) AS antigo,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'ADS'), 0)              AS ads,
-                   COALESCE(SUM(valor) FILTER (WHERE tipo NOT LIKE 'FULL%%' AND tipo <> 'ADS'), 0) AS outros
+                   -- Tudo que nao e um dos quatro tipos nomeados acima. Definido
+                   -- por exclusao de propósito: o ML cria tipos de custo novos
+                   -- (excesso de espaco, retirada de estoque), e um filtro por
+                   -- prefixo deixaria esses valores fora da conta sem avisar.
+                   COALESCE(SUM(valor) FILTER (
+                       WHERE tipo NOT IN ('FULL_ARMAZENAGEM','FULL_COLETA',
+                                          'FULL_ARMAZENAGEM_PROLONGADA','ADS')), 0) AS outros
             FROM fact_custos_extras
             WHERE periodo_inicio >= %(ini)s AND periodo_inicio < %(fim)s {filtro_c}
             GROUP BY loja
