@@ -971,10 +971,16 @@ def _tab_fechamento_estoque(engine):
     )
 
     sub_painel, sub_upload = st.tabs(["📊 Painel do mês", "⬆️ Subir relatórios"])
-    with sub_painel:
-        _fechamento_painel(engine)
+
+    # O upload roda ANTES do painel de propósito. As duas sub-tabs são
+    # renderizadas no mesmo ciclo do Streamlit, na ordem em que o código
+    # executa — e não na ordem em que aparecem na tela. Com o painel primeiro,
+    # ele consultava o banco antes da gravação do mesmo clique acontecer e
+    # ficava sempre um upload atrasado.
     with sub_upload:
         _fechamento_upload(engine)
+    with sub_painel:
+        _fechamento_painel(engine)
 
 
 def _fechamento_painel(engine):
@@ -1035,22 +1041,21 @@ def _fechamento_painel(engine):
 
     valor_estoque = float(df['valor_estoque'].sum())
     valor_tr = float(df['valor_transito_full'].sum())
+    valor_imp = float(df['valor_importacao'].sum())
+    un_imp = int(df['importacao'].sum())
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Estoque", _fmt_brl(valor_estoque),
               help="Disponível + indisponível, nos locais que você acessa.")
     c2.metric("A caminho dos Fulls", _fmt_brl(valor_tr),
               help="Saiu do galpão e ainda não chegou ao CD. Soma ao imobilizado.")
-    c3.metric("Imobilizado", _fmt_brl(valor_estoque + valor_tr))
-    c4.metric("Unidades", _fmt_int(df['disponivel'].sum() + df['indisponivel'].sum()))
-
-    importacao = float(df['valor_importacao'].sum())
-    if importacao:
-        st.caption(
-            f"➕ **Importação a caminho do galpão: {_fmt_brl(importacao)}** "
-            f"({_fmt_int(df['importacao'].sum())} un.) — fora do total acima, "
-            f"porque mercadoria que ainda não chegou não é estoque."
-        )
+    c3.metric("Imobilizado", _fmt_brl(valor_estoque + valor_tr),
+              help="Estoque + o que está a caminho dos Fulls.")
+    c4.metric("Importação", _fmt_brl(valor_imp),
+              help="Compra a caminho do galpão. NÃO entra no imobilizado: "
+                   "mercadoria que ainda não chegou não é estoque.")
+    c5.metric("Unidades", _fmt_int(df['disponivel'].sum() + df['indisponivel'].sum()),
+              help="Unidades em estoque, sem contar as que estão a caminho.")
 
     sem_custo = int(df['un_sem_custo'].sum())
     if sem_custo:
@@ -1060,17 +1065,45 @@ def _fechamento_painel(engine):
             f"subestimado nessa medida."
         )
 
-    disp = pd.DataFrame({
-        'Local': df['local_estoque'],
-        'SKUs': df['skus'].apply(_fmt_int),
-        'Disponível': df['disponivel'].apply(_fmt_int),
-        'Indisponível': df['indisponivel'].apply(_fmt_int),
-        'Estoque (R$)': df['valor_estoque'].apply(_fmt_brl),
-        'A caminho': df['transito_full'].apply(_fmt_int),
-        'A caminho (R$)': df['valor_transito_full'].apply(_fmt_brl),
-        'Sem custo (un)': df['un_sem_custo'].apply(_fmt_int),
+    # Uma linha por local, depois o TOTAL, depois a importação — que fica
+    # separada logo abaixo do total, e não somada nele, de propósito.
+    linhas = [{
+        'Local': r['local_estoque'],
+        'SKUs': _fmt_int(r['skus']),
+        'Disponível': _fmt_int(r['disponivel']),
+        'Indisponível': _fmt_int(r['indisponivel']),
+        'Estoque (R$)': _fmt_brl(r['valor_estoque']),
+        'Em trânsito (un)': _fmt_int(r['transito_full']),
+        'Em trânsito (R$)': _fmt_brl(r['valor_transito_full']),
+        'Sem custo (un)': _fmt_int(r['un_sem_custo']),
+    } for _, r in df.iterrows()]
+
+    linhas.append({
+        'Local': 'TOTAL',
+        'SKUs': _fmt_int(df['skus'].sum()),
+        'Disponível': _fmt_int(df['disponivel'].sum()),
+        'Indisponível': _fmt_int(df['indisponivel'].sum()),
+        'Estoque (R$)': _fmt_brl(valor_estoque),
+        'Em trânsito (un)': _fmt_int(df['transito_full'].sum()),
+        'Em trânsito (R$)': _fmt_brl(valor_tr),
+        'Sem custo (un)': _fmt_int(sem_custo),
     })
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    if un_imp or valor_imp:
+        linhas.append({
+            'Local': '➕ Importação a caminho do galpão (fora do total)',
+            'SKUs': '', 'Disponível': '', 'Indisponível': '', 'Estoque (R$)': '',
+            'Em trânsito (un)': _fmt_int(un_imp),
+            'Em trânsito (R$)': _fmt_brl(valor_imp),
+            'Sem custo (un)': '',
+        })
+
+    st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+    st.caption(
+        f"**Imobilizado hoje: {_fmt_brl(valor_estoque + valor_tr)}** — estoque "
+        f"mais o que está a caminho dos Fulls. A importação de "
+        f"{_fmt_brl(valor_imp)} fica de fora porque ainda não chegou ao galpão."
+    )
 
     _fechamento_detalhes(engine, ref, where, params)
 
