@@ -22,10 +22,21 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
         valida contra dim_produtos, faz UPSERT em dim_estoque, registra
         em log_uploads.
 
+  Tab 5 — 💸 Despesas de Full
+        Upload dos relatórios de custo de Full do ML.
+
+  Tab 6 — 🧾 Fechamento de Estoque
+        Foto mensal valorizada do galpão e de cada Full, ao preço de compra
+        congelado no upload, em fact_estoque_mensal. É outra coisa da tab 3:
+        aquela é o saldo de hoje para calcular giro, esta é o dia 1º por
+        local, que ninguém sobrescreve. A leitura dos quatro formatos de
+        relatório mora em processar_estoque_full.py.
+
 Dependências internas:
     database_utils.get_engine       — engine cacheado (v3.6)
     database_utils.gravar_log_upload — log de uploads
     permissoes.filtrar_query_por_loja — RBAC nas queries
+    processar_estoque_full          — leitura/valorização do fechamento
 """
 
 import streamlit as st
@@ -916,6 +927,362 @@ def _painel_status_full(engine):
     st.divider()
 
 
+# ============================================================
+# TAB 6 — FECHAMENTO DE ESTOQUE
+# ============================================================
+
+# (rótulo na tela, marketplace em dim_lojas, leitor, extensões aceitas)
+_ORIGENS_FECHAMENTO = {
+    'Galpão (Upseller)':   (None,            'upseller', ['xlsx', 'xls']),
+    'Mercado Livre (Full)': ('MERCADO LIVRE', 'ml',       ['xlsx', 'xls']),
+    'Amazon (FBA)':         ('AMAZON',        'amazon',   ['csv']),
+    'Shopee (FBS)':         ('SHOPEE',        'shopee',   ['xlsx', 'xls']),
+}
+
+
+def _ultimo_dia_mes_anterior(hoje=None):
+    """
+    Data de referência padrão do fechamento.
+
+    Convenção do Thiago: a posição é puxada no dia 1º e vale como fechamento
+    do mês que acabou. Puxar dia 1º e etiquetar como setembro faria o
+    fechamento de agosto nunca existir.
+    """
+    hoje = hoje or date.today()
+    return hoje.replace(day=1) - timedelta(days=1)
+
+
+def _meses_com_fechamento(engine):
+    try:
+        df = _query_to_df(engine, """
+            SELECT DISTINCT data_referencia FROM fact_estoque_mensal
+            ORDER BY data_referencia DESC
+        """)
+        return [d for d in df['data_referencia']] if not df.empty else []
+    except Exception:
+        return []
+
+
+def _tab_fechamento_estoque(engine):
+    st.subheader("📦 Fechamento de Estoque")
+    st.caption(
+        "Posição valorizada do galpão e de cada Full, ao custo de compra "
+        "congelado no dia do upload."
+    )
+
+    sub_painel, sub_upload = st.tabs(["📊 Painel do mês", "⬆️ Subir relatórios"])
+    with sub_painel:
+        _fechamento_painel(engine)
+    with sub_upload:
+        _fechamento_upload(engine)
+
+
+def _fechamento_painel(engine):
+    meses = _meses_com_fechamento(engine)
+    if not meses:
+        st.info(
+            "Nenhum fechamento gravado ainda. Use **Subir relatórios** para "
+            "carregar a posição de cada local."
+        )
+        return
+
+    ref = st.selectbox(
+        "📅 Mês de referência", meses,
+        format_func=lambda d: d.strftime('%m/%Y') if hasattr(d, 'strftime') else str(d),
+        key="fech_ref",
+    )
+
+    where, params = ["data_referencia = %s"], [ref]
+    if not ve_todas_lojas():
+        # Quem só vê algumas lojas não vê o galpão: ele é da empresa inteira.
+        permitidas = get_lojas_usuario(engine)
+        if not permitidas:
+            st.warning("Você não tem loja liberada para ver o fechamento.")
+            return
+        where.append("loja = ANY(%s)")
+        params.append(list(permitidas))
+
+    df = _query_to_df(engine, f"""
+        SELECT local_estoque, marketplace, loja,
+               COUNT(*)                          AS skus,
+               SUM(qtd_disponivel)               AS disponivel,
+               SUM(qtd_indisponivel)             AS indisponivel,
+               SUM(valor_disponivel + valor_indisponivel) AS valor_estoque,
+               SUM(CASE WHEN transito_tipo = 'ENTRADA_FULL'
+                        THEN qtd_transito ELSE 0 END)     AS transito_full,
+               SUM(CASE WHEN transito_tipo = 'ENTRADA_FULL'
+                        THEN valor_transito ELSE 0 END)   AS valor_transito_full,
+               SUM(CASE WHEN transito_tipo = 'IMPORTACAO'
+                        THEN qtd_transito ELSE 0 END)     AS importacao,
+               SUM(CASE WHEN transito_tipo = 'IMPORTACAO'
+                        THEN valor_transito ELSE 0 END)   AS valor_importacao,
+               SUM(CASE WHEN sku_cadastrado THEN 0
+                        ELSE qtd_disponivel + qtd_indisponivel END) AS un_sem_custo,
+               MAX(data_upload)                  AS atualizado_em
+        FROM fact_estoque_mensal
+        WHERE {' AND '.join(where)}
+        GROUP BY local_estoque, marketplace, loja
+        ORDER BY SUM(valor_disponivel + valor_indisponivel) DESC
+    """, params)
+
+    if df.empty:
+        st.info("Sem dados neste mês para as lojas que você acessa.")
+        return
+
+    num = ['skus', 'disponivel', 'indisponivel', 'valor_estoque', 'transito_full',
+           'valor_transito_full', 'importacao', 'valor_importacao', 'un_sem_custo']
+    df = _coerce_num(df, num).fillna({c: 0 for c in num})
+
+    valor_estoque = float(df['valor_estoque'].sum())
+    valor_tr = float(df['valor_transito_full'].sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Estoque", _fmt_brl(valor_estoque),
+              help="Disponível + indisponível, nos locais que você acessa.")
+    c2.metric("A caminho dos Fulls", _fmt_brl(valor_tr),
+              help="Saiu do galpão e ainda não chegou ao CD. Soma ao imobilizado.")
+    c3.metric("Imobilizado", _fmt_brl(valor_estoque + valor_tr))
+    c4.metric("Unidades", _fmt_int(df['disponivel'].sum() + df['indisponivel'].sum()))
+
+    importacao = float(df['valor_importacao'].sum())
+    if importacao:
+        st.caption(
+            f"➕ **Importação a caminho do galpão: {_fmt_brl(importacao)}** "
+            f"({_fmt_int(df['importacao'].sum())} un.) — fora do total acima, "
+            f"porque mercadoria que ainda não chegou não é estoque."
+        )
+
+    sem_custo = int(df['un_sem_custo'].sum())
+    if sem_custo:
+        st.warning(
+            f"⚠️ {_fmt_int(sem_custo)} unidade(s) entraram valendo **zero** por "
+            f"não terem preço de compra cadastrado. O valor acima está "
+            f"subestimado nessa medida."
+        )
+
+    disp = pd.DataFrame({
+        'Local': df['local_estoque'],
+        'SKUs': df['skus'].apply(_fmt_int),
+        'Disponível': df['disponivel'].apply(_fmt_int),
+        'Indisponível': df['indisponivel'].apply(_fmt_int),
+        'Estoque (R$)': df['valor_estoque'].apply(_fmt_brl),
+        'A caminho': df['transito_full'].apply(_fmt_int),
+        'A caminho (R$)': df['valor_transito_full'].apply(_fmt_brl),
+        'Sem custo (un)': df['un_sem_custo'].apply(_fmt_int),
+    })
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    _fechamento_detalhes(engine, ref, where, params)
+
+
+def _fechamento_detalhes(engine, ref, where, params):
+    """Quebra por motivo de indisponibilidade e lista de SKUs sem custo."""
+    with st.expander("🔍 Por que há estoque indisponível"):
+        df = _query_to_df(engine, f"""
+            SELECT local_estoque, m.key AS motivo, SUM(m.value::int) AS unidades
+            FROM fact_estoque_mensal,
+                 LATERAL jsonb_each_text(COALESCE(motivos_indisponivel, '{{}}'::jsonb)) m
+            WHERE {' AND '.join(where)}
+            GROUP BY local_estoque, m.key
+            HAVING SUM(m.value::int) > 0
+            ORDER BY SUM(m.value::int) DESC
+        """, params)
+        if df.empty:
+            st.caption("Nenhuma unidade indisponível neste fechamento.")
+        else:
+            df = _coerce_num(df, ['unidades'])
+            st.dataframe(df.rename(columns={
+                'local_estoque': 'Local', 'motivo': 'Motivo', 'unidades': 'Unidades',
+            }), use_container_width=True, hide_index=True)
+
+    with st.expander("⚠️ SKUs sem preço de compra"):
+        df = _query_to_df(engine, f"""
+            SELECT local_estoque, sku,
+                   qtd_disponivel + qtd_indisponivel + qtd_transito AS unidades
+            FROM fact_estoque_mensal
+            WHERE {' AND '.join(where)} AND sku_cadastrado = FALSE
+              AND qtd_disponivel + qtd_indisponivel + qtd_transito > 0
+            ORDER BY 3 DESC
+        """, params)
+        if df.empty:
+            st.caption("Todos os SKUs deste fechamento têm preço de compra. 🎉")
+        else:
+            df = _coerce_num(df, ['unidades'])
+            st.caption(
+                "Cadastrar o preço de compra destes SKUs e subir o arquivo de "
+                "novo corrige o fechamento — o upload substitui o local inteiro."
+            )
+            st.dataframe(df.rename(columns={
+                'local_estoque': 'Local', 'sku': 'SKU', 'unidades': 'Unidades',
+            }), use_container_width=True, hide_index=True)
+
+
+def _fechamento_upload(engine):
+    from processar_estoque_full import (
+        ler_ml, ler_amazon, ler_shopee, ler_upseller,
+        buscar_mapa_asin, buscar_precos_compra, valorizar, gravar_fechamento,
+        LOCAL_GALPAO, TRANSITO_ENTRADA_FULL, TRANSITO_IMPORTACAO,
+    )
+    from database_utils import buscar_mapeamento_skus
+
+    c1, c2 = st.columns([1.4, 1])
+    with c1:
+        origem = st.selectbox("📥 Origem do relatório",
+                              list(_ORIGENS_FECHAMENTO.keys()), key="fech_origem")
+    with c2:
+        ref = st.date_input("📅 Mês de referência", value=_ultimo_dia_mes_anterior(),
+                            key="fech_data",
+                            help="A posição puxada no dia 1º fecha o mês anterior.")
+
+    marketplace, leitor, extensoes = _ORIGENS_FECHAMENTO[origem]
+
+    loja = None
+    if marketplace is None:
+        local = LOCAL_GALPAO
+        transito_tipo = TRANSITO_IMPORTACAO
+        st.caption("O Upseller enxerga só o galpão, então o local já está definido.")
+    else:
+        transito_tipo = TRANSITO_ENTRADA_FULL
+        lojas_mkt = _lojas_do_marketplace(engine, marketplace)
+        if not ve_todas_lojas():
+            permitidas = set(get_lojas_usuario(engine))
+            lojas_mkt = [l for l in lojas_mkt if l in permitidas]
+        if not lojas_mkt:
+            st.warning("Nenhuma loja deste marketplace liberada para você.")
+            return
+        loja = st.selectbox("🏪 Loja", lojas_mkt, key="fech_loja")
+        local = loja
+
+    arquivo = st.file_uploader(
+        f"Relatório de estoque — {origem}", type=extensoes, key="fech_arquivo",
+        help="Um arquivo por local. Subir de novo o mesmo local substitui o "
+             "que já estava gravado naquele mês.",
+    )
+    if arquivo is None:
+        _fechamento_historico(engine)
+        return
+
+    try:
+        if leitor == 'ml':
+            df, avisos = ler_ml(arquivo)
+        elif leitor == 'shopee':
+            df, avisos = ler_shopee(arquivo)
+        elif leitor == 'upseller':
+            df, avisos = ler_upseller(arquivo)
+        else:
+            df, avisos = ler_amazon(arquivo, buscar_mapa_asin(engine),
+                                    buscar_mapeamento_skus(engine))
+    except Exception as exc:
+        st.error(f"Falha ao ler o arquivo: {exc}")
+        return
+
+    for aviso in avisos:
+        st.warning(f"⚠️ {aviso}")
+
+    if df.empty:
+        st.error("O arquivo não produziu nenhuma linha de estoque.")
+        return
+
+    df = valorizar(df, buscar_precos_compra(engine))
+
+    unidades = int(df['disponivel'].sum() + df['indisponivel'].sum())
+    valor = float(df['valor_disponivel'].sum() + df['valor_indisponivel'].sum())
+    transito = int(df['transito'].sum())
+    sem_custo = df[~df['sku_cadastrado']]
+    un_sem_custo = int(sem_custo['disponivel'].sum() + sem_custo['indisponivel'].sum())
+
+    st.markdown(f"### Prévia — `{local}`, fechamento de **{ref.strftime('%m/%Y')}**")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("SKUs", _fmt_int(len(df)))
+    c2.metric("Unidades", _fmt_int(unidades))
+    c3.metric("Valor", _fmt_brl(valor))
+    c4.metric(
+        "A caminho" if transito_tipo == TRANSITO_ENTRADA_FULL else "Importação",
+        _fmt_int(transito),
+    )
+
+    if un_sem_custo:
+        st.warning(
+            f"⚠️ {_fmt_int(len(sem_custo))} SKU(s) sem preço de compra "
+            f"({_fmt_int(un_sem_custo)} unidades) vão entrar valendo zero."
+        )
+        with st.expander("Ver SKUs sem preço de compra"):
+            st.dataframe(
+                sem_custo[['sku', 'disponivel', 'indisponivel', 'transito']]
+                .rename(columns={'sku': 'SKU', 'disponivel': 'Disponível',
+                                 'indisponivel': 'Indisponível',
+                                 'transito': 'Trânsito'}),
+                use_container_width=True, hide_index=True,
+            )
+
+    with st.expander("Ver as linhas que serão gravadas"):
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    if st.button(f"💾 Gravar fechamento de `{local}`", type="primary",
+                 key="fech_gravar"):
+        res = gravar_fechamento(engine, df, ref, local, marketplace, loja,
+                                transito_tipo, arquivo.name)
+        gravar_log_upload(engine, {
+            'marketplace': marketplace or 'UPSELLER',
+            'loja': loja or LOCAL_GALPAO,
+            'arquivo_nome': arquivo.name,
+            'periodo_inicio': None,
+            'periodo_fim': None,
+            'total_linhas': int(len(df)),
+            'linhas_importadas': res['inseridos'],
+            'linhas_erro': int(len(df)) - res['inseridos'],
+        })
+        st.cache_data.clear()
+        st.success(f"✅ {res['mensagem']}")
+        st.rerun()
+
+    _fechamento_historico(engine)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lojas_do_marketplace(_engine, marketplace):
+    try:
+        df = pd.read_sql(
+            "SELECT DISTINCT loja FROM dim_lojas WHERE marketplace = %s ORDER BY loja",
+            _engine, params=(marketplace,),
+        )
+        return df['loja'].dropna().tolist()
+    except Exception:
+        return []
+
+
+def _fechamento_historico(engine):
+    st.markdown("### 🗂️ O que já está fechado")
+    try:
+        df = _query_to_df(engine, """
+            SELECT data_referencia, local_estoque,
+                   COUNT(*) AS skus,
+                   SUM(qtd_disponivel + qtd_indisponivel) AS unidades,
+                   SUM(valor_disponivel + valor_indisponivel) AS valor,
+                   MAX(data_upload) AS quando
+            FROM fact_estoque_mensal
+            GROUP BY data_referencia, local_estoque
+            ORDER BY data_referencia DESC, local_estoque
+            LIMIT 40
+        """)
+        if df.empty:
+            st.caption("Nenhum fechamento gravado ainda.")
+            return
+        df = _coerce_num(df, ['skus', 'unidades', 'valor'])
+        st.dataframe(pd.DataFrame({
+            'Mês': df['data_referencia'].apply(
+                lambda d: d.strftime('%m/%Y') if hasattr(d, 'strftime') else str(d)),
+            'Local': df['local_estoque'],
+            'SKUs': df['skus'].apply(_fmt_int),
+            'Unidades': df['unidades'].apply(_fmt_int),
+            'Valor': df['valor'].apply(_fmt_brl),
+            'Subido em': pd.to_datetime(df['quando']).dt.strftime('%d/%m/%Y %H:%M'),
+        }), use_container_width=True, hide_index=True)
+    except Exception:
+        st.caption("Histórico indisponível.")
+
+
 def _tab_despesas_full(engine):
     """
     Tab de upload dos relatorios de custo de Full.
@@ -1068,12 +1435,13 @@ def main():
     st.header("📈 Análise de Produtos")
     engine = get_engine()
 
-    t1, t2, t3, t4, t5 = st.tabs([
+    t1, t2, t3, t4, t5, t6 = st.tabs([
         "🏆 Mais Vendidos",
         "📈 Crescimento & Queda",
         "📦 Cobertura de Estoque",
         "⬆️ Atualizar Estoque (Upseller)",
         "💸 Despesas de Full",
+        "🧾 Fechamento de Estoque",
     ])
     with t1:
         _tab_mais_vendidos(engine)
@@ -1085,6 +1453,8 @@ def main():
         _tab_upload_estoque(engine)
     with t5:
         _tab_despesas_full(engine)
+    with t6:
+        _tab_fechamento_estoque(engine)
 
 
 if __name__ == "__main__":

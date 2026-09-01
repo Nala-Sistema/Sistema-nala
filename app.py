@@ -906,6 +906,7 @@ def main():
     engine = get_engine()
     _garantir_tabela_usuario_lojas(engine)
     _garantir_tabela_estoque(engine)
+    _garantir_tabela_estoque_mensal(engine)
     _garantir_coluna_visivel_painel(engine)
     _garantir_tabela_tiktok_skus(engine)
     _garantir_colunas_custos_extras(engine)
@@ -967,6 +968,62 @@ def _garantir_tabela_estoque(engine):
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS ix_dim_estoque_data
             ON dim_estoque(data_atualizacao)
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _garantir_tabela_estoque_mensal(engine):
+    """
+    v3.7: fact_estoque_mensal — fechamento mensal de estoque valorizado.
+
+    Nao substitui a dim_estoque: aquela guarda o saldo corrente do galpao e
+    alimenta a Cobertura de Estoque, que precisa da posicao de hoje. Esta e
+    a foto do dia 1o, por local, que ninguem mais sobrescreve.
+
+    A chave e (data_referencia, local_estoque, sku) porque o mesmo SKU existe
+    em varios locais ao mesmo tempo — foi exatamente o que impediu de usar a
+    dim_estoque, que tem PK so no sku e faria um Full apagar o outro.
+
+    custo_unitario fica congelado na linha: um mes fechado nao pode mudar de
+    valor porque alguem editou um custo depois.
+    """
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS fact_estoque_mensal (
+                data_referencia      DATE NOT NULL,
+                local_estoque        VARCHAR(60) NOT NULL,
+                sku                  VARCHAR(120) NOT NULL,
+                marketplace          VARCHAR(40),
+                loja                 VARCHAR(80),
+                qtd_disponivel       INTEGER NOT NULL DEFAULT 0,
+                qtd_indisponivel     INTEGER NOT NULL DEFAULT 0,
+                qtd_transito         INTEGER NOT NULL DEFAULT 0,
+                transito_tipo        VARCHAR(20),
+                motivos_indisponivel JSONB,
+                motivos_transito     JSONB,
+                custo_unitario       NUMERIC(12,2),
+                valor_disponivel     NUMERIC(14,2) NOT NULL DEFAULT 0,
+                valor_indisponivel   NUMERIC(14,2) NOT NULL DEFAULT 0,
+                valor_transito       NUMERIC(14,2) NOT NULL DEFAULT 0,
+                sku_cadastrado       BOOLEAN NOT NULL DEFAULT FALSE,
+                arquivo_origem       VARCHAR(255),
+                data_upload          TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (data_referencia, local_estoque, sku)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS ix_estoque_mensal_ref
+            ON fact_estoque_mensal(data_referencia)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS ix_estoque_mensal_loja
+            ON fact_estoque_mensal(loja)
         """)
         conn.commit()
         cursor.close()
