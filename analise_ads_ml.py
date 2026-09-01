@@ -47,22 +47,125 @@ def _fmt_pct(v):
         return "—"
 
 
+def _cruzamento_tacos_ml(engine):
+    """
+    Cruza o gasto de ads (por anúncio/MLB) com a venda real do produto no
+    sistema, no mesmo período — MATCH EXATO POR MLB (o ML ads traz o MLB em
+    codigo_anuncio, e as vendas ML guardam o mesmo MLB → SKU). Não precisa de
+    título nem de match manual como o Shopee. Mostra o TACOS real (gasto ÷
+    venda total do produto no período), que o painel do ML não dá.
+    """
+    st.subheader("🔗 Cruzamento Ads ↔ Vendas (TACOS real)")
+    st.caption(
+        "Cruzamento exato por **MLB**: liga cada anúncio ao SKU pela venda "
+        "real do sistema. **TACOS real = investido ÷ venda total do produto "
+        "no período** (o que o painel do ML não mostra)."
+    )
+
+    def _q(sql, params=()):
+        conn = engine.raw_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
+        finally:
+            cur.close()
+            conn.close()
+
+    lojas = _q("SELECT DISTINCT loja FROM fact_ads_performance "
+               "WHERE marketplace='MERCADO LIVRE' ORDER BY loja")['loja'].tolist()
+    if not lojas:
+        st.info("Nenhum relatório de ads de ML gravado ainda. Suba um na aba **Upload**.")
+        return
+
+    loja = st.selectbox("Loja", lojas, key="cruz_ml_loja")
+    per = _q("SELECT DISTINCT periodo_inicio, periodo_fim FROM fact_ads_performance "
+             "WHERE marketplace='MERCADO LIVRE' AND loja=%s "
+             "ORDER BY periodo_fim DESC, periodo_inicio DESC", (loja,))
+    if per.empty:
+        st.info("Sem períodos para esta loja.")
+        return
+    opts = [f"{pi.strftime('%d/%m/%Y')} a {pf.strftime('%d/%m/%Y')}"
+            for pi, pf in zip(per['periodo_inicio'], per['periodo_fim'])]
+    i = st.selectbox("Período", range(len(opts)), format_func=lambda i: opts[i], key="cruz_ml_per")
+    ini, fim = per['periodo_inicio'][i], per['periodo_fim'][i]
+
+    df = _q("""
+        SELECT a.codigo_anuncio AS mlb, a.titulo AS titulo, v.skus AS skus,
+               a.gasto_ads AS gasto, v.receita_total AS venda_total,
+               CASE WHEN v.receita_total>0 THEN a.gasto_ads/v.receita_total*100 END AS tacos_real
+        FROM fact_ads_performance a
+        LEFT JOIN LATERAL (
+            SELECT string_agg(DISTINCT s.sku, ', ') AS skus,
+                   SUM(s.valor_venda_efetivo) AS receita_total
+            FROM fact_vendas_snapshot s
+            WHERE UPPER(s.marketplace_origem)='MERCADO LIVRE' AND s.loja_origem=%s
+              AND s.codigo_anuncio=a.codigo_anuncio
+              AND s.data_venda BETWEEN %s AND %s
+        ) v ON true
+        WHERE a.marketplace='MERCADO LIVRE' AND a.loja=%s
+          AND a.periodo_inicio=%s AND a.periodo_fim=%s AND a.gasto_ads>0
+        ORDER BY a.gasto_ads DESC
+    """, (loja, ini, fim, loja, ini, fim))
+
+    if df.empty:
+        st.info("Nenhum anúncio com gasto neste período.")
+        return
+
+    gasto_tot = float(df['gasto'].fillna(0).sum())
+    venda_tot = float(df['venda_total'].fillna(0).sum())
+    casaram = int((df['venda_total'].fillna(0) > 0).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Investimento", _fmt_brl(gasto_tot))
+    c2.metric("TACOS da conta", _fmt_pct(100.0 * gasto_tot / venda_tot) if venda_tot else "—")
+    c3.metric("Anúncios com gasto", _fmt_int(len(df)))
+    c4.metric("Casaram (têm venda)", f"{casaram}/{len(df)}")
+
+    show = df.copy()
+    show['gasto'] = show['gasto'].apply(_fmt_brl)
+    show['venda_total'] = show['venda_total'].apply(
+        lambda v: _fmt_brl(v) if v and float(v) > 0 else '— sem venda —')
+    show['tacos_real'] = show['tacos_real'].apply(
+        lambda v: _fmt_pct(float(v)) if v is not None else 'N/A')
+    show['skus'] = show['skus'].fillna('❌ não vendeu no período')
+    show['titulo'] = show['titulo'].astype(str).str[:45]
+    show = show[['mlb', 'titulo', 'skus', 'gasto', 'venda_total', 'tacos_real']]
+    show.columns = ['MLB', 'Título', 'SKU(s)', 'Investido', 'Venda no período', 'TACOS real']
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.caption(
+        "**TACOS real** = investido ÷ venda total do produto no período. "
+        "*'sem venda'* = anúncio rodou mas o produto não vendeu (candidato a revisão). "
+        "TACOS acima de ~3% no nível produto é sinal de atenção."
+    )
+
+
 def modulo_ads_ml(engine):
     """
     Ponto de entrada da aba, chamado pelo roteador `analise_ads.py`.
+    Duas sub-abas: Upload (ingestão) e Cruzamento (TACOS real ads↔vendas).
 
-    Todo o corpo roda dentro de try/except pelo mesmo motivo da tab de
-    Despesas de Full: esta aba divide a tela com a de Shopee, que já está em
-    uso, e uma exceção aqui não pode derrubar a outra.
+    Cada uma roda em try/except próprio pelo mesmo motivo da tab de Despesas
+    de Full: esta aba divide a tela com a de Shopee, que já está em uso, e uma
+    exceção aqui não pode derrubar a outra.
     """
-    try:
-        _render(engine)
-    except Exception as e:
-        st.error(
-            "Esta aba encontrou um erro e foi isolada — as demais continuam "
-            "funcionando normalmente."
-        )
-        st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
+    sub_up, sub_cruz = st.tabs(["📤 Upload", "🔗 Cruzamento — TACOS real"])
+    with sub_up:
+        try:
+            _render(engine)
+        except Exception as e:
+            st.error(
+                "Esta aba encontrou um erro e foi isolada — as demais continuam "
+                "funcionando normalmente."
+            )
+            st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
+    with sub_cruz:
+        try:
+            _cruzamento_tacos_ml(engine)
+        except Exception as e:
+            st.error("O cruzamento encontrou um erro e foi isolado.")
+            st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
 
 
 def _render(engine):
