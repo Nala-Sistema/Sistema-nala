@@ -589,11 +589,27 @@ def identificar_loja(engine, codigos_anuncio, marketplace='MERCADO LIVRE'):
 #  sao coisas diferentes.)
 DIAS_PRAZO = (3, 18)
 
+# (tipo, rotulo, arquivo de origem, cobravel)
+#
+# `cobravel` diz se o sistema pode exigir o envio por data. So a armazenagem
+# pode: o relatorio dela e acumulado e atualiza continuamente.
+#
+# Os demais vem do Relatorio de Tarifas Full, que e um FECHAMENTO FINANCEIRO
+# publicado pelo ML em data propria de cada loja. Em 01/09/2026, com os quatro
+# arquivos baixados no mesmo minuto, a coleta ia ate 19/08 na Nala, 01/08 na
+# LPT, 30/07 na YanniRJ e 15/07 na YanniSP. Cobrar "suba o relatorio atual"
+# nesses casos manda o gestor buscar arquivo que o ML ainda nao liberou.
 TIPOS_FULL = [
-    (TIPO_ARMAZENAGEM, 'Armazenagem', 'Custos por serviço de armazenamento'),
-    (TIPO_COLETA, 'Coleta', 'Relatório de Tarifas Full'),
-    (TIPO_PROLONGADO, 'Estoque antigo', 'Relatório de Tarifas Full'),
+    (TIPO_ARMAZENAGEM, 'Armazenagem',    'Custos por serviço de armazenamento', True),
+    (TIPO_COLETA,      'Coleta',         'Relatório de Tarifas Full',           False),
+    (TIPO_PROLONGADO,  'Estoque antigo', 'Relatório de Tarifas Full',           False),
 ]
+
+# Tipos que vem do Relatorio de Tarifas Full. Se a loja tem QUALQUER um deles,
+# o arquivo foi enviado — entao um tipo ausente significa "sem cobranca no
+# periodo", nao "nunca enviado". Sem isso o sistema confunde ausencia de
+# cobranca com ausencia de dado, e manda procurar arquivo que ja subiu.
+TIPOS_DE_TARIFAS = (TIPO_COLETA, TIPO_PROLONGADO, TIPO_EXCESSO, TIPO_RETIRADA)
 
 
 def ultimo_prazo(hoje=None):
@@ -634,18 +650,19 @@ def proximo_prazo(hoje=None):
 
 def status_custos_full(engine, marketplace='MERCADO LIVRE', lojas=None):
     """
-    Status dos custos de Full por loja e tipo, cobrando a quinzena vencida.
+    Status dos custos de Full por loja e tipo.
 
-    A cobranca e sobre COBERTURA (`periodo_fim`), nao sobre data de upload:
-    nos dados reais o Thiago subiu tudo no mesmo dia e ainda assim varias
-    lojas seguiam descobertas, porque os arquivos disponiveis eram de julho.
-    Um semaforo baseado em "enviei hoje" ficaria todo verde escondendo a
-    lacuna.
+    Devolve DataFrame com loja, tipo, ate, subido_em, situacao e atrasado.
 
-    `lojas` restringe o resultado (RBAC): o gestor de loja so deve ver e ser
-    cobrado pelas lojas dele.
+    `situacao` distingue tres estados que antes eram um so:
+      'em_dia'       — cobertura alcanca o fim da quinzena vencida
+      'sem_cobranca' — o Relatorio de Tarifas Full foi enviado e nao trouxe
+                       esse custo (a loja nao teve estoque antigo, p.ex.)
+      'nao_enviado'  — nao ha nenhum dado dessa familia para a loja
+      'atrasado'     — so para armazenagem, que e o unico tipo cobravel
 
-    Devolve DataFrame com loja, tipo, ate, subido_em e atrasado.
+    `atrasado` fica True apenas para tipo cobravel. Os demais dependem do ML
+    publicar o fechamento, entao exigir data seria cobrar o impossivel.
     """
     fim_quinzena, _prazo, _rotulo = quinzena_cobrada()
 
@@ -669,7 +686,27 @@ def status_custos_full(engine, marketplace='MERCADO LIVRE', lojas=None):
     df = pd.read_sql(sql, engine, params=params)
     df['subido_em'] = pd.to_datetime(df['subido_em']).dt.date
     df['ate'] = pd.to_datetime(df['ate']).dt.date
-    df['atrasado'] = df['ate'].isna() | (df['ate'] < fim_quinzena)
+
+    # Lojas que ja enviaram algum custo da familia Tarifas Full
+    enviou_tarifas = set(pd.read_sql("""
+        SELECT DISTINCT loja FROM fact_custos_extras
+        WHERE marketplace = %(mkt)s AND tipo = ANY(%(tt)s)
+    """, engine, params={'mkt': marketplace, 'tt': list(TIPOS_DE_TARIFAS)})['loja'])
+
+    cobravel = {t[0]: t[3] for t in TIPOS_FULL}
+
+    def _situacao(r):
+        if pd.notna(r['ate']):
+            return 'em_dia' if r['ate'] >= fim_quinzena else (
+                'atrasado' if cobravel.get(r['tipo']) else 'defasado')
+        if not cobravel.get(r['tipo']) and r['loja'] in enviou_tarifas:
+            return 'sem_cobranca'
+        return 'nao_enviado'
+
+    df['situacao'] = df.apply(_situacao, axis=1)
+    df['atrasado'] = (df['situacao'] == 'atrasado') | (
+        (df['situacao'] == 'nao_enviado') & df['tipo'].map(cobravel).fillna(False)
+    )
     return df
 
 
