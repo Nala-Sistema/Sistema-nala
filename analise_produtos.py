@@ -1162,6 +1162,12 @@ def _fechamento_upload(engine):
         _fechamento_historico(engine)
         return
 
+    # O arquivo é lido a cada rerun do Streamlit — e o buffer fica no fim da
+    # leitura anterior. Sem rebobinar, a segunda leitura vem vazia e a tela
+    # volta sem preview e sem botão, como se o clique não tivesse feito nada.
+    if hasattr(arquivo, 'seek'):
+        arquivo.seek(0)
+
     try:
         if leitor == 'ml':
             df, avisos = ler_ml(arquivo)
@@ -1233,9 +1239,10 @@ def _fechamento_upload(engine):
             'linhas_importadas': res['inseridos'],
             'linhas_erro': int(len(df)) - res['inseridos'],
         })
-        st.cache_data.clear()
+        # Sem st.rerun() aqui: ele reinicia o script na hora e joga fora a
+        # mensagem abaixo, que é justamente a confirmação de que gravou.
         st.success(f"✅ {res['mensagem']}")
-        st.rerun()
+        st.caption("Confira o resultado em **Painel do mês**.")
 
     _fechamento_historico(engine)
 
