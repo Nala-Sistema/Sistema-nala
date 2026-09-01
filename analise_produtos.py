@@ -859,40 +859,59 @@ def _painel_status_full(engine):
 
     html = ["<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"]
     html.append("<tr style='background:#f2f2f2'><th style='padding:8px;text-align:left'>Loja</th>")
-    for _, rotulo, _ in TIPOS_FULL:
+    for _, rotulo, _, _cob in TIPOS_FULL:
         html.append(f"<th style='padding:8px;text-align:center'>{rotulo}</th>")
     html.append("<th style='padding:8px;text-align:left'>O que subir</th></tr>")
 
     for loja in lojas:
         html.append(f"<tr><td style='padding:8px;border-top:1px solid #eee'><b>{loja}</b></td>")
         pendentes = set()
-        for tipo, _, arquivo in TIPOS_FULL:
+        for tipo, _, arquivo, cobravel in TIPOS_FULL:
             r = idx.get((loja, tipo))
-            atrasado = r is None or bool(r['atrasado'])
-            if r is None or pd.isna(r['ate']):
-                bg, fg, txt = '#fdecea', '#b71c1c', 'nunca enviado'
-            else:
-                bg, fg = ('#fdecea', '#b71c1c') if atrasado else ('#e8f5e9', '#1b5e20')
+            sit = r['situacao'] if r is not None else 'nao_enviado'
+
+            # Cores por situacao. So a armazenagem fica vermelha, porque e o
+            # unico custo cujo relatorio o gestor consegue baixar quando quer.
+            # Os demais dependem do ML publicar o fechamento — vermelho ali
+            # seria cobrar o impossivel e transformar o painel em ruido.
+            if sit == 'em_dia':
+                bg, fg = '#e8f5e9', '#1b5e20'
                 txt = f"cobre até {r['ate']:%d/%m}"
-            if atrasado:
+            elif sit == 'sem_cobranca':
+                bg, fg = '#eceff1', '#455a64'
+                txt = "enviado · sem cobrança"
+            elif sit == 'defasado':
+                bg, fg = '#fff8e1', '#8d6e00'
+                txt = f"até {r['ate']:%d/%m} · aguarda ML"
+            elif sit == 'atrasado':
+                bg, fg = '#fdecea', '#b71c1c'
+                txt = f"até {r['ate']:%d/%m} · atrasado"
+            else:  # nao_enviado
+                bg, fg = ('#fdecea', '#b71c1c') if cobravel else ('#fff8e1', '#8d6e00')
+                txt = "nunca enviado"
+
+            if r is not None and bool(r['atrasado']):
                 pendentes.add(arquivo)
-            cobertura = ''
-            if r is not None and not pd.isna(r['subido_em']):
-                cobertura = f"<br><span style='font-size:0.76rem;opacity:.75'>enviado {r['subido_em']:%d/%m}</span>"
+
+            rodape = ''
+            if r is not None and not pd.isna(r['subido_em']) and sit != 'sem_cobranca':
+                rodape = (f"<br><span style='font-size:0.76rem;opacity:.75'>"
+                          f"enviado {r['subido_em']:%d/%m}</span>")
             html.append(
                 f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
-                f"background:{bg};color:{fg}'>{txt}{cobertura}</td>"
+                f"background:{bg};color:{fg}'>{txt}{rodape}</td>"
             )
         acao = ' + '.join(sorted(pendentes)) if pendentes else '—'
         html.append(f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>")
     html.append("</table>")
     st.markdown(''.join(html), unsafe_allow_html=True)
     st.caption(
-        f"Rotina por quinzena: 01–15 vence dia 18, 16–fim do mês vence dia 3. "
-        f"Verde = o custo cobre até {fim_q:%d/%m}, o fim da quinzena vencida. "
-        f"O semáforo olha a cobertura, não a data de envio — subir um relatório "
-        f"antigo não fecha a quinzena. "
-        f"Baixe sempre o acumulado mais completo: subir de novo não duplica."
+        f"**Armazenagem** é cobrada por quinzena (01–15 vence dia 18; 16–fim do mês "
+        f"vence dia 3) — verde quando cobre até {fim_q:%d/%m}, vermelho quando não. "
+        f"**Coleta e estoque antigo** vêm do Relatório de Tarifas Full, que o ML "
+        f"publica em data própria de cada loja: aparecem em amarelo quando estão "
+        f"defasados, porque o gestor não consegue baixar o que ainda não foi liberado. "
+        f"Cinza significa que o relatório foi enviado e não houve cobrança daquele tipo."
     )
     st.divider()
 
