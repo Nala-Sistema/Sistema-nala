@@ -115,6 +115,46 @@ def dividir_em_centavos(valor, n):
     return [sinal * p / 100.0 for p in partes]
 
 
+def _total_do_resumo(caminho):
+    """
+    Le o total liquido da aba Resumo, achando a coluna pelo NOME.
+
+    A posicao das colunas varia entre relatorios: lojas com bonus ganham uma
+    coluna "Bonus acumulados nos seus produtos" ANTES de "Total", e ai a
+    leitura por indice fixo pega o desconto em vez do total. Foi o que
+    aconteceu com a ML-YanniRJ (acusou R$ 60,04 sendo o total R$ 481,22).
+
+    Layout observado:
+      Tipo | Tamanho | Tarifa diaria | Custos acumulados | [Bonus] | Total
+
+    Devolve o total ou None se nao encontrar.
+    """
+    try:
+        res = pd.read_excel(caminho, sheet_name='Resumo', header=None)
+    except Exception:
+        return None
+
+    col_total = None
+    for _, row in res.iterrows():
+        vals = [str(v).strip().lower() for v in row.tolist()]
+        if 'tamanho da unidade' in vals:           # linha de cabecalho
+            for idx, v in enumerate(vals):
+                if v == 'total':
+                    col_total = idx
+            break
+
+    if col_total is None:
+        # Sem cabecalho reconhecivel: usa a ultima coluna com numeros
+        numericas = [c for c in res.columns
+                     if pd.to_numeric(res[c], errors='coerce').notna().any()]
+        if not numericas:
+            return None
+        col_total = numericas[-1]
+
+    serie = pd.to_numeric(res[col_total], errors='coerce').dropna()
+    return float(serie.max()) if not serie.empty else None
+
+
 def _achar_col(df, *termos):
     """Primeira coluna cujo nome contém todos os termos (case-insensitive)."""
     for c in df.columns:
@@ -304,18 +344,17 @@ def ler_custos_armazenamento_mensal(caminho):
 
     df_out = pd.DataFrame(linhas, columns=COLUNAS_NORM)
 
-    try:
-        res = pd.read_excel(caminho, sheet_name='Resumo', header=None)
-        total_resumo = pd.to_numeric(res[5], errors='coerce').dropna().max()
+    total_resumo = _total_do_resumo(caminho)
+    if total_resumo is not None:
         total_lido = df_out['valor'].sum()
         # Tolerancia relativa: o arredondamento por mes gera centavos de desvio
         # em arquivos grandes, e um limite fixo viraria alarme falso.
-        if total_resumo and abs(total_lido - total_resumo) > max(0.50, total_resumo * 0.001):
+        if abs(total_lido - total_resumo) > max(0.50, total_resumo * 0.001):
             avisos.append(
                 f'DIVERGENCIA: o detalhe soma R$ {total_lido:,.2f} '
                 f'mas o Resumo diz R$ {total_resumo:,.2f}.'
             )
-    except Exception:
+    else:
         avisos.append('Nao foi possivel conferir contra a aba Resumo.')
 
     return df_out, avisos
