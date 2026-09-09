@@ -150,7 +150,8 @@ def modulo_ads_ml(engine):
     de Full: esta aba divide a tela com a de Shopee, que já está em uso, e uma
     exceção aqui não pode derrubar a outra.
     """
-    sub_up, sub_cruz = st.tabs(["📤 Upload", "🔗 Cruzamento — TACOS real"])
+    sub_up, sub_cruz, sub_cfg = st.tabs(
+        ["📤 Upload", "🔗 Cruzamento — TACOS real", "🎯 ROAS objetivo"])
     with sub_up:
         try:
             _render(engine)
@@ -165,6 +166,12 @@ def modulo_ads_ml(engine):
             _cruzamento_tacos_ml(engine)
         except Exception as e:
             st.error("O cruzamento encontrou um erro e foi isolado.")
+            st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
+    with sub_cfg:
+        try:
+            _captura_config(engine)
+        except Exception as e:
+            st.error("A captura encontrou um erro e foi isolada.")
             st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
 
 
@@ -284,6 +291,205 @@ def _render(engine):
         else:
             st.error(res['mensagem'])
         _resumo_gravado(engine)
+
+
+def _captura_config(engine):
+    """
+    Tela da foto semanal: ROAS objetivo, orçamento diário e sinal do ML.
+
+    Por que existe uma tela separada do Upload: o relatório de ads é do
+    PERÍODO (uma semana fechada) e a foto é do AGORA. Misturar os dois no
+    mesmo formulário faria o gestor achar que a foto também se refere ao
+    período filtrado — e ela não se refere: as colunas de orçamento e ROAS
+    objetivo do painel mostram sempre o valor de hoje, mesmo com o filtro em
+    outro mês.
+    """
+    from datetime import datetime
+
+    from processar_campanha_config import (
+        MARKETPLACE_ML, garantir_tabela_campanha_config,
+        ler_captura_campanhas, gravar_campanha_config,
+        ultima_captura, detectar_mudancas,
+    )
+
+    st.subheader("🎯 ROAS objetivo e orçamento por campanha")
+
+    ok, erro = garantir_tabela_campanha_config(engine)
+    if not ok:
+        st.error(f"Não consegui preparar a tabela da captura: {erro}")
+        return
+
+    st.caption(
+        "O relatório de ads traz o **resultado**; esta tela traz a "
+        "**alavanca**. O ROAS objetivo é o que se opera no ML — e ele não "
+        "existe em relatório nenhum, só na tela de campanhas. Cada captura "
+        "é uma **foto datada**: é comparando fotos que o sistema descobre "
+        "que alguém mexeu, quando mexeu e o que aconteceu depois."
+    )
+
+    try:
+        lojas = pd.read_sql(
+            "SELECT loja FROM dim_lojas WHERE marketplace = 'MERCADO LIVRE' "
+            "AND COALESCE(visivel_no_painel, TRUE) ORDER BY loja", engine
+        )['loja'].tolist()
+    except Exception:
+        lojas = []
+    if not lojas:
+        st.error("Não consegui carregar as lojas de Mercado Livre.")
+        return
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        loja = st.selectbox("Loja", lojas, key="cfg_ml_loja")
+    with col2:
+        arquivo = st.file_uploader(
+            "Captura (.csv do capturador ou .html da página salva)",
+            type=["csv", "html", "htm"], key="cfg_ml_upl"
+        )
+
+    # Idade da última foto: dado velho leva a conclusão errada com a mesma
+    # cara de dado novo, então a idade fica visível antes de qualquer número.
+    ult = ultima_captura(engine, MARKETPLACE_ML, loja)
+    if ult is None:
+        st.info(
+            f"Nenhuma captura de **{loja}** ainda. A primeira vira a linha de "
+            f"base — a partir da segunda o sistema já aponta o que mudou."
+        )
+    else:
+        dias = (datetime.now() - ult).days
+        texto = f"Última captura de **{loja}**: {ult:%d/%m/%Y %H:%M}"
+        if dias >= 10:
+            st.warning(f"{texto} — há **{dias} dias**. Está velha.")
+        elif dias >= 3:
+            st.info(f"{texto} — há {dias} dia(s).")
+        else:
+            st.success(f"{texto} — há {dias} dia(s).")
+
+    with st.expander("Como capturar (2 jeitos)"):
+        st.markdown(
+            "**Jeito rápido — o capturador.** Um botão na barra de favoritos "
+            "do navegador. Abra o painel de campanhas do ML, clique nele e "
+            "ele lê a tabela virando as páginas sozinho, baixando um CSV com "
+            "a data e hora da foto dentro. Suba esse CSV aqui.\n\n"
+            "**Plano B — salvar a página.** No painel, aumente o número de "
+            "campanhas por página, aperte `Ctrl+S` e suba o `.html`. "
+            "Funciona, mas pega só a página que estava na tela — o ML mostra "
+            "10 por vez, e o resto fica de fora.\n\n"
+            "Em qualquer um dos dois: as colunas **Nome da campanha**, "
+            "**Orçamento diário** e **ROAS Objetivo** precisam estar "
+            "visíveis na tela antes de capturar."
+        )
+
+    if not arquivo:
+        _historico_config(engine, MARKETPLACE_ML, loja)
+        return
+
+    df, meta = ler_captura_campanhas(
+        arquivo, nome_arquivo=getattr(arquivo, 'name', ''))
+    for aviso in meta['avisos']:
+        st.warning(aviso)
+    if df.empty:
+        return
+
+    # A data vem do arquivo quando ele a traz: a foto pode ter sido tirada
+    # na quinta e subida na segunda, e gravar a data do upload apagaria
+    # justamente o "quando" que dá sentido à tabela.
+    data_captura = meta.get('data_captura')
+    if data_captura is None:
+        st.warning(
+            "Este arquivo não traz a data da captura (é o caso do `.html`). "
+            "Confirme abaixo **quando a foto foi tirada** — não é "
+            "necessariamente hoje."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            d = st.date_input("Data da captura", value=datetime.now().date(),
+                              format="DD/MM/YYYY", key="cfg_ml_data")
+        with c2:
+            h = st.time_input("Hora", value=datetime.now().time(),
+                              key="cfg_ml_hora")
+        data_captura = datetime.combine(d, h)
+
+    st.markdown(f"**{len(df)} campanha(s)** lidas • foto de "
+                f"**{data_captura:%d/%m/%Y %H:%M}**")
+    previa = df.rename(columns={
+        'campanha': 'Campanha', 'roas_objetivo': 'ROAS objetivo',
+        'orcamento_diario': 'Orçamento diário', 'diagnostico_ml': 'Sinal do ML'})
+    st.dataframe(previa, use_container_width=True, hide_index=True)
+    st.caption(
+        "⚠️ **Sinal do ML** é a opinião da plataforma (APRENDENDO / "
+        "Excelente), guardada só como baliza. O ML ganha quando você gasta "
+        "mais; o diagnóstico que vale é o nosso."
+    )
+
+    if st.button("💾 Gravar esta captura", type="primary",
+                 key="cfg_ml_gravar"):
+        res = gravar_campanha_config(
+            engine, df, MARKETPLACE_ML, loja, data_captura,
+            arquivo_nome=getattr(arquivo, 'name', ''))
+        if res['gravadas']:
+            st.success(res['mensagem'])
+            mud = detectar_mudancas(engine, MARKETPLACE_ML, loja, data_captura)
+            if mud.empty:
+                st.info("Nada mudou desde a foto anterior.")
+            else:
+                st.markdown("### 🔔 O que mudou desde a foto anterior")
+                st.dataframe(
+                    mud.rename(columns={
+                        'campanha': 'Campanha', 'tipo': 'Evento',
+                        'antes': 'Antes', 'depois': 'Depois'})[
+                        ['Campanha', 'Evento', 'Antes', 'Depois']],
+                    use_container_width=True, hide_index=True)
+                st.caption(
+                    "Cada linha aqui é um evento para o Log Estratégico: "
+                    "quem mexeu no ROAS objetivo, quando, e de quanto para "
+                    "quanto."
+                )
+        else:
+            st.error(res['mensagem'])
+
+    _historico_config(engine, MARKETPLACE_ML, loja)
+
+
+def _historico_config(engine, marketplace, loja):
+    """Fotos já guardadas desta loja, da mais recente para a mais antiga."""
+    st.divider()
+    st.markdown("### Fotos já guardadas")
+    try:
+        df = pd.read_sql("""
+            SELECT data_captura,
+                   COUNT(*)                        AS campanhas,
+                   AVG(roas_objetivo)              AS roas_medio,
+                   SUM(orcamento_diario)           AS orcamento_total
+            FROM fact_ads_campanha_config
+            WHERE marketplace = %(mk)s AND loja = %(loja)s
+            GROUP BY data_captura
+            ORDER BY data_captura DESC
+            LIMIT 20
+        """, engine, params={'mk': marketplace, 'loja': loja})
+    except Exception as e:
+        st.caption(f"Histórico indisponível: {type(e).__name__}: {e}")
+        return
+
+    if df.empty:
+        st.info("Nenhuma foto guardada para esta loja ainda.")
+        return
+
+    d = df.copy()
+    d['Quando'] = pd.to_datetime(d['data_captura']).dt.strftime('%d/%m/%Y %H:%M')
+    d['Campanhas'] = d['campanhas'].apply(_fmt_int)
+    d['ROAS objetivo médio'] = d['roas_medio'].apply(
+        lambda v: '—' if pd.isna(v) else f"{float(v):.1f}x".replace('.', ','))
+    d['Orçamento/dia somado'] = d['orcamento_total'].apply(_fmt_brl)
+    st.dataframe(
+        d[['Quando', 'Campanhas', 'ROAS objetivo médio',
+           'Orçamento/dia somado']],
+        use_container_width=True, hide_index=True)
+    st.caption(
+        "O **orçamento somado** é teto, não gasto: o ML raramente usa tudo. "
+        "Serve para ver a intenção declarada, e o gasto real vem do "
+        "relatório de ads."
+    )
 
 
 def _resumo_gravado(engine):
