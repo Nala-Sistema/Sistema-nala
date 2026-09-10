@@ -2,6 +2,21 @@
 PROCESSADOR SHOPEE - Sistema Nala
 Processa arquivos de vendas da Shopee (.xlsx exportado do painel)
 
+VERSÃO 2.8 (10/09/2026) — auditoria de faturamento maior que a Shopee (LPT):
+  - FIX: pedido com 'Status do pedido' = 'Não pago' entrava como venda válida.
+         'Total global' vem preenchido com o valor acordado (não é 0,0), então
+         mask_sem_receita não pegava esses pedidos — só cancelado e devolução
+         eram descartados. Confirmado em Shopee-LPT (01-09/09/2026): 12 pedidos
+         não pagos, R$ 378,67, gravados no snapshot como venda fechada.
+         Nova mask_nao_pago descarta pela mesma lógica de cancelado/devolução.
+  - Comparado contra o export oficial de estatísticas da Shopee (filtro
+         'Produto Pago'): a definição 2026 de 'Vendas' da própria Shopee
+         INCLUI pedido cancelado/devolvido (decisão deles, não é bug nosso)
+         e desconta só 'Cupom do vendedor' — que pra LPT é irrisório (R$ 11
+         no período). Depois desse fix, sistema x Shopee (excluindo
+         cancelado/devolução dos dois lados pra comparar igual) fecha em
+         0,99% de diferença — dentro do ruído de fronteira de data/fuso.
+
 VERSÃO 2.4 (18/08/2026) — auditoria do subsídio PIX:
   - FIX (A): carrinho não soma mais o ajuste uma vez por linha. O arquivo repete os
          valores do PEDIDO em cada linha (validado em 8 carrinhos de 4 arquivos —
@@ -547,10 +562,18 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
         else:
             mask_devolucao = pd.Series(False, index=df.index)
 
+        # Não pago — pedido criado mas o comprador ainda não pagou. 'Total
+        # global' vem preenchido com o valor acordado (não é 0), então a
+        # trava de mask_sem_receita não pega esses; sem essa máscara própria
+        # o pedido entra no banco como venda antes de existir de verdade.
+        mask_nao_pago = df['Status do pedido'].astype(str).str.contains(
+            'n[ãa]o pago', case=False, na=False, regex=True
+        )
+
         # Sem receita (Total global = 0 — pedidos sem pagamento real)
         mask_sem_receita = df['Total global'] == 0.0
 
-        mask_descartar = mask_cancelado | mask_devolucao | mask_sem_receita
+        mask_descartar = mask_cancelado | mask_devolucao | mask_nao_pago | mask_sem_receita
         df_valido = df[~mask_descartar].copy()
         linhas_descartadas = total_original - len(df_valido)
 
@@ -575,6 +598,8 @@ def processar_arquivo_shopee(arquivo, loja: str, imposto: float, engine):
                 _motivo = 'Pedido cancelado'
             elif mask_devolucao.get(_row.name, False):
                 _motivo = 'Devolução / reembolso'
+            elif mask_nao_pago.get(_row.name, False):
+                _motivo = 'Pedido não pago'
             else:
                 _motivo = 'Sem receita (Total global = 0)'
             descartes.append({
