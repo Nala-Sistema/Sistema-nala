@@ -71,6 +71,32 @@ import pandas as pd
 MARKETPLACE_ML = 'MERCADO LIVRE'
 MARKETPLACE_SHOPEE = 'SHOPEE'
 
+
+def agora_brasil():
+    """
+    Hora de São Paulo, e não a do servidor.
+
+    O app roda no Streamlit Cloud, cujo relógio está em UTC. `datetime.now()`
+    ali devolve 18:18 quando no escritório são 15:18 — três horas à frente.
+
+    Numa tabela qualquer isso seria um detalhe cosmético. Aqui não: a data e
+    a hora da captura são o dado. Uma foto tirada às 22h viraria 1h do dia
+    seguinte, cairia no dia errado e a comparação entre fotos apontaria a
+    mudança no dia errado — que é justamente o que a tabela existe para
+    responder.
+
+    Fallback para UTC−3 fixo se o fuso não estiver instalado: o Brasil não
+    usa horário de verão desde 2019, então o deslocamento é constante e o
+    fallback dá a mesma resposta sem exigir o pacote `tzdata` no
+    requirements.
+    """
+    from datetime import timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo('America/Sao_Paulo')).replace(tzinfo=None)
+    except Exception:
+        return datetime.now(timezone(timedelta(hours=-3))).replace(tzinfo=None)
+
 COLUNAS_NORM = [
     'campanha', 'roas_objetivo', 'orcamento_diario', 'diagnostico_ml',
 ]
@@ -346,10 +372,13 @@ def ler_csv_captura(conteudo, nome_arquivo=''):
 
     if datas:
         bruta = sorted(datas)[0]
-        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        # (formato, quantos caracteres ele consome) — o corte é explícito
+        # porque a string pode vir com milissegundos ou fuso no fim.
+        for fmt, tam in (('%Y-%m-%dT%H:%M:%S', 19),
+                         ('%Y-%m-%d %H:%M:%S', 19),
+                         ('%Y-%m-%d', 10)):
             try:
-                meta['data_captura'] = datetime.strptime(bruta[:len(
-                    datetime.now().strftime(fmt))], fmt)
+                meta['data_captura'] = datetime.strptime(bruta[:tam], fmt)
                 break
             except ValueError:
                 continue

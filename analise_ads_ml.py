@@ -307,7 +307,7 @@ def _captura_config(engine):
     from datetime import datetime
 
     from processar_campanha_config import (
-        MARKETPLACE_ML, garantir_tabela_campanha_config,
+        MARKETPLACE_ML, agora_brasil, garantir_tabela_campanha_config,
         ler_captura_campanhas, gravar_campanha_config,
         ultima_captura, detectar_mudancas,
     )
@@ -356,7 +356,7 @@ def _captura_config(engine):
             f"base — a partir da segunda o sistema já aponta o que mudou."
         )
     else:
-        dias = (datetime.now() - ult).days
+        dias = (agora_brasil() - ult).days
         texto = f"Última captura de **{loja}**: {ult:%d/%m/%Y %H:%M}"
         if dias >= 10:
             st.warning(f"{texto} — há **{dias} dias**. Está velha.")
@@ -403,10 +403,11 @@ def _captura_config(engine):
         )
         c1, c2 = st.columns(2)
         with c1:
-            d = st.date_input("Data da captura", value=datetime.now().date(),
+            agora = agora_brasil()
+            d = st.date_input("Data da captura", value=agora.date(),
                               format="DD/MM/YYYY", key="cfg_ml_data")
         with c2:
-            h = st.time_input("Hora", value=datetime.now().time(),
+            h = st.time_input("Hora", value=agora.time(),
                               key="cfg_ml_hora")
         data_captura = datetime.combine(d, h)
 
