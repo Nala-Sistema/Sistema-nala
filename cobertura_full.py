@@ -24,14 +24,17 @@ REGRAS (acertadas com o Thiago em 15/09/2026)
     transferência interna do ML) chegam em 2 a 3 dias, antes de qualquer
     envio novo. A cobertura só do disponível também é mostrada.
 
-    lead time efetivo = lead time (~14 dias: ~10 para conseguir data de
-    coleta + 3 a 4 até o ML disponibilizar) + folga para a semana em que não
-    há data de coleta.
+    lead time ~14 dias: ~10 para conseguir data de coleta + 3 a 4 até o ML
+    disponibilizar. A folga (~7) é a semana em que não há data de coleta.
 
       cobertura < 7 dias                 ⚫ quebra garantida
-      cobertura < lead efetivo           🔴 zera mesmo agendando hoje
-      cobertura < lead efetivo + 7       🟠 última janela segura: agendar agora
+      cobertura < lead time              🔴 zera mesmo agendando hoje
+      cobertura < lead time + folga      🟠 última janela segura: agendar agora
       senão                              🟢
+
+    A folga já mora DENTRO da faixa laranja (decisão do Thiago, 16/09): ela
+    não é somada de novo nos níveis. Ela entra, sim, na quantidade a enviar,
+    como estoque de segurança.
 
   ACELEROU
     Janela de 7 dias com venda por dia bem maior que a de 30 (cobertura de
@@ -39,7 +42,7 @@ REGRAS (acertadas com o Thiago em 15/09/2026)
     semana: abaixo disso é ruído (os logs provaram três vezes).
 
   QUANTO ENVIAR (dias-alvo informados pelo usuário)
-    enviar = (dias_alvo + lead efetivo) × venda_dia
+    enviar = (dias_alvo + lead time + folga) × venda_dia
              − disponível − em transferência − agendado ainda não coletado
     Sem somar o lead time, o item zera no caminho. Sem descontar transferência
     e agendamento, envia em dobro.
@@ -61,6 +64,17 @@ REGRAS (acertadas com o Thiago em 15/09/2026)
         acerta a quantidade exata em 46 de 63 casos, não em todos).
     Passou da data agendada + 3 dias sem nada: "coleta não aconteceu" — e o
     agendamento deixa de ser descontado do envio.
+    Coleta avulsa, fora da onda, o usuário marca à mão na tela
+    (`coletado_manual_em` / `coletado_manual_por`): vale como coletado.
+
+  ORDEM DA LISTA
+    Por margem perdida por dia (R$) = venda/dia × margem por unidade — preço
+    médio × margem % dos últimos 30 dias em fact_vendas_snapshot, por SKU e
+    loja, preferindo as vendas FULL. Margem negativa vai sozinha para o fim.
+    Menos de 5 unidades líquidas em 30 dias sai da lista urgente e vai para
+    "giro baixo". A data da última venda aparece junto: o upload de vendas
+    atrasa.
+    Atenção: a margem do sistema ainda NÃO desconta ads nem Full — é teto.
 """
 
 import math
@@ -87,8 +101,8 @@ class Parametros:
     lead_time_dias: int = 14
     folga_semana_perdida_dias: int = 7
     quebra_garantida_dias: int = 7
-    janela_laranja_dias: int = 7
     piso_dias_com_estoque_7d: int = 3
+    piso_giro_baixo_30d: int = 5
     piso_vendidas_acelerou: int = 5
     fator_acelerou: float = 0.7
     alerta_bloqueio_dias: int = 60
@@ -99,7 +113,8 @@ class Parametros:
     onda_minima_unidades: int = 100
 
     @property
-    def lead_time_efetivo(self):
+    def lead_time_com_folga(self):
+        """Só para a quantidade a enviar — os níveis não somam a folga de novo."""
         return self.lead_time_dias + self.folga_semana_perdida_dias
 
 
@@ -136,19 +151,21 @@ def nivel_por_cobertura(cobertura, p):
         return SEM_GIRO
     if cobertura < p.quebra_garantida_dias:
         return QUEBRA_GARANTIDA
-    if cobertura < p.lead_time_efetivo:
+    if cobertura < p.lead_time_dias:
         return VERMELHO
-    if cobertura < p.lead_time_efetivo + p.janela_laranja_dias:
+    if cobertura < p.lead_time_dias + p.folga_semana_perdida_dias:
         return LARANJA
     return VERDE
 
 
-def avaliar(linha, p, agendado_aberto=0, dias_alvo=None):
+def avaliar(linha, p, agendado_aberto=0, dias_alvo=None, economia=None):
     """
     Avalia um estoque da `v_cobertura_full`.
 
     `agendado_aberto`: unidades agendadas e ainda não coletadas (ver
     `situacao_agendamentos`). None = ninguém informou nada.
+    `economia`: preço e margem do SKU (ver `economia_por_estoque`). None = sem
+    venda registrada no sistema.
     """
     disponivel = _int(linha.get('full_disponivel'))
     transito = _int(linha.get('full_em_transferencia'))
@@ -203,6 +220,12 @@ def avaliar(linha, p, agendado_aberto=0, dias_alvo=None):
     if linha.get('serie_divergente'):
         avisos.append('série com movimento que a API não listou: conferir no painel do ML')
 
+    venda_30_liquida = _num(linha.get('venda_liquida_30d'))
+    giro_baixo = (venda_30_liquida or 0) < p.piso_giro_baixo_30d
+    margem_unitaria = (economia or {}).get('margem_unitaria')
+    margem_dia = (venda_dia * margem_unitaria
+                  if venda_dia is not None and margem_unitaria is not None else None)
+
     resultado = {
         'nivel': nivel,
         'icone': ICONES[nivel],
@@ -212,6 +235,11 @@ def avaliar(linha, p, agendado_aberto=0, dias_alvo=None):
         'cobertura_com_transito': cob_com_transito,
         'acelerou': acelerou,
         'alerta_bloqueio_fiscal': dias_bloqueio > p.alerta_bloqueio_dias,
+        'giro_baixo': giro_baixo,
+        'preco_medio': (economia or {}).get('preco_medio'),
+        'margem_percentual': (economia or {}).get('margem_percentual'),
+        'margem_perdida_dia': margem_dia,
+        'data_ultima_venda': (economia or {}).get('ultima_venda'),
         'avisos': avisos,
     }
     if dias_alvo is not None:
@@ -226,8 +254,69 @@ def avaliar(linha, p, agendado_aberto=0, dias_alvo=None):
 def quanto_enviar(venda_dia, disponivel, transito, agendado_aberto, dias_alvo, p):
     if not venda_dia:
         return 0
-    necessario = (dias_alvo + p.lead_time_efetivo) * venda_dia
+    necessario = (dias_alvo + p.lead_time_com_folga) * venda_dia
     return max(0, math.ceil(necessario - disponivel - transito - agendado_aberto))
+
+
+def economia_por_estoque(skus_por_estoque, vendas):
+    """
+    `skus_por_estoque`: {(marketplace, loja, estoque_id): {sku, ...}}.
+    `vendas`: linhas com marketplace, loja, sku, full (bool), unidades,
+    receita, margem e ultima_venda (últimos 30 dias, agrupadas).
+
+    Preço e margem do estoque = média ponderada dos seus SKUs NA MESMA LOJA,
+    usando só as vendas FULL quando existem (o preço do Full pode ser outro).
+    """
+    por_chave = {}
+    for v in vendas:
+        chave = (v['marketplace'], v['loja'], (v['sku'] or '').strip().upper())
+        por_chave.setdefault(chave, []).append(v)
+
+    saida = {}
+    for (marketplace, loja, estoque_id), skus in skus_por_estoque.items():
+        linhas = []
+        for sku in skus:
+            linhas.extend(por_chave.get((marketplace, loja, (sku or '').strip().upper()), []))
+        if not linhas:
+            continue
+        do_full = [l for l in linhas if l.get('full') and (l.get('unidades') or 0) > 0]
+        base = do_full or linhas
+        unidades = sum(_num(l.get('unidades')) or 0 for l in base)
+        receita = sum(_num(l.get('receita')) or 0 for l in base)
+        margem = sum(_num(l.get('margem')) or 0 for l in base)
+        if unidades <= 0:
+            continue
+        saida[(marketplace, loja, estoque_id)] = {
+            'preco_medio': receita / unidades,
+            'margem_unitaria': margem / unidades,
+            'margem_percentual': (margem / receita) if receita else None,
+            'ultima_venda': max(l['ultima_venda'] for l in linhas if l.get('ultima_venda')),
+            'so_full': bool(do_full),
+        }
+    return saida
+
+
+URGENTES = (QUEBRA_GARANTIDA, VERMELHO, LARANJA)
+
+
+def organizar(avaliados):
+    """
+    Três seções:
+      urgentes   ⚫🔴🟠 com giro, por margem perdida por dia (maior primeiro;
+                 sem dado de venda vai para o fim, depois da margem negativa);
+      giro baixo menos de 5 unidades em 30 dias, qualquer nível;
+      em dia     🟢 e sem giro com giro normal.
+    """
+    def ordem(item):
+        m = item.get('margem_perdida_dia')
+        return (m is None, -(m or 0))
+
+    urgentes = sorted((a for a in avaliados if a['nivel'] in URGENTES and not a['giro_baixo']),
+                      key=ordem)
+    giro_baixo = sorted((a for a in avaliados if a['giro_baixo']), key=ordem)
+    em_dia = sorted((a for a in avaliados if a['nivel'] not in URGENTES and not a['giro_baixo']),
+                    key=ordem)
+    return {'urgentes': urgentes, 'giro_baixo': giro_baixo, 'em_dia': em_dia}
 
 
 def dias_de_onda(coleta_por_dia, p):
@@ -248,7 +337,9 @@ def dias_de_onda(coleta_por_dia, p):
 def situacao_agendamentos(agendamentos, entradas, dias_validos, hoje, parametros_de):
     """
     `agendamentos`: dicts com id, marketplace, loja, estoque_id, data_coleta,
-    quantidade e fonte_tem_sinal_coleta (linhas da v_estoque_envio_manual).
+    quantidade, fonte_tem_sinal_coleta e coletado_manual_em (linhas da
+    v_estoque_envio_manual). Marcado à mão continua participando do FIFO, para
+    que a coleta dele não seja atribuída a outro agendamento.
     `entradas`: {(marketplace, loja, estoque_id): [(data, unidades), ...]}.
     `dias_validos`: saída de `dias_de_onda`.
     `parametros_de`: função marketplace -> Parametros.
@@ -295,6 +386,9 @@ def _classificar(ag, hoje, p):
     quantidade = ag['quantidade']
     coletado = ag['coletado']
     janela_aberta = hoje <= ag['janela_fim']
+    if ag.get('coletado_manual_em'):
+        # coleta avulsa marcada na tela: vale mais que o sinal automático
+        return {'situacao': COLETADO, 'a_descontar': 0}
     if coletado >= p.fracao_coletado * quantidade:
         return {'situacao': COLETADO, 'a_descontar': 0}
     if coletado > 0:
@@ -324,8 +418,27 @@ SQL_COBERTURA = 'SELECT * FROM v_cobertura_full'
 
 SQL_AGENDAMENTOS = """
     SELECT id, marketplace, loja, estoque_id, data_coleta, quantidade, observacao,
-           criado_por, criado_em, fonte_tem_sinal_coleta
+           criado_por, criado_em, fonte_tem_sinal_coleta,
+           coletado_manual_em, coletado_manual_por
     FROM v_estoque_envio_manual
+"""
+
+SQL_SKUS = """
+    SELECT DISTINCT marketplace, loja, estoque_id, UPPER(TRIM(sku)) AS sku
+    FROM dim_estoque_anuncio
+    WHERE sku IS NOT NULL AND TRIM(sku) <> ''
+"""
+
+# Na Shopee o equivalente a FULL ainda precisa ser confirmado (FBS) — hoje só
+# o ML tem estoque diário, e para ele 'FULL' é o valor gravado pelo upload.
+SQL_VENDAS_30D = """
+    SELECT marketplace_origem AS marketplace, loja_origem AS loja,
+           UPPER(TRIM(sku)) AS sku, (UPPER(logistica) = 'FULL') AS full,
+           SUM(quantidade) AS unidades, SUM(valor_venda_efetivo) AS receita,
+           SUM(margem_total) AS margem, MAX(data_venda) AS ultima_venda
+    FROM fact_vendas_snapshot
+    WHERE data_venda >= %(desde)s AND sku IS NOT NULL
+    GROUP BY 1, 2, 3, 4
 """
 
 SQL_ENTRADAS = """
@@ -361,7 +474,7 @@ def _consultar(engine, sql, params=None):
 
 
 def montar_painel(engine, dias_alvo=None, ajustes_por_marketplace=None, hoje=None):
-    """Lê as views e devolve (estoques avaliados, agendamentos com situação)."""
+    """Lê as views e devolve (seções de `organizar`, agendamentos com situação)."""
     hoje = hoje or date.today()
     ajustes_por_marketplace = ajustes_por_marketplace or {}
 
@@ -387,11 +500,18 @@ def montar_painel(engine, dias_alvo=None, ajustes_por_marketplace=None, hoje=Non
                 parametros_de(marketplace))
         situacoes = situacao_agendamentos(agendamentos, entradas, validos, hoje, parametros_de)
 
+    skus = {}
+    for r in _consultar(engine, SQL_SKUS):
+        skus.setdefault((r['marketplace'], r['loja'], r['estoque_id']), set()).add(r['sku'])
+    vendas = _consultar(engine, SQL_VENDAS_30D, {'desde': hoje - timedelta(days=30)})
+    economia = economia_por_estoque(skus, vendas)
+
     agendado = agendado_por_estoque(situacoes)
     avaliados = []
     for linha in cobertura:
         chave = (linha['marketplace'], linha['loja'], linha['estoque_id'])
         aberto = agendado.get(chave) if situacoes else None
         avaliados.append(dict(linha, **avaliar(linha, parametros_de(linha['marketplace']),
-                                               agendado_aberto=aberto, dias_alvo=dias_alvo)))
-    return avaliados, situacoes
+                                               agendado_aberto=aberto, dias_alvo=dias_alvo,
+                                               economia=economia.get(chave))))
+    return organizar(avaliados), situacoes

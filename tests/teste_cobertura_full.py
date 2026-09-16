@@ -75,16 +75,25 @@ class Janelas(unittest.TestCase):
 
 
 class Niveis(unittest.TestCase):
-    def test_fronteiras_com_lead_14_e_folga_7(self):
-        esperado = [(6.9, cf.QUEBRA_GARANTIDA), (7, cf.VERMELHO), (20.9, cf.VERMELHO),
-                    (21, cf.LARANJA), (27.9, cf.LARANJA), (28, cf.VERDE)]
+    def test_fronteiras_da_tabela_do_thiago(self):
+        # a folga mora dentro da faixa laranja: não é somada de novo
+        esperado = [(6.9, cf.QUEBRA_GARANTIDA), (7, cf.VERMELHO), (13.9, cf.VERMELHO),
+                    (14, cf.LARANJA), (20.9, cf.LARANJA), (21, cf.VERDE)]
         for cobertura, nivel in esperado:
             self.assertEqual(cf.nivel_por_cobertura(cobertura, ML), nivel, cobertura)
 
-    def test_folga_e_ajustavel_na_tela(self):
+    def test_lead_e_folga_sao_ajustaveis_na_tela(self):
         sem_folga = cf.parametros('MERCADO LIVRE', folga_semana_perdida_dias=0)
-        self.assertEqual(cf.nivel_por_cobertura(14, sem_folga), cf.LARANJA)
-        self.assertEqual(cf.nivel_por_cobertura(14, ML), cf.VERMELHO)
+        self.assertEqual(cf.nivel_por_cobertura(14, sem_folga), cf.VERDE)
+        lead_maior = cf.parametros('MERCADO LIVRE', lead_time_dias=20)
+        self.assertEqual(cf.nivel_por_cobertura(14, lead_maior), cf.VERMELHO)
+
+    def test_folga_entra_na_quantidade_e_nao_no_nivel(self):
+        self.assertEqual(ML.lead_time_com_folga, 21)
+        sem_folga = cf.parametros('MERCADO LIVRE', folga_semana_perdida_dias=0)
+        # (30 + 14) x 1 = 44 contra (30 + 21) x 1 = 51
+        self.assertEqual(cf.quanto_enviar(1.0, 0, 0, 0, 30, sem_folga), 44)
+        self.assertEqual(cf.quanto_enviar(1.0, 0, 0, 0, 30, ML), 51)
 
 
 class Enviar(unittest.TestCase):
@@ -115,10 +124,67 @@ class Avisos(unittest.TestCase):
         self.assertEqual(len(r['avisos']), 2)
 
 
-def ag(id_, data_coleta, quantidade, sinal=True, estoque='UP1', mk='MERCADO LIVRE'):
+def venda(sku, full, unidades, receita, margem, ultima=date(2026, 9, 15), loja='ML-LPT'):
+    return {'marketplace': 'MERCADO LIVRE', 'loja': loja, 'sku': sku, 'full': full,
+            'unidades': unidades, 'receita': receita, 'margem': margem, 'ultima_venda': ultima}
+
+
+class Margem(unittest.TestCase):
+    def test_prefere_venda_full_e_pondera_os_skus_do_estoque(self):
+        chave = ('MERCADO LIVRE', 'ML-LPT', 'UP1')
+        e = cf.economia_por_estoque({chave: {'L-1', 'l-1 '}}, [
+            venda('L-1', True, 10, 200, 40),
+            venda('L-1', False, 90, 1000, 500),        # fora do Full: ignorado
+            venda('L-1', True, 5, 100, 20, loja='ML-Nala'),   # outra loja: ignorado
+        ])[chave]
+        self.assertEqual((e['preco_medio'], e['margem_unitaria']), (20, 4))
+        self.assertAlmostEqual(e['margem_percentual'], 0.2)
+        self.assertTrue(e['so_full'])
+
+    def test_sem_venda_full_usa_todas_as_logisticas(self):
+        chave = ('MERCADO LIVRE', 'ML-LPT', 'UP1')
+        e = cf.economia_por_estoque({chave: {'L-1'}}, [venda('L-1', False, 4, 100, 8)])[chave]
+        self.assertEqual(e['margem_unitaria'], 2)
+        self.assertFalse(e['so_full'])
+
+    def test_margem_perdida_por_dia(self):
+        r = cf.avaliar(linha(10, 0, 3.0, 7, 2.0, 30, 21, venda_liquida_30d=60), ML,
+                       economia={'margem_unitaria': 4.5, 'preco_medio': 30,
+                                 'margem_percentual': 0.15, 'ultima_venda': date(2026, 9, 13)})
+        self.assertAlmostEqual(r['margem_perdida_dia'], 13.5)
+        self.assertEqual(r['data_ultima_venda'], date(2026, 9, 13))
+        self.assertFalse(r['giro_baixo'])
+
+    def test_menos_de_5_em_30_dias_e_giro_baixo(self):
+        r = cf.avaliar(linha(0, 0, 1.0, 3, 0.2, 20, 3, venda_liquida_30d=4), ML)
+        self.assertTrue(r['giro_baixo'])
+
+
+class OrdemDaLista(unittest.TestCase):
+    def item(self, nome, nivel, margem, giro_baixo=False):
+        return {'nome': nome, 'nivel': nivel, 'margem_perdida_dia': margem,
+                'giro_baixo': giro_baixo}
+
+    def test_urgentes_por_margem_com_negativa_e_sem_dado_no_fim(self):
+        secoes = cf.organizar([
+            self.item('pequena', cf.VERMELHO, 5.0),
+            self.item('sem dado', cf.QUEBRA_GARANTIDA, None),
+            self.item('negativa', cf.QUEBRA_GARANTIDA, -3.0),
+            self.item('grande', cf.LARANJA, 80.0),
+            self.item('parado', cf.QUEBRA_GARANTIDA, 50.0, giro_baixo=True),
+            self.item('folgado', cf.VERDE, 99.0),
+        ])
+        self.assertEqual([i['nome'] for i in secoes['urgentes']],
+                         ['grande', 'pequena', 'negativa', 'sem dado'])
+        self.assertEqual([i['nome'] for i in secoes['giro_baixo']], ['parado'])
+        self.assertEqual([i['nome'] for i in secoes['em_dia']], ['folgado'])
+
+
+def ag(id_, data_coleta, quantidade, sinal=True, estoque='UP1', mk='MERCADO LIVRE',
+       manual=None):
     return {'id': id_, 'marketplace': mk, 'loja': 'ML-LPT', 'estoque_id': estoque,
             'data_coleta': data_coleta, 'quantidade': quantidade,
-            'fonte_tem_sinal_coleta': sinal}
+            'fonte_tem_sinal_coleta': sinal, 'coletado_manual_em': manual}
 
 
 def ondas(*dias, mk='MERCADO LIVRE'):
@@ -179,6 +245,18 @@ class Agendamentos(unittest.TestCase):
         self.assertEqual((s[1]['situacao'], s[1]['a_descontar']), (cf.SEM_SINAL, 30))
         s = situacao([ag(1, date(2026, 9, 12), 30, sinal=False)], [], set(), date(2026, 9, 19))
         self.assertEqual(s[1]['a_descontar'], 0)
+
+    def test_coleta_avulsa_marcada_a_mao_vale_como_coletado(self):
+        s = situacao([ag(1, date(2026, 9, 3), 20, manual=date(2026, 9, 3))],
+                     [(date(2026, 9, 3), 20)], set(), date(2026, 9, 10))
+        self.assertEqual((s[1]['situacao'], s[1]['a_descontar']), (cf.COLETADO, 0))
+
+    def test_marcado_a_mao_nao_empresta_sua_coleta_ao_seguinte(self):
+        s = situacao([ag(1, date(2026, 9, 10), 30, manual=date(2026, 9, 10)),
+                      ag(2, date(2026, 9, 12), 30)],
+                     [(date(2026, 9, 12), 30)], ondas(date(2026, 9, 12)), date(2026, 9, 13))
+        self.assertEqual(s[1]['coletado'], 30)
+        self.assertEqual((s[2]['coletado'], s[2]['situacao']), (0, cf.AGUARDANDO))
 
     def test_onda_e_do_marketplace_e_tem_corte(self):
         validos = cf.dias_de_onda({('MERCADO LIVRE', date(2026, 9, 1)): 99,
