@@ -47,104 +47,168 @@ def _fmt_pct(v):
         return "—"
 
 
+def _q(engine, sql, params=()):
+    conn = engine.raw_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame(cur.fetchall(), columns=cols)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _pct(num, den):
+    try:
+        num, den = float(num or 0), float(den or 0)
+    except (TypeError, ValueError):
+        return None
+    return 100.0 * num / den if den else None
+
+
 def _cruzamento_tacos_ml(engine):
     """
     Cruza o gasto de ads (por anúncio/MLB) com a venda real do produto no
-    sistema, no mesmo período — MATCH EXATO POR MLB (o ML ads traz o MLB em
-    codigo_anuncio, e as vendas ML guardam o mesmo MLB → SKU). Não precisa de
-    título nem de match manual como o Shopee. Mostra o TACOS real (gasto ÷
-    venda total do produto no período), que o painel do ML não dá.
+    sistema, no mesmo intervalo de datas — MATCH EXATO POR MLB (o ML ads traz
+    o MLB em codigo_anuncio, e as vendas ML guardam o mesmo MLB → SKU).
+
+    Desde 14/09 o coletor grava uma linha por dia (periodo_inicio =
+    periodo_fim). Por isso o período aqui é um intervalo livre e o gasto é
+    SOMADO dentro dele; listar os pares (início, fim) do banco virava uma
+    opção por dia e ninguém conseguia ver a semana.
+
+    ACOS, TACOS e margem pós-ads aparecem juntos: ACOS mede a campanha,
+    TACOS e margem mostram quanto do lucro o anúncio consumiu.
     """
+    from filtro_periodo import filtro_periodo
+
     st.subheader("🔗 Cruzamento Ads ↔ Vendas (TACOS real)")
     st.caption(
         "Cruzamento exato por **MLB**: liga cada anúncio ao SKU pela venda "
-        "real do sistema. **TACOS real = investido ÷ venda total do produto "
-        "no período** (o que o painel do ML não mostra)."
+        "real do sistema, somando gasto e venda no intervalo escolhido."
     )
 
-    def _q(sql, params=()):
-        conn = engine.raw_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, params)
-            cols = [d[0] for d in cur.description]
-            return pd.DataFrame(cur.fetchall(), columns=cols)
-        finally:
-            cur.close()
-            conn.close()
-
-    lojas = _q("SELECT DISTINCT loja FROM fact_ads_performance "
-               "WHERE marketplace='MERCADO LIVRE' ORDER BY loja")['loja'].tolist()
+    lojas = _q(engine, "SELECT DISTINCT loja FROM fact_ads_performance "
+                       "WHERE marketplace='MERCADO LIVRE' ORDER BY loja")['loja'].tolist()
     if not lojas:
-        st.info("Nenhum relatório de ads de ML gravado ainda. Suba um na aba **Upload**.")
+        st.info("Nenhum dado de ads de ML gravado ainda.")
         return
 
     loja = st.selectbox("Loja", lojas, key="cruz_ml_loja")
-    per = _q("SELECT DISTINCT periodo_inicio, periodo_fim FROM fact_ads_performance "
-             "WHERE marketplace='MERCADO LIVRE' AND loja=%s "
-             "ORDER BY periodo_fim DESC, periodo_inicio DESC", (loja,))
-    if per.empty:
-        st.info("Sem períodos para esta loja.")
-        return
-    opts = [f"{pi.strftime('%d/%m/%Y')} a {pf.strftime('%d/%m/%Y')}"
-            for pi, pf in zip(per['periodo_inicio'], per['periodo_fim'])]
-    i = st.selectbox("Período", range(len(opts)), format_func=lambda i: opts[i], key="cruz_ml_per")
-    ini, fim = per['periodo_inicio'][i], per['periodo_fim'][i]
+    lim = _q(engine, """
+        SELECT (SELECT MAX(periodo_fim) FROM fact_ads_performance
+                 WHERE marketplace='MERCADO LIVRE' AND loja=%s) AS ads_ate,
+               (SELECT MAX(data_venda) FROM fact_vendas_snapshot
+                 WHERE UPPER(marketplace_origem)='MERCADO LIVRE'
+                   AND loja_origem=%s) AS vendas_ate
+    """, (loja, loja))
+    ads_ate, vendas_ate = lim['ads_ate'][0], lim['vendas_ate'][0]
 
-    df = _q("""
-        SELECT a.codigo_anuncio AS mlb, a.titulo AS titulo, v.skus AS skus,
-               a.gasto_ads AS gasto, v.receita_total AS venda_total,
-               CASE WHEN v.receita_total>0 THEN a.gasto_ads/v.receita_total*100 END AS tacos_real
-        FROM fact_ads_performance a
-        LEFT JOIN LATERAL (
-            SELECT string_agg(DISTINCT s.sku, ', ') AS skus,
-                   SUM(s.valor_venda_efetivo) AS receita_total
-            FROM fact_vendas_snapshot s
-            WHERE UPPER(s.marketplace_origem)='MERCADO LIVRE' AND s.loja_origem=%s
-              AND s.codigo_anuncio=a.codigo_anuncio
-              AND s.data_venda BETWEEN %s AND %s
-        ) v ON true
-        WHERE a.marketplace='MERCADO LIVRE' AND a.loja=%s
-          AND a.periodo_inicio=%s AND a.periodo_fim=%s AND a.gasto_ads>0
-        ORDER BY a.gasto_ads DESC
+    ini, fim = filtro_periodo("cruz_ml", dado_ate=ads_ate)
+    if ini is None:
+        return
+    if vendas_ate is None or vendas_ate < fim:
+        ate = vendas_ate.strftime('%d/%m/%Y') if vendas_ate else 'nunca'
+        st.warning(
+            f"As vendas de **{loja}** estão gravadas só até **{ate}**. Os "
+            "dias sem venda deixam o TACOS maior e a margem menor do que são "
+            "— suba as vendas antes de tirar conclusão.")
+
+    df = _q(engine, """
+        WITH ads AS (
+            SELECT codigo_anuncio AS mlb, MAX(titulo) AS titulo,
+                   SUM(gasto_ads) AS gasto, SUM(receita_ads) AS receita_ads
+            FROM fact_ads_performance
+            WHERE marketplace='MERCADO LIVRE' AND loja=%s
+              AND periodo_inicio >= %s AND periodo_fim <= %s
+            GROUP BY codigo_anuncio
+            HAVING SUM(gasto_ads) > 0
+        ), v AS (
+            SELECT codigo_anuncio AS mlb,
+                   string_agg(DISTINCT sku, ', ') AS skus,
+                   SUM(valor_venda_efetivo) AS venda,
+                   SUM(margem_total) AS margem
+            FROM fact_vendas_snapshot
+            WHERE UPPER(marketplace_origem)='MERCADO LIVRE' AND loja_origem=%s
+              AND data_venda BETWEEN %s AND %s
+            GROUP BY codigo_anuncio
+        )
+        SELECT ads.mlb, ads.titulo, v.skus, ads.gasto, ads.receita_ads,
+               v.venda, v.margem
+        FROM ads LEFT JOIN v ON v.mlb = ads.mlb
+        ORDER BY ads.gasto DESC
     """, (loja, ini, fim, loja, ini, fim))
 
     if df.empty:
         st.info("Nenhum anúncio com gasto neste período.")
         return
 
-    gasto_tot = float(df['gasto'].fillna(0).sum())
-    venda_tot = float(df['venda_total'].fillna(0).sum())
-    casaram = int((df['venda_total'].fillna(0) > 0).sum())
+    tot = _q(engine, """
+        SELECT SUM(valor_venda_efetivo) AS venda, SUM(margem_total) AS margem
+        FROM fact_vendas_snapshot
+        WHERE UPPER(marketplace_origem)='MERCADO LIVRE' AND loja_origem=%s
+          AND data_venda BETWEEN %s AND %s
+    """, (loja, ini, fim))
+    venda_loja = float(tot['venda'][0] or 0)
+    margem_loja = float(tot['margem'][0] or 0)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Investimento", _fmt_brl(gasto_tot))
-    c2.metric("TACOS da conta", _fmt_pct(100.0 * gasto_tot / venda_tot) if venda_tot else "—")
-    c3.metric("Anúncios com gasto", _fmt_int(len(df)))
-    c4.metric("Casaram (têm venda)", f"{casaram}/{len(df)}")
+    for c in ('gasto', 'receita_ads', 'venda', 'margem'):
+        df[c] = pd.to_numeric(df[c], errors='coerce').astype(float)
+    gasto_tot = df['gasto'].sum()
+    receita_ads_tot = df['receita_ads'].fillna(0).sum()
+    casaram = int((df['venda'].fillna(0) > 0).sum())
 
-    show = df.copy()
-    show['gasto'] = show['gasto'].apply(_fmt_brl)
-    show['venda_total'] = show['venda_total'].apply(
-        lambda v: _fmt_brl(v) if v and float(v) > 0 else '— sem venda —')
-    show['tacos_real'] = show['tacos_real'].apply(
-        lambda v: _fmt_pct(float(v)) if v is not None else 'N/A')
-    show['skus'] = show['skus'].fillna('❌ não vendeu no período')
-    show['titulo'] = show['titulo'].astype(str).str[:45]
-    show = show[['mlb', 'titulo', 'skus', 'gasto', 'venda_total', 'tacos_real']]
-    show.columns = ['MLB', 'Título', 'SKU(s)', 'Investido', 'Venda no período', 'TACOS real']
+    st.markdown(f"**{loja}** — {ini:%d/%m/%Y} a {fim:%d/%m/%Y} "
+                f"({(fim - ini).days + 1} dia(s))")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Investimento em ads", _fmt_brl(gasto_tot))
+    c2.metric("ACOS (investido ÷ receita de ads)",
+              _fmt_pct(_pct(gasto_tot, receita_ads_tot)))
+    c3.metric("TACOS da loja (investido ÷ venda total)",
+              _fmt_pct(_pct(gasto_tot, venda_loja)))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Venda total da loja", _fmt_brl(venda_loja))
+    c2.metric("Margem antes de ads",
+              _fmt_pct(_pct(margem_loja, venda_loja)),
+              help=_fmt_brl(margem_loja))
+    c3.metric("Margem pós-ads",
+              _fmt_pct(_pct(margem_loja - gasto_tot, venda_loja)),
+              help=_fmt_brl(margem_loja - gasto_tot))
+    st.caption(f"Anúncios com gasto: **{len(df)}** • com venda no período: "
+               f"**{casaram} de {len(df)}** • referência: TACOS até 2% na "
+               "loja e 3% por anúncio.")
+
+    show = pd.DataFrame({
+        'MLB': df['mlb'],
+        'Título': df['titulo'].astype(str).str[:45],
+        'SKU(s)': df['skus'].fillna('❌ não vendeu no período'),
+        'Investido': df['gasto'].apply(_fmt_brl),
+        'Receita de ads': df['receita_ads'].apply(_fmt_brl),
+        'ACOS': [_fmt_pct(_pct(g, r)) for g, r in zip(df['gasto'], df['receita_ads'])],
+        'Venda no período': df['venda'].apply(
+            lambda v: _fmt_brl(v) if pd.notna(v) and v > 0 else '— sem venda —'),
+        'TACOS real': [_fmt_pct(_pct(g, v)) for g, v in zip(df['gasto'], df['venda'])],
+        'Margem antes de ads': [_fmt_pct(_pct(m, v)) for m, v in zip(df['margem'], df['venda'])],
+        'Margem pós-ads': [_fmt_pct(_pct((m if pd.notna(m) else 0) - g, v))
+                           for m, g, v in zip(df['margem'], df['gasto'], df['venda'])],
+    })
     st.dataframe(show, use_container_width=True, hide_index=True)
     st.caption(
-        "**TACOS real** = investido ÷ venda total do produto no período. "
-        "*'sem venda'* = anúncio rodou mas o produto não vendeu (candidato a revisão). "
-        "TACOS acima de ~3% no nível produto é sinal de atenção."
+        "**ACOS** = investido ÷ receita que o ML atribui a ads (eficiência da "
+        "campanha). **TACOS real** = investido ÷ venda total do produto no "
+        "período. **Margem pós-ads** = (margem do produto − investido) ÷ "
+        "venda; ainda **não desconta o Full**, então a margem real é menor. "
+        "*'sem venda'* = anúncio rodou e o produto não vendeu (candidato a "
+        "revisão)."
     )
 
 
 def modulo_ads_ml(engine):
     """
     Ponto de entrada da aba, chamado pelo roteador `analise_ads.py`.
-    Duas sub-abas: Upload (ingestão) e Cruzamento (TACOS real ads↔vendas).
+    Três sub-abas: Upload (ingestão), Cruzamento (ACOS/TACOS/margem por
+    intervalo de datas) e ROAS objetivo (histórico das campanhas, só leitura).
 
     Cada uma roda em try/except próprio pelo mesmo motivo da tab de Despesas
     de Full: esta aba divide a tela com a de Shopee, que já está em uso, e uma
@@ -169,9 +233,9 @@ def modulo_ads_ml(engine):
             st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
     with sub_cfg:
         try:
-            _captura_config(engine)
+            _historico_campanhas(engine)
         except Exception as e:
-            st.error("A captura encontrou um erro e foi isolada.")
+            st.error("O histórico de campanhas encontrou um erro e foi isolado.")
             st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
 
 
@@ -293,204 +357,146 @@ def _render(engine):
         _resumo_gravado(engine)
 
 
-def _captura_config(engine):
+def _historico_campanhas(engine):
     """
-    Tela da foto semanal: ROAS objetivo, orçamento diário e sinal do ML.
+    Histórico do ROAS objetivo e do orçamento por campanha — só leitura.
 
-    Por que existe uma tela separada do Upload: o relatório de ads é do
-    PERÍODO (uma semana fechada) e a foto é do AGORA. Misturar os dois no
-    mesmo formulário faria o gestor achar que a foto também se refere ao
-    período filtrado — e ela não se refere: as colunas de orçamento e ROAS
-    objetivo do painel mostram sempre o valor de hoje, mesmo com o filtro em
-    outro mês.
+    O coletor da API grava uma foto de `fact_ads_campanha_config` várias
+    vezes por dia desde 14/09; a captura manual (bookmarklet / HTML salvo)
+    saiu da tela porque duas fontes para o mesmo dado só geram conflito. As
+    fotos manuais antigas continuam no banco e entram no histórico.
+
+    A comparação usa a ÚLTIMA foto de cada dia: comparar foto com foto
+    repetiria o mesmo evento a cada coleta. O ROAS objetivo é a alavanca que
+    se opera no ML, então a pergunta desta tela é "quem mexeu, quando e de
+    quanto para quanto" — o efeito aparece no Cruzamento, no período depois
+    da data.
     """
-    from datetime import datetime
-
-    from processar_campanha_config import (
-        MARKETPLACE_ML, agora_brasil, garantir_tabela_campanha_config,
-        ler_captura_campanhas, gravar_campanha_config,
-        ultima_captura, detectar_mudancas,
-    )
+    from filtro_periodo import filtro_periodo
 
     st.subheader("🎯 ROAS objetivo e orçamento por campanha")
-
-    ok, erro = garantir_tabela_campanha_config(engine)
-    if not ok:
-        st.error(f"Não consegui preparar a tabela da captura: {erro}")
-        return
-
     st.caption(
-        "O relatório de ads traz o **resultado**; esta tela traz a "
-        "**alavanca**. O ROAS objetivo é o que se opera no ML — e ele não "
-        "existe em relatório nenhum, só na tela de campanhas. Cada captura "
-        "é uma **foto datada**: é comparando fotos que o sistema descobre "
-        "que alguém mexeu, quando mexeu e o que aconteceu depois."
+        "Leitura do que a API do ML captura todo dia. O relatório de ads traz "
+        "o **resultado**; aqui fica a **alavanca** — e quando ela mudou."
     )
 
-    try:
-        lojas = pd.read_sql(
-            "SELECT loja FROM dim_lojas WHERE marketplace = 'MERCADO LIVRE' "
-            "AND COALESCE(visivel_no_painel, TRUE) ORDER BY loja", engine
-        )['loja'].tolist()
-    except Exception:
-        lojas = []
+    lojas = _q(engine, "SELECT DISTINCT loja FROM fact_ads_campanha_config "
+                       "WHERE marketplace='MERCADO LIVRE' ORDER BY loja")['loja'].tolist()
     if not lojas:
-        st.error("Não consegui carregar as lojas de Mercado Livre.")
+        st.info("Nenhuma foto de campanha gravada ainda.")
         return
+    loja = st.selectbox("Loja", lojas, key="cfg_ml_loja")
 
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        loja = st.selectbox("Loja", lojas, key="cfg_ml_loja")
-    with col2:
-        arquivo = st.file_uploader(
-            "Captura (.csv do capturador ou .html da página salva)",
-            type=["csv", "html", "htm"], key="cfg_ml_upl"
-        )
-
-    # Idade da última foto: dado velho leva a conclusão errada com a mesma
-    # cara de dado novo, então a idade fica visível antes de qualquer número.
-    ult = ultima_captura(engine, MARKETPLACE_ML, loja)
-    if ult is None:
-        st.info(
-            f"Nenhuma captura de **{loja}** ainda. A primeira vira a linha de "
-            f"base — a partir da segunda o sistema já aponta o que mudou."
-        )
-    else:
-        dias = (agora_brasil() - ult).days
-        texto = f"Última captura de **{loja}**: {ult:%d/%m/%Y %H:%M}"
-        if dias >= 10:
-            st.warning(f"{texto} — há **{dias} dias**. Está velha.")
-        elif dias >= 3:
-            st.info(f"{texto} — há {dias} dia(s).")
-        else:
-            st.success(f"{texto} — há {dias} dia(s).")
-
-    with st.expander("Como capturar (2 jeitos)"):
-        st.markdown(
-            "**Jeito rápido — o capturador.** Um botão na barra de favoritos "
-            "do navegador. Abra o painel de campanhas do ML, clique nele e "
-            "ele lê a tabela virando as páginas sozinho, baixando um CSV com "
-            "a data e hora da foto dentro. Suba esse CSV aqui.\n\n"
-            "**Plano B — salvar a página.** No painel, aumente o número de "
-            "campanhas por página, aperte `Ctrl+S` e suba o `.html`. "
-            "Funciona, mas pega só a página que estava na tela — o ML mostra "
-            "10 por vez, e o resto fica de fora.\n\n"
-            "Em qualquer um dos dois: as colunas **Nome da campanha**, "
-            "**Orçamento diário** e **ROAS Objetivo** precisam estar "
-            "visíveis na tela antes de capturar."
-        )
-
-    if not arquivo:
-        _historico_config(engine, MARKETPLACE_ML, loja)
-        return
-
-    df, meta = ler_captura_campanhas(
-        arquivo, nome_arquivo=getattr(arquivo, 'name', ''))
-    for aviso in meta['avisos']:
-        st.warning(aviso)
-    if df.empty:
-        return
-
-    # A data vem do arquivo quando ele a traz: a foto pode ter sido tirada
-    # na quinta e subida na segunda, e gravar a data do upload apagaria
-    # justamente o "quando" que dá sentido à tabela.
-    data_captura = meta.get('data_captura')
-    if data_captura is None:
-        st.warning(
-            "Este arquivo não traz a data da captura (é o caso do `.html`). "
-            "Confirme abaixo **quando a foto foi tirada** — não é "
-            "necessariamente hoje."
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            agora = agora_brasil()
-            d = st.date_input("Data da captura", value=agora.date(),
-                              format="DD/MM/YYYY", key="cfg_ml_data")
-        with c2:
-            h = st.time_input("Hora", value=agora.time(),
-                              key="cfg_ml_hora")
-        data_captura = datetime.combine(d, h)
-
-    st.markdown(f"**{len(df)} campanha(s)** lidas • foto de "
-                f"**{data_captura:%d/%m/%Y %H:%M}**")
-    previa = df.rename(columns={
-        'campanha': 'Campanha', 'roas_objetivo': 'ROAS objetivo',
-        'orcamento_diario': 'Orçamento diário', 'diagnostico_ml': 'Sinal do ML'})
-    st.dataframe(previa, use_container_width=True, hide_index=True)
-    st.caption(
-        "⚠️ **Sinal do ML** é a opinião da plataforma (APRENDENDO / "
-        "Excelente), guardada só como baliza. O ML ganha quando você gasta "
-        "mais; o diagnóstico que vale é o nosso."
-    )
-
-    if st.button("💾 Gravar esta captura", type="primary",
-                 key="cfg_ml_gravar"):
-        res = gravar_campanha_config(
-            engine, df, MARKETPLACE_ML, loja, data_captura,
-            arquivo_nome=getattr(arquivo, 'name', ''))
-        if res['gravadas']:
-            st.success(res['mensagem'])
-            mud = detectar_mudancas(engine, MARKETPLACE_ML, loja, data_captura)
-            if mud.empty:
-                st.info("Nada mudou desde a foto anterior.")
-            else:
-                st.markdown("### 🔔 O que mudou desde a foto anterior")
-                st.dataframe(
-                    mud.rename(columns={
-                        'campanha': 'Campanha', 'tipo': 'Evento',
-                        'antes': 'Antes', 'depois': 'Depois'})[
-                        ['Campanha', 'Evento', 'Antes', 'Depois']],
-                    use_container_width=True, hide_index=True)
-                st.caption(
-                    "Cada linha aqui é um evento para o Log Estratégico: "
-                    "quem mexeu no ROAS objetivo, quando, e de quanto para "
-                    "quanto."
-                )
-        else:
-            st.error(res['mensagem'])
-
-    _historico_config(engine, MARKETPLACE_ML, loja)
-
-
-def _historico_config(engine, marketplace, loja):
-    """Fotos já guardadas desta loja, da mais recente para a mais antiga."""
-    st.divider()
-    st.markdown("### Fotos já guardadas")
-    try:
-        df = pd.read_sql("""
-            SELECT data_captura,
-                   COUNT(*)                        AS campanhas,
-                   AVG(roas_objetivo)              AS roas_medio,
-                   SUM(orcamento_diario)           AS orcamento_total
+    diario = _q(engine, """
+        WITH d AS (
+            SELECT DISTINCT ON (campanha, data_captura::date)
+                   campanha, data_captura::date AS dia, data_captura,
+                   roas_objetivo, orcamento_diario, status_campanha,
+                   diagnostico_ml, arquivo_origem
             FROM fact_ads_campanha_config
-            WHERE marketplace = %(mk)s AND loja = %(loja)s
-            GROUP BY data_captura
-            ORDER BY data_captura DESC
-            LIMIT 20
-        """, engine, params={'mk': marketplace, 'loja': loja})
-    except Exception as e:
-        st.caption(f"Histórico indisponível: {type(e).__name__}: {e}")
+            WHERE marketplace='MERCADO LIVRE' AND loja=%s
+            ORDER BY campanha, data_captura::date, data_captura DESC
+        )
+        SELECT d.*,
+               LAG(dia)              OVER w AS dia_ant,
+               LAG(roas_objetivo)    OVER w AS roas_ant,
+               LAG(orcamento_diario) OVER w AS orc_ant,
+               LAG(status_campanha)  OVER w AS status_ant
+        FROM d
+        WINDOW w AS (PARTITION BY campanha ORDER BY dia)
+    """, (loja,))
+    if diario.empty:
+        st.info("Nenhuma foto desta loja.")
         return
 
-    if df.empty:
-        st.info("Nenhuma foto guardada para esta loja ainda.")
-        return
+    ultima = pd.to_datetime(diario['data_captura']).max()
+    st.caption(f"Última foto de **{loja}**: {ultima:%d/%m/%Y %H:%M}")
 
-    d = df.copy()
-    d['Quando'] = pd.to_datetime(d['data_captura']).dt.strftime('%d/%m/%Y %H:%M')
-    d['Campanhas'] = d['campanhas'].apply(_fmt_int)
-    d['ROAS objetivo médio'] = d['roas_medio'].apply(
-        lambda v: '—' if pd.isna(v) else f"{float(v):.1f}x".replace('.', ','))
-    d['Orçamento/dia somado'] = d['orcamento_total'].apply(_fmt_brl)
-    st.dataframe(
-        d[['Quando', 'Campanhas', 'ROAS objetivo médio',
-           'Orçamento/dia somado']],
-        use_container_width=True, hide_index=True)
+    # ── Mudanças no período ────────────────────────────────────────────
+    st.markdown("### 🔔 O que mudou")
+    # Linha de base = primeira foto COMPLETA. A captura manual de HTML pegava
+    # só a página na tela (10 campanhas); usá-la como base faria as demais
+    # aparecerem como "novas" no primeiro dia da API.
+    api = diario[diario['arquivo_origem'].fillna('').str.startswith('API')]
+    primeiro_dia = (api if not api.empty else diario)['dia'].min()
+    ini, fim = filtro_periodo("cfg_ml", dado_ate=diario['dia'].max(),
+                              padrao="Últimos 30 dias")
+    if ini is not None:
+        eventos = []
+        for r in diario.itertuples(index=False):
+            if not (ini <= r.dia <= fim):
+                continue
+            quando = r.dia.strftime('%d/%m/%Y')
+            desde = (None if r.dia_ant is None or pd.isna(r.dia_ant)
+                     else r.dia_ant.strftime('%d/%m/%Y'))
+            if desde is None:
+                if r.dia <= primeiro_dia:
+                    continue
+                eventos.append((r.dia, quando, r.campanha, 'Campanha nova',
+                                '—', _fmt_roas(r.roas_objetivo), None))
+                continue
+            if _mudou(r.roas_ant, r.roas_objetivo):
+                eventos.append((r.dia, quando, r.campanha,
+                                'ROAS objetivo' + _seta(r.roas_ant, r.roas_objetivo),
+                                _fmt_roas(r.roas_ant), _fmt_roas(r.roas_objetivo), desde))
+            if _mudou(r.orc_ant, r.orcamento_diario):
+                eventos.append((r.dia, quando, r.campanha,
+                                'Orçamento diário' + _seta(r.orc_ant, r.orcamento_diario),
+                                _fmt_brl(r.orc_ant), _fmt_brl(r.orcamento_diario), desde))
+            if (r.status_ant and r.status_campanha
+                    and r.status_ant != r.status_campanha):
+                eventos.append((r.dia, quando, r.campanha, 'Status',
+                                r.status_ant, r.status_campanha, desde))
+        if eventos:
+            ev = pd.DataFrame(eventos, columns=[
+                'dia', 'Visto em', 'Campanha', 'Mudança', 'Antes', 'Depois',
+                'Foto anterior'])
+            ev = ev.sort_values(['dia', 'Campanha'], ascending=[False, True])
+            st.dataframe(ev.drop(columns='dia').fillna('—'),
+                         use_container_width=True, hide_index=True)
+            st.caption(
+                "**Visto em** é o dia da foto que mostrou a mudança; ela "
+                "aconteceu entre a **foto anterior** e esse dia. Com foto "
+                "diária, é o próprio dia (ou o anterior).")
+        else:
+            st.info("Nenhuma mudança de ROAS objetivo, orçamento ou status "
+                    "neste período.")
+        st.caption(f"Primeira foto completa desta loja: "
+                   f"{primeiro_dia:%d/%m/%Y} — campanhas que já estavam nela "
+                   "não contam como novas.")
+
+    # ── Situação atual ─────────────────────────────────────────────────
+    st.markdown("### Como está agora")
+    dia_max = diario['dia'].max()
+    atual = diario[diario['dia'] == dia_max].sort_values('campanha')
+    st.dataframe(pd.DataFrame({
+        'Campanha': atual['campanha'],
+        'ROAS objetivo': atual['roas_objetivo'].apply(_fmt_roas),
+        'Orçamento diário': atual['orcamento_diario'].apply(_fmt_brl),
+        'Status': atual['status_campanha'].fillna('—'),
+        'Sinal do ML': atual['diagnostico_ml'].fillna('—'),
+    }), use_container_width=True, hide_index=True)
     st.caption(
-        "O **orçamento somado** é teto, não gasto: o ML raramente usa tudo. "
-        "Serve para ver a intenção declarada, e o gasto real vem do "
-        "relatório de ads."
+        f"Foto de {dia_max:%d/%m/%Y}. O **orçamento** é teto, não gasto — o "
+        "gasto real está no Cruzamento. **Sinal do ML** é a opinião da "
+        "plataforma, que ganha quando você gasta mais: baliza, não veredito."
     )
+
+
+def _mudou(antes, depois):
+    if antes is None or depois is None or pd.isna(antes) or pd.isna(depois):
+        return False
+    return abs(float(antes) - float(depois)) > 1e-6
+
+
+def _seta(antes, depois):
+    return ' ↓' if float(depois) < float(antes) else ' ↑'
+
+
+def _fmt_roas(v):
+    if v is None or pd.isna(v):
+        return '—'
+    return f"{float(v):.1f}x".replace('.', ',')
 
 
 def _resumo_gravado(engine):
