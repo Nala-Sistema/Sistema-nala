@@ -31,6 +31,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import io
 
+import fonte_dados
 from formatadores import formatar_valor, formatar_percentual, formatar_quantidade
 from database_utils import (
     get_engine, gravar_log_upload, buscar_pendentes, buscar_pendentes_resumo,
@@ -642,7 +643,19 @@ def tab_processar_upload(engine):
 
     col1, col2, col3 = st.columns(3)
     mktp = col1.selectbox("Marketplace:", sorted(df_lojas['marketplace'].unique()), key=f"up_mktp_{uc}")
-    lojas = df_lojas[df_lojas['marketplace'] == mktp]['loja'].tolist()
+    lojas_todas = df_lojas[df_lojas['marketplace'] == mktp]['loja'].tolist()
+    # FONTE ÚNICA: loja cuja venda já vem pela API some daqui, para ninguém
+    # conseguir subir upload por cima e somar a venda em dobro (ver
+    # fonte_dados.py). Loja sem linha em dim_fonte_dados continua aparecendo
+    # normalmente — é o padrão 'upload'.
+    lojas = fonte_dados.lojas_upload_permitidas(lojas_todas)
+    if not lojas:
+        st.info(f"ℹ️ Todas as lojas de {mktp} já recebem venda pela API. "
+               "Nada para subir por upload aqui.")
+        return
+    if len(lojas) < len(lojas_todas):
+        so_api = sorted(set(lojas_todas) - set(lojas))
+        st.caption(f"⚡ Fora da lista (já vêm pela API): {', '.join(so_api)}")
     loja = col2.selectbox("Loja:", lojas, key=f"up_loja_{uc}")
     imposto = df_lojas[df_lojas['loja'] == loja]['imposto'].values[0]
     st.info(f"📍 {loja} | Imposto: {formatar_percentual(imposto)}")
@@ -787,6 +800,23 @@ def tab_processar_upload(engine):
         col_btn1, col_btn2 = st.columns([1, 3])
 
         if col_btn1.button("💾 GRAVAR NO BANCO", type="primary", use_container_width=True):
+            # B3 (auditor-tecnico, 22/09/2026): a análise do arquivo e o clique
+            # em GRAVAR podem ficar minutos separados — se a fonte da loja virar
+            # 'api' nesse meio-tempo (troca de fonte rodando), gravar aqui
+            # duplicaria a venda. Reconfere na hora, limpando o cache antes (não
+            # espera os 60s do TTL). Genérico de propósito (correção do
+            # auditor, 2ª rodada): sem travar em 'SHOPEE' — o filtro do
+            # selectbox de loja (lojas_upload_permitidas) já é genérico, e
+            # esta reconferência tinha ficado presa à Shopee, virando buraco
+            # assim que ML/Amazon também passarem a vir pela API.
+            fonte_dados._cached_fonte_dados.clear()
+            if fonte_dados.fonte_da_loja(loja) == 'api':
+                st.error(f"❌ **{loja}** passou a receber venda pela API enquanto você "
+                        "analisava o arquivo. Este upload NÃO foi gravado — a venda "
+                        "já vem da API para este período. Descarte o preview e "
+                        "recomece se precisar de outra loja.")
+                st.stop()
+
             with st.spinner("Gravando vendas no banco..."):
                 descartadas = 0; atualizados = 0
 
@@ -896,6 +926,10 @@ def tab_vendas_consolidadas(engine):
     mktp_filtro = col_f1.selectbox("Marketplace:", ["Todos"] + sorted(df_lojas['marketplace'].unique().tolist()))
     lojas_disp = df_lojas[df_lojas['marketplace'] == mktp_filtro]['loja'].tolist() if mktp_filtro != "Todos" else df_lojas['loja'].tolist()
     loja_filtro = col_f2.selectbox("Loja:", ["Todas"] + sorted(lojas_disp))
+    if loja_filtro != "Todas":
+        _aviso_origem = fonte_dados.origem_da_venda(loja_filtro)
+        if _aviso_origem:
+            st.caption(f"ℹ️ {_aviso_origem}")
 
     st.markdown("**🔍 Filtrar por SKU ou Nome do Produto**")
     texto_busca = st.text_input("Buscar:", placeholder="Ex: 321, escova, kit jogo", key="busca_sku_consolidadas")
@@ -1051,6 +1085,19 @@ def tab_vendas_consolidadas(engine):
             st.markdown(f"**Pedido:** {v.get('numero_pedido','-')} | **SKU:** {v.get('sku','-')} | "
                         f"**Loja:** {v.get('loja_origem','-')} | **Data:** {v.get('data_venda','-')}")
 
+            if v.get('arquivo_origem') == 'API':
+                # A sincronização noturna apaga e reinsere esta linha do jeito
+                # que vem da API a cada madrugada — uma correção manual aqui
+                # seria desfeita sem avisar ninguém. A correção de verdade é
+                # no que gera o dado (custo em dim_produtos, ou pedir a
+                # correção pela API/coletor).
+                st.warning("⚠️ Esta venda vem da API (Shopee-Nala/Shopee-LPT). Ela é "
+                          "resincronizada toda madrugada, e uma correção manual aqui "
+                          "seria desfeita sem aviso. Corrija a origem (ex.: custo em "
+                          "Gestão de SKUs) ou peça a correção pela API/coletor.")
+                st.session_state.pop('venda_correcao', None)
+                return
+
             c1, c2, c3 = st.columns(3)
             novo_receita = c1.number_input("Receita (R$):", value=float(v.get('valor_venda_efetivo', 0)),
                                            format="%.2f", key="corr_receita")
@@ -1101,7 +1148,16 @@ def tab_vendas_consolidadas(engine):
         st.warning("⚠️ **ATENÇÃO:** Ação irreversível!")
         modo = st.radio("Modo:", ["Selecionar individuais","Deletar marketplace inteiro"], horizontal=True)
         if modo == "Selecionar individuais":
-            df_del = df_vendas[['id','data_venda','numero_pedido','sku','codigo_anuncio','quantidade','valor_venda_efetivo','margem_percentual']].copy()
+            # Venda da API (Shopee-Nala/LPT) não aparece aqui: a sincronização
+            # noturna a traria de volta sozinha, e quem quiser tirá-la de vez
+            # precisa desligar a fonte da loja, não apagar linha por linha.
+            n_api = int((df_vendas.get('arquivo_origem') == 'API').sum()) if 'arquivo_origem' in df_vendas.columns else 0
+            df_vendas_del = (df_vendas[df_vendas['arquivo_origem'] != 'API']
+                             if 'arquivo_origem' in df_vendas.columns else df_vendas)
+            if n_api:
+                st.caption(f"⚡ {n_api} venda(s) da API não aparecem aqui (a sincronização "
+                          "noturna as traria de volta).")
+            df_del = df_vendas_del[['id','data_venda','numero_pedido','sku','codigo_anuncio','quantidade','valor_venda_efetivo','margem_percentual']].copy()
             df_del['data_venda'] = pd.to_datetime(df_del['data_venda']).dt.strftime('%d/%m/%Y')
             df_del.insert(0, 'Excluir', False)
             df_ed = st.data_editor(df_del, column_config={
@@ -1132,12 +1188,21 @@ def tab_vendas_consolidadas(engine):
                 if cd == "DELETAR" and md:
                     try:
                         conn = engine.raw_connection(); cursor = conn.cursor()
-                        cursor.execute("DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s", (md,))
+                        # Poupa venda da API (arquivo_origem='API'): esta é a
+                        # única porta que apaga sem escolher loja/período, e
+                        # "marketplace inteiro" incluiria Shopee-Nala e
+                        # Shopee-LPT junto — a sincronização noturna as
+                        # traria de volta de qualquer jeito, então preservar
+                        # aqui evita um DELETE enorme por engano.
+                        cursor.execute(
+                            "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s "
+                            "AND COALESCE(arquivo_origem, '') <> 'API'", (md,))
                         d = cursor.rowcount
                         cursor.execute("DELETE FROM log_uploads WHERE marketplace = %s", (md,))
                         conn.commit(); cursor.close(); conn.close()
                         st.session_state.pop('vendas_consolidadas', None)
-                        st.success(f"✅ {d} vendas deletadas!"); st.rerun()
+                        st.success(f"✅ {d} vendas deletadas (vendas da API foram preservadas; "
+                                  "para desligar uma loja da API, mude dim_fonte_dados)."); st.rerun()
                     except Exception as e: st.error(f"❌ {e}")
 
 
@@ -1237,10 +1302,16 @@ def tab_historico_uploads(engine):
             if df_lojas_mktp.empty:
                 st.warning("Nenhuma outra loja cadastrada neste marketplace."); return
 
-            # Remove a loja atual das opções
+            # Remove a loja atual das opções, e as que já são fonte 'api'
+            # (não faz sentido migrar um lançamento antigo do upload PARA
+            # uma loja que hoje recebe venda pela API — fonte única).
             lojas_destino = df_lojas_mktp[df_lojas_mktp['loja'] != sel_r['loja']]
+            permitidas = set(fonte_dados.lojas_upload_permitidas(lojas_destino['loja'].tolist()))
+            lojas_destino = lojas_destino[lojas_destino['loja'].isin(permitidas)]
             if lojas_destino.empty:
-                st.warning("Só existe uma loja neste marketplace. Cadastre outra em Config."); return
+                st.warning("Nenhuma outra loja disponível (só resta loja que já recebe "
+                          "venda pela API, ou não há outra loja cadastrada neste "
+                          "marketplace)."); return
 
             opcoes_loja = {}
             for _, lr in lojas_destino.iterrows():

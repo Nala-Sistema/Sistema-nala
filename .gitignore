@@ -208,3 +208,6 @@ __marimo__/
 
 # Segredos do Streamlit: nunca versionar (o repositório é público)
 .streamlit/secrets.toml
+
+# Configuracao local do Claude Code
+.claude/

@@ -4,7 +4,7 @@ Testa a cobertura do Full e o estado dos agendamentos (cobertura_full.py).
 Os três primeiros casos são REAIS: números da v_cobertura_full em 15/09/2026,
 conferidos à mão pelo Auditor. Se um deles mudar, a regra mudou.
 
-Rodar:  python tests/teste_cobertura_full.py
+Rodar:  python tests/test_cobertura_full.py   (ou: pytest tests/test_cobertura_full.py)
 """
 
 import os
