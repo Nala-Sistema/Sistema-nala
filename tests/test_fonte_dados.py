@@ -30,6 +30,15 @@ DF = pd.DataFrame([
      'fonte': 'api', 'api_desde': pd.Timestamp('2026-09-14')},
 ])
 
+# Como a tabela fica DEPOIS da troca de fonte do ML (corte 01/10/2026). Serve
+# para provar que nada aqui é específico da Shopee.
+DF_COM_ML = pd.concat([DF, pd.DataFrame([
+    {'marketplace': 'MERCADO LIVRE', 'loja': 'ML-LPT', 'assunto': 'vendas',
+     'fonte': 'api', 'api_desde': pd.Timestamp('2026-10-01')},
+    {'marketplace': 'MERCADO LIVRE', 'loja': 'ML-YanniSP', 'assunto': 'vendas',
+     'fonte': 'upload', 'api_desde': pd.NaT},
+])], ignore_index=True)
+
 
 def _com_df(df=DF):
     return mock.patch.object(fd, '_cached_fonte_dados', return_value=df)
@@ -105,6 +114,47 @@ class OrigemDaVenda(unittest.TestCase):
     def test_loja_upload_nao_traz_nada(self):
         with _com_df():
             self.assertEqual(fd.origem_da_venda('Shopee Litstore(Yanni)'), '')
+
+
+class TextoDaOrigemPorMarketplace(unittest.TestCase):
+    """O texto de `origem_da_venda` dizia "API da Shopee" fixo. Depois da troca
+    de fonte do ML isso faria a tela mentir o nome do marketplace."""
+
+    def test_shopee_diz_shopee(self):
+        with _com_df(DF_COM_ML):
+            texto = fd.origem_da_venda('Shopee-LPT')
+        self.assertIn('API da Shopee', texto)
+        self.assertIn('01/09/2026', texto)
+
+    def test_mercado_livre_diz_mercado_livre(self):
+        with _com_df(DF_COM_ML):
+            texto = fd.origem_da_venda('ML-LPT')
+        self.assertIn('API do Mercado Livre', texto)
+        self.assertIn('01/10/2026', texto)
+        self.assertNotIn('Shopee', texto)
+
+    def test_loja_de_ml_ainda_no_upload_nao_traz_nada(self):
+        with _com_df(DF_COM_ML):
+            self.assertEqual(fd.origem_da_venda('ML-YanniSP'), '')
+
+    def test_o_nome_do_marketplace_sai_de_maiusculas(self):
+        self.assertEqual(fd.nome_do_marketplace('SHOPEE'), 'Shopee')
+        self.assertEqual(fd.nome_do_marketplace('MERCADO LIVRE'), 'Mercado Livre')
+        self.assertEqual(fd.nome_do_marketplace(None), '')
+
+    def test_sem_marketplace_na_linha_nao_inventa_nome(self):
+        df = pd.DataFrame([{'marketplace': None, 'loja': 'X', 'assunto': 'vendas',
+                           'fonte': 'api', 'api_desde': pd.Timestamp('2026-10-01')}])
+        with _com_df(df):
+            texto = fd.origem_da_venda('X')
+        self.assertIn('vêm da API desde', texto)
+
+    def test_as_lojas_de_upload_do_ml_seguem_liberadas_na_tela(self):
+        # A regra de fonte única, já genérica: só a loja marcada 'api' some.
+        with _com_df(DF_COM_ML):
+            permitidas = fd.lojas_upload_permitidas(
+                ['ML-LPT', 'ML-YanniSP', 'Shopee-LPT', 'Shopee Litstore(Yanni)'])
+        self.assertEqual(permitidas, ['ML-YanniSP', 'Shopee Litstore(Yanni)'])
 
 
 if __name__ == '__main__':

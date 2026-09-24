@@ -10,6 +10,11 @@ FASE 2 (22/09/2026): Shopee-Nala e Shopee-LPT viram 'api' para o assunto
 'vendas' a partir de 01/09/2026. A Shopee-Yanni continua 'upload' — este
 módulo nunca esconde uma loja sem que dim_fonte_dados diga isso.
 
+MERCADO LIVRE (24/09/2026): a troca das 4 lojas do ML está decidida para
+01/10/2026. Nada aqui precisa mudar para isso funcionar — as funções já leem a
+tabela sem citar marketplace. A única coisa que precisou virar genérica foi o
+TEXTO de `origem_da_venda`, que dizia "API da Shopee" fixo.
+
 Genérico de propósito (regra: o que se constrói para Full/ads/vendas serve ML
 E Shopee — [[project_desenho_multimarketplace]]): quando outro assunto ou
 outro marketplace migrar, nenhuma tela precisa de código novo, só uma linha
@@ -77,13 +82,31 @@ def fonte_da_loja(loja: str, assunto: str = 'vendas') -> str:
     return linha.iloc[0]['fonte']
 
 
+def nome_do_marketplace(marketplace) -> str:
+    """'SHOPEE' -> 'Shopee'; 'MERCADO LIVRE' -> 'Mercado Livre'.
+
+    A coluna guarda o nome em MAIÚSCULAS (dim_fonte_dados tem CHECK de
+    maiúsculas), que não é como se escreve numa tela.
+    """
+    texto = str(marketplace or '').strip()
+    return texto.title() if texto else ''
+
+
 def origem_da_venda(loja: str) -> str:
-    """Texto curto para avisar na tela de onde vêm as vendas desta loja."""
+    """Texto curto para avisar na tela de onde vêm as vendas desta loja.
+
+    GENÉRICO desde 24/09/2026 (frente [VENDAS ML API]): antes escrevia "API da
+    Shopee" fixo, e diria isso também das lojas do Mercado Livre depois da troca
+    de fonte do ML (corte 01/10/2026) — ou seja, a tela mentiria o nome do
+    marketplace. O nome agora sai da própria linha de dim_fonte_dados.
+    """
     df = _cached_fonte_dados()
     linha = df[(df['loja'] == loja) & (df['assunto'] == 'vendas') & (df['fonte'] == 'api')]
     if linha.empty:
         return ''
     desde = linha.iloc[0]['api_desde']
     desde_str = pd.to_datetime(desde).strftime('%d/%m/%Y') if pd.notna(desde) else '?'
-    return (f"As vendas de **{loja}** vêm da API da Shopee desde {desde_str}. "
+    nome = nome_do_marketplace(linha.iloc[0].get('marketplace'))
+    origem = f'API d{"o" if nome == "Mercado Livre" else "a"} {nome}' if nome else 'API'
+    return (f"As vendas de **{loja}** vêm da {origem} desde {desde_str}. "
            f"Períodos antes disso continuam do upload.")
