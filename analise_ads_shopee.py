@@ -51,6 +51,44 @@ MAX_SKUS_POR_ANUNCIO = 3  # número máximo de SKUs que um anúncio pode ter
 
 
 # ============================================================
+# FONTE ÚNICA POR LOJA (Fase 2 — ads da Shopee pela API)
+# ------------------------------------------------------------
+# Upload e API moram em tabelas DIFERENTES (fact_ads_shopee e
+# fact_ads_performance) e não têm chave em comum. Por isso nenhum banco
+# reclama se as duas forem somadas: quem tem de impedir isso é esta tela.
+# Foi assim que o TACOS dobrou em 17/09/2026.
+#
+# A regra é UMA FONTE POR LOJA, decidida por dim_fonte_dados:
+#   - loja 'api'    -> lê fact_ads_performance + fact_ads_diario_loja, e NUNCA
+#                      fact_ads_shopee;
+#   - loja 'upload' -> lê fact_ads_shopee, como sempre.
+# Nenhuma consulta desta tela junta as duas, nem numa visão consolidada.
+# ============================================================
+
+def _fonte_das_lojas():
+    """[(rótulo, nome_no_upload, nome_no_sistema, fonte)], na ordem da tela.
+
+    `nome_no_upload` é o nome curto do relatório de ads ('Nala-Lit'), que é o
+    que fact_ads_shopee guarda. `nome_no_sistema` é o de dim_lojas
+    ('Shopee Lithouse(Nala)'), que é o que a API grava. Confundir os dois não
+    dá erro: dá tela vazia.
+    """
+    import fonte_dados
+    saida = []
+    for rotulo, curto in LOJAS_SHOPEE.items():
+        sistema = LOJA_ADS_PARA_ORIGEM.get(curto, curto)
+        saida.append((rotulo, curto, sistema, fonte_dados.fonte_da_loja(sistema, 'ads')))
+    return saida
+
+
+def _lojas_de_upload():
+    """Só as lojas que ainda entram por upload. Loja 'api' some da aba de
+    Upload e da de Match SKU — a porta de entrada fecha no mesmo commit em que
+    a API vira fonte (regra da fonte única)."""
+    return [linha for linha in _fonte_das_lojas() if linha[3] != 'api']
+
+
+# ============================================================
 # HELPERS DE FORMATAÇÃO (padrão BR)
 # ============================================================
 
@@ -567,9 +605,26 @@ def _shopee_upload(engine):
     st.subheader("Upload de Relatório de Ads")
     st.caption("Importe CSVs exportados da Central de Marketing da Shopee.")
 
+    # Só loja cuja fonte ainda é o upload. Loja que virou 'api' não aparece
+    # aqui: é a regra da fonte única, e é o que impede um CSV antigo de entrar
+    # por cima do que a API já grava (o TACOS dobrado de 17/09/2026).
+    disponiveis = _lojas_de_upload()
+    if not disponiveis:
+        st.success("Todas as lojas Shopee já vêm pela API — não há mais upload "
+                   "de ads para fazer.")
+        st.caption("Se precisar reabrir o upload de uma loja, o caminho é "
+                   "`dim_fonte_dados` (assunto `ads`), não esta tela.")
+        return
+
+    escondidas = [r for r, _c, _s, f in _fonte_das_lojas() if f == 'api']
+    if escondidas:
+        st.info("Não aparecem aqui, porque já vêm pela API: "
+                + ", ".join(escondidas) + ".")
+
     col1, col2 = st.columns(2)
     with col1:
-        loja = st.selectbox("Loja", list(LOJAS_SHOPEE.keys()), key="ads_loja")
+        i_loja = st.selectbox("Loja", range(len(disponiveis)),
+                              format_func=lambda i: disponiveis[i][0], key="ads_loja")
     with col2:
         tipo = st.selectbox("Tipo de relatório", [
             "Geral (Todos os Anúncios)", "Grupo de Anúncios", "Produto Individual"
@@ -591,7 +646,7 @@ def _shopee_upload(engine):
         tipo_cod = TIPO_MAP.get(tipo, "geral")
         for arquivo in arquivos:
             st.markdown(f"**📄 Arquivo:** `{arquivo.name}`")
-            loja_nome = LOJAS_SHOPEE[loja]
+            loja_nome = disponiveis[i_loja][1]
             df, meta = processar_csv_ads_shopee(
                 arquivo, loja_override=loja_nome, tipo_override=tipo_cod
             )
@@ -786,12 +841,176 @@ def _registrar_log_ads(engine, meta, arquivo_nome, gravados, erros):
 # ============================================================
 
 def _shopee_dashboard(engine):
+    """Roteador do dashboard: cada loja lê a fonte dela, e só a dela."""
     st.subheader("Dashboard TACOS")
     st.caption("Meta TACOS: máximo 3% | 🟢 até 3% • 🟡 3–5% • 🟠 5–10% • 🔴 acima de 10%")
 
-    # Dropdown de loja
-    loja = st.selectbox("Loja", list(LOJAS_SHOPEE.keys()), key="dash_loja")
-    loja_nome = LOJAS_SHOPEE[loja]
+    lojas = _fonte_das_lojas()
+    rotulos = [f"{r}{'' if f != 'api' else '  ·  API'}" for r, _c, _s, f in lojas]
+    i = st.selectbox("Loja", range(len(lojas)), format_func=lambda i: rotulos[i],
+                     key="dash_loja_sel")
+    _rotulo, curto, sistema, fonte = lojas[i]
+
+    if fonte == 'api':
+        _shopee_dashboard_api(engine, sistema)
+    else:
+        _shopee_dashboard_upload(engine, curto)
+
+
+def _shopee_dashboard_api(engine, loja_sistema):
+    """Dashboard das lojas que já vêm pela API.
+
+    NÃO LÊ fact_ads_shopee. Nem para completar buraco, nem para "mostrar o
+    histórico antigo junto": o upload da Shopee-Nala vai até 02/08 e a API
+    começa em 23/03 — as duas fontes se sobrepõem, e somar qualquer pedaço
+    contaria o mesmo dinheiro duas vezes sem nenhum erro de banco.
+
+    TRÊS NÚMEROS DE PRIMEIRA LINHA, não um: o gasto da LOJA (que fecha 100%),
+    o que está atribuído a ANÚNCIO, e a diferença entre os dois. A diferença é
+    campanha de loja (GMV Max, que não tem anúncio nem SKU) e campanha que a
+    API não lista mais. Escondê-la no rodapé é o que faria alguém ler um TACOS
+    por anúncio que ignora metade do dinheiro.
+    """
+    from filtro_periodo import filtro_periodo
+
+    dado_ate = _query_scalar(engine, """
+        SELECT MAX(data) FROM fact_ads_diario_loja
+         WHERE marketplace = 'SHOPEE' AND loja = %s
+    """, [loja_sistema])
+    if dado_ate is None:
+        st.info("Nenhum dado de ads gravado pela API para esta loja ainda.")
+        return
+
+    ini, fim = filtro_periodo("ads_shopee_api", dado_ate=dado_ate)
+    if ini is None:
+        return
+
+    # --- 1) Os três números da loja -------------------------------------
+    gasto_loja = float(_query_scalar(engine, """
+        SELECT COALESCE(SUM(gasto_ads), 0) FROM fact_ads_diario_loja
+         WHERE marketplace = 'SHOPEE' AND loja = %s AND data BETWEEN %s AND %s
+    """, [loja_sistema, ini, fim]) or 0)
+
+    gasto_anuncios = float(_query_scalar(engine, """
+        SELECT COALESCE(SUM(gasto_ads), 0) FROM fact_ads_performance
+         WHERE marketplace = 'SHOPEE' AND loja = %s AND data BETWEEN %s AND %s
+    """, [loja_sistema, ini, fim]) or 0)
+
+    receita_loja = float(_query_scalar(engine, """
+        SELECT COALESCE(SUM(valor_venda_efetivo), 0) FROM fact_vendas_snapshot
+         WHERE UPPER(marketplace_origem) = 'SHOPEE' AND loja_origem = %s
+           AND data_venda BETWEEN %s AND %s
+    """, [loja_sistema, ini, fim]) or 0)
+
+    sem_anuncio = round(gasto_loja - gasto_anuncios, 2)
+    pct_sem = (sem_anuncio / gasto_loja * 100) if gasto_loja else 0
+    tacos_loja = (gasto_loja / receita_loja * 100) if receita_loja else None
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Receita da Loja", fmt_brl(receita_loja))
+    c2.metric("Gasto da Loja", fmt_brl(gasto_loja),
+              help="Total de ads cobrado pela Shopee. É o único número que "
+                   "fecha 100% do dinheiro.")
+    c3.metric("Nos Anúncios", fmt_brl(gasto_anuncios),
+              help="A parte do gasto que tem anúncio identificado.")
+    c4.metric("Sem Anúncio", fmt_brl(sem_anuncio), f"{fmt_pct(pct_sem)} do gasto",
+              delta_color="off",
+              help="Campanha de loja (GMV Max) e campanha que a API não lista "
+                   "mais. Não tem produto nem SKU.")
+    c5.metric("TACOS da Loja", fmt_pct(tacos_loja),
+              help="Gasto da LOJA sobre a receita da loja. Usa o gasto que "
+                   "fecha 100%, então vale mesmo quando o nível de anúncio não vale.")
+
+    if gasto_loja > 0 and pct_sem >= 1:
+        st.warning(
+            f"**TACOS por ANÚNCIO não vale neste período:** {fmt_pct(pct_sem)} do "
+            f"gasto ({fmt_brl(sem_anuncio)}) não tem anúncio identificado. "
+            f"O **TACOS da Loja** acima vale, porque usa o gasto total da loja.")
+
+    if receita_loja == 0:
+        st.warning(
+            f"Nenhuma venda encontrada para `{loja_sistema}` neste período. "
+            f"O TACOS da loja fica sem denominador.")
+
+    # --- 2) Por anúncio --------------------------------------------------
+    # A ponte ads -> venda na Shopee é o item_id, que mora em
+    # fact_pedidos_itens_marketplace.id_anuncio_plataforma. Não dá para usar
+    # fact_vendas_snapshot.codigo_anuncio como no Mercado Livre: na Shopee ele
+    # guarda o SKU na quase totalidade das linhas.
+    # E um anúncio pode ter VÁRIOS SKUs (variação e kit — um deles tem 11), por
+    # isso o SKU é agregado aqui e nunca gravado na linha de ads.
+    df = _query_df(engine, """
+        WITH ads AS (
+            SELECT codigo_anuncio, MAX(titulo) AS titulo,
+                   SUM(gasto_ads) AS gasto, SUM(receita_ads) AS receita_ads,
+                   SUM(cliques) AS cliques, SUM(impressoes) AS impressoes,
+                   SUM(vendas) AS pedidos
+              FROM fact_ads_performance
+             WHERE marketplace = 'SHOPEE' AND loja = %s
+               AND data BETWEEN %s AND %s
+             GROUP BY codigo_anuncio
+            HAVING SUM(gasto_ads) > 0
+        ), venda AS (
+            SELECT id_anuncio_plataforma AS codigo_anuncio,
+                   string_agg(DISTINCT sku, ', ' ORDER BY sku) AS skus,
+                   SUM(valor_venda_efetivo) AS venda,
+                   SUM(margem_total) AS margem
+              FROM fact_pedidos_itens_marketplace
+             WHERE marketplace = 'SHOPEE' AND loja = %s
+               AND data_venda BETWEEN %s AND %s
+               AND COALESCE(devolvida, FALSE) = FALSE
+             GROUP BY id_anuncio_plataforma
+        )
+        SELECT a.codigo_anuncio, a.titulo, v.skus,
+               a.impressoes, a.cliques, a.pedidos,
+               a.gasto, a.receita_ads, v.venda, v.margem
+          FROM ads a LEFT JOIN venda v ON v.codigo_anuncio = a.codigo_anuncio
+         ORDER BY a.gasto DESC
+    """, [loja_sistema, ini, fim, loja_sistema, ini, fim])
+
+    if df.empty:
+        st.info("Nenhum anúncio com gasto neste período.")
+        return
+
+    df['tacos'] = df.apply(
+        lambda r: (float(r['gasto']) / float(r['venda']) * 100)
+        if r['venda'] and float(r['venda']) > 0 else None, axis=1)
+    df['acos'] = df.apply(
+        lambda r: (float(r['gasto']) / float(r['receita_ads']) * 100)
+        if r['receita_ads'] and float(r['receita_ads']) > 0 else None, axis=1)
+
+    st.markdown("### TACOS por Anúncio")
+    st.caption("O SKU é derivado do anúncio na hora da leitura — um anúncio "
+               "pode ter vários, e a linha de ads não carrega nenhum.")
+
+    sem_venda = df[df['venda'].isna()]
+    if not sem_venda.empty:
+        st.info(f"**{len(sem_venda)} anúncio(s) gastaram e não venderam** neste "
+                f"período, somando {fmt_brl(float(sem_venda['gasto'].sum()))}.")
+
+    st.dataframe(
+        df.assign(
+            gasto=df['gasto'].map(lambda v: fmt_brl(float(v or 0))),
+            venda=df['venda'].map(lambda v: fmt_brl(float(v)) if v is not None else '—'),
+            margem=df['margem'].map(lambda v: fmt_brl(float(v)) if v is not None else '—'),
+            receita_ads=df['receita_ads'].map(lambda v: fmt_brl(float(v or 0))),
+            tacos=df['tacos'].map(fmt_pct),
+            acos=df['acos'].map(fmt_pct),
+        )[['codigo_anuncio', 'titulo', 'skus', 'impressoes', 'cliques',
+           'pedidos', 'gasto', 'receita_ads', 'acos', 'venda', 'tacos', 'margem']],
+        use_container_width=True, hide_index=True,
+        column_config={
+            'codigo_anuncio': 'Anúncio', 'titulo': 'Título', 'skus': 'SKUs',
+            'impressoes': 'Impressões', 'cliques': 'Cliques', 'pedidos': 'Pedidos',
+            'gasto': 'Gasto', 'receita_ads': 'Receita ads', 'acos': 'ACOS',
+            'venda': 'Venda total', 'tacos': 'TACOS', 'margem': 'Margem',
+        })
+
+
+def _shopee_dashboard_upload(engine, loja_nome):
+    """Dashboard das lojas que ainda entram por upload (hoje, só a
+    Shopee-Yanni, que não tem acesso à API — perfil em análise desde
+    13/09/2026). Lê fact_ads_shopee e mais nada."""
 
     # Dropdown de períodos já importados (mais prático que date_input manual)
     df_periodos = _query_df(engine, """
@@ -1270,8 +1489,19 @@ def _shopee_match_sku(engine):
         "automaticamente). Você só **confere os poucos duvidosos** 🤔. Não precisa digitar SKU."
     )
 
-    loja = st.selectbox("Loja", list(LOJAS_SHOPEE.keys()), key="match_loja")
-    loja_nome = LOJAS_SHOPEE[loja]
+    # Casar anúncio com SKU é trabalho do caminho do UPLOAD. Na API o vínculo
+    # não é digitado: vem do item_id da própria campanha, resolvido na leitura
+    # por fact_pedidos_itens_marketplace.id_anuncio_plataforma.
+    disponiveis = _lojas_de_upload()
+    if not disponiveis:
+        st.success("Nenhuma loja Shopee depende mais de match por título.")
+        st.caption("Nas lojas que vêm pela API o vínculo anúncio→SKU é "
+                   "derivado do item_id, não digitado aqui.")
+        return
+
+    i_loja = st.selectbox("Loja", range(len(disponiveis)),
+                          format_func=lambda i: disponiveis[i][0], key="match_loja")
+    loja_nome = disponiveis[i_loja][1]
 
     # Garante a tabela de vínculo dinâmico (idempotente)
     garantir_tabela_link_titulo(engine)

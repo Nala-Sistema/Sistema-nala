@@ -448,17 +448,46 @@ def garantir_coluna_ads_grupo(engine):
                 pass
 
 
+def lojas_bloqueadas_para_upload(df_ads):
+    """As lojas do DataFrame cuja fonte de ads já é a API.
+
+    Separada da gravação para poder ser testada sem banco e sem Streamlit.
+    Recebe o nome CURTO do relatório ('Nala-Lit') e traduz para o nome do
+    sistema ('Shopee Lithouse(Nala)'), que é como dim_fonte_dados guarda.
+    """
+    import fonte_dados
+    bloqueadas = []
+    for curto in sorted({str(l) for l in df_ads.get('loja', [])}):
+        sistema = LOJA_ADS_PARA_ORIGEM.get(curto, curto)
+        if fonte_dados.fonte_da_loja(sistema, 'ads') == 'api':
+            bloqueadas.append(f'{curto} ({sistema})')
+    return bloqueadas
+
+
 def gravar_ads_shopee(df_ads, arquivo_nome, engine):
     """
     Grava registros de ads no banco fact_ads_shopee.
     Usa UPSERT (INSERT ON CONFLICT UPDATE) para evitar duplicatas.
     SAVEPOINT por linha — falha individual não derruba a transação toda.
 
+    RECUSA loja cuja fonte de ads já seja a API (Fase 2). Esconder a loja do
+    seletor da tela não basta: quem chega por outro caminho — um arquivo
+    reaproveitado, um rerun com o estado antigo do Streamlit, um script — passa
+    por cima da tela e não do banco. Upload e API moram em tabelas diferentes e
+    não colidem em chave nenhuma, então o banco não avisaria: as duas fontes
+    simplesmente somariam na leitura, que foi o TACOS dobrado de 17/09/2026.
+
     Retorna: (gravados, erros, duplicatas)
     """
     gravados = 0
     erros = []
     duplicatas = 0
+
+    bloqueadas = lojas_bloqueadas_para_upload(df_ads)
+    if bloqueadas:
+        return 0, [f'Upload recusado: a fonte de ads de {", ".join(bloqueadas)} '
+                   f'já é a API. Nada foi gravado. Para reabrir o upload desta '
+                   f'loja, mude dim_fonte_dados (assunto "ads") — não esta tela.'], 0
 
     garantir_coluna_ads_grupo(engine)
     conn = engine.raw_connection()
