@@ -53,12 +53,29 @@
 -- LIMITES CONHECIDOS (não são bug; estão registrados para a tela)
 --   - "Entrada" é tudo o que entrou no Full: coleta, devolução de comprador
 --     e ajuste a favor. Não separa só a coleta.
---   - O saldo do dia D é a foto tirada na rodada seguinte (hoje ~10h BRT;
---     na grade nova, ~04h). A venda entre a meia-noite e a foto cai no dia
---     seguinte na conta da entrada. Foto às 04h reduz esse erro.
---   - ML-YanniSP (prep center): em 16–18/09 a entrada deu 21 contra 28 do
---     /operations. Investigação antes do passo 2; se não fechar, a tela marca
---     "entrada não confiável" para ela.
+--   - DE ONDE VEM O SALDO DO DIA D (corrigido em 26/09/2026, ressalva do
+--     auditor). Há DOIS regimes em fact_estoque_diario:
+--       a) série reconstruída pelas operações (/operations): o saldo de D é o
+--          FIM DO DIA D. É o regime de TODAS as linhas até 26/09/2026.
+--       b) gravação parcial (estoque_ml.linha_so_saldo, coletor 467e3e7): o
+--          saldo de D é a FOTO do Full tirada na rodada de D+1 (hoje ~10h BRT;
+--          na grade nova, ~04h). Em 26/09/2026 havia 0 linhas assim.
+--     No regime (b) a venda entre a meia-noite e a foto entra na conta de D+1,
+--     e no dia da troca de (a) para (b) há um salto. Esse ruído AINDA NÃO FOI
+--     MEDIDO: nenhum alarme de "saída sem explicação" vai para a tela antes de
+--     a view marcar a linha que veio da foto e de a medição das rodadas
+--     parciais (a partir de 27/09/2026) definir a tolerância.
+--   - Saída sem explicação inclui RETIRADA do Full e ajuste contra: é "saída
+--     sem venda", não necessariamente perda.
+--   - `venda_ate` é a ÚLTIMA VENDA da loja: numa loja de pouco volume, um dia
+--     sem nenhuma venda depois da última fica "desconhecido" até a próxima.
+--   - Com a API das vendas do ML como fonte, pedido que vira devolução SAI do
+--     snapshot depois (regra A): a venda de dias passados pode diminuir e a
+--     entrada/saída desses dias muda na leitura seguinte. É esperado.
+--   - ML-YanniSP (prep center): em 16–18/09 a entrada deu 22 contra 28 do
+--     /operations. Diferença explicada pelo auditor (o método antigo soma as
+--     subidas e ignora as descidas). Investigação FECHADA em 26/09/2026, sem
+--     marca de "entrada não confiável".
 --
 -- CONFERIDO EM LEITURA em 26/09/2026: o corpo EXATO desta view (extraído
 -- deste arquivo por script) rodou como CTE de mesmo nome na frente das
