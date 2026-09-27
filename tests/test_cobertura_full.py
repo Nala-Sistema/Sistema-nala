@@ -160,6 +160,38 @@ class Margem(unittest.TestCase):
         self.assertTrue(r['giro_baixo'])
 
 
+class VendaAte(unittest.TestCase):
+    """Passo 3 da troca do /operations (26/09/2026): a venda só é conhecida até
+    a última venda registrada da loja (`venda_ate`, coluna 31 da view)."""
+
+    def test_venda_atrasada_aparece_com_a_data(self):
+        r = cf.avaliar(linha(10, 0, 1.0, 7, 1.0, 30, 7, venda_ate=date(2026, 9, 24),
+                             data_do_dado=date(2026, 9, 26)), ML)
+        self.assertIn('venda até 24/09: os 2 dia(s) seguintes ficam fora da demanda',
+                      r['avisos'])
+
+    def test_venda_em_dia_nao_avisa(self):
+        r = cf.avaliar(linha(10, 0, 1.0, 7, 1.0, 30, 7, venda_ate=date(2026, 9, 26),
+                             data_do_dado=date(2026, 9, 26)), ML)
+        self.assertFalse(any(a.startswith('venda até') for a in r['avisos']))
+
+    def test_sem_venda_ate_fica_como_antes(self):
+        # outro marketplace (a coluna vem NULL): nada muda
+        r = cf.avaliar(linha(0, 0, 1.0, 3, 0.2, 20, 3, venda_liquida_30d=4), ML)
+        self.assertTrue(r['giro_baixo'])
+        self.assertFalse(any(a.startswith('venda até') for a in r['avisos']))
+
+    def test_uma_semana_de_venda_desconhecida_ainda_decide_giro_baixo(self):
+        r = cf.avaliar(linha(0, 0, 1.0, 3, 0.2, 20, 3, venda_liquida_30d=4,
+                             venda_ate=date(2026, 9, 19), data_do_dado=date(2026, 9, 26)), ML)
+        self.assertTrue(r['giro_baixo'])
+
+    def test_mais_de_uma_semana_desconhecida_nao_marca_giro_baixo_falso(self):
+        r = cf.avaliar(linha(0, 0, 1.0, 3, 0.2, 20, 3, venda_liquida_30d=4,
+                             venda_ate=date(2026, 9, 18), data_do_dado=date(2026, 9, 26)), ML)
+        self.assertFalse(r['giro_baixo'])
+
+
 class OrdemDaLista(unittest.TestCase):
     def item(self, nome, nivel, margem, giro_baixo=False):
         return {'nome': nome, 'nivel': nivel, 'margem_perdida_dia': margem,
@@ -245,6 +277,19 @@ class Agendamentos(unittest.TestCase):
         self.assertEqual((s[1]['situacao'], s[1]['a_descontar']), (cf.SEM_SINAL, 30))
         s = situacao([ag(1, date(2026, 9, 12), 30, sinal=False)], [], set(), date(2026, 9, 19))
         self.assertEqual(s[1]['a_descontar'], 0)
+
+    def test_dia_desconhecido_na_janela_nunca_vira_coleta_nao_aconteceu(self):
+        # movimento desconhecido (venda não registrada / sem saldo na véspera):
+        # sem coleta vista não prova que ela não aconteceu
+        a = dict(ag(1, date(2026, 9, 12), 30), dias_desconhecidos_na_janela=2)
+        s = situacao([a], [], set(), date(2026, 9, 16))
+        self.assertEqual((s[1]['situacao'], s[1]['a_descontar']), (cf.SEM_SINAL, 30))
+
+    def test_coleta_vista_vale_mesmo_com_dia_desconhecido(self):
+        a = dict(ag(1, date(2026, 9, 12), 30), dias_desconhecidos_na_janela=2)
+        s = situacao([a], [(date(2026, 9, 12), 30)], ondas(date(2026, 9, 12)),
+                     date(2026, 9, 16))
+        self.assertEqual(s[1]['situacao'], cf.COLETADO)
 
     def test_coleta_avulsa_marcada_a_mao_vale_como_coletado(self):
         s = situacao([ag(1, date(2026, 9, 3), 20, manual=date(2026, 9, 3))],
