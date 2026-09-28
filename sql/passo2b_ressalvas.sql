@@ -1,10 +1,9 @@
 -- =============================================================================
--- PASSO 2 — v_cobertura_full e v_estoque_envio_manual LEEM O MOVIMENTO DA
---           v_movimento_full_diario (ML), e não mais das operações do Full
+-- PASSO 2b — RESSALVAS DO AUDITOR AO PASSO 2 (três views, só definição)
 -- =============================================================================
--- Escrito em 26/09/2026 (frente [HORARIO COLETORES], passo 2 de 4). NÃO RODAR
--- sem o parecer do auditor-tecnico. Depende de v_movimento_full_diario
--- (sql/v_movimento_full_diario.sql), aplicada em 26/09/2026 19:18.
+-- Escrito em 28/09/2026 (frente [HORARIO COLETORES]). NÃO RODAR sem o parecer
+-- do auditor-tecnico. Depende dos passos 1 e 2 aplicados
+-- (sql/v_movimento_full_diario.sql e sql/passo2_cobertura_e_envio_pelo_movimento.sql).
 --
 -- ONDE RODAR: projeto Neon "Gestão Marketplaces" (still-shape-14526725),
 --             branch "production", banco "neondb", como neondb_owner.
@@ -19,62 +18,26 @@
 --             ANTES DE EXECUTAR: anotar a hora e o minuto (ponto de
 --             restauração; o projeto guarda 7 dias de histórico).
 --
--- ORDEM OBRIGATÓRIA DA FRENTE
---   passo 2 (este) -> passo 3 (cobertura_full.py lê as colunas novas) ->
---   passo 4 (coletor para de chamar /operations). Assim a tela nunca fica
---   sem movimento no meio da troca.
+-- O QUE MUDA (linhas marcadas com "<<<"; o resto é o texto aplicado, gerado
+-- por script a partir dos arquivos dos passos 1 e 2)
+--   (b) [MÉDIA] v_movimento_full_diario: entrada_implicita e
+--       saida_sem_explicacao saíam 0 (e não NULL) nos dias de movimento
+--       desconhecido, porque GREATEST(NULL, 0) = 0 no Postgres. Passam a NULL.
+--       Quem já lia estava protegido (FILTER movimento_conhecido, "> 0",
+--       COALESCE(...,0) em teve_full_30d), então nenhuma tela muda hoje.
+--   (a) [BAIXA] v_cobertura_full, caminho FORA do ML: a venda líquida volta a
+--       COALESCE(vendidas, 0) − canceladas − canceladas pós-envio, como era
+--       antes do passo 2 (diferia com vendidas NULL e cancelamento > 0). Hoje
+--       não há linha fora do ML: nada muda.
+--   (c) [BAIXA] v_estoque_envio_manual: dias_desconhecidos_na_janela só
+--       desconta dia conhecido ATÉ ONTEM (um dia conhecido depois de ontem
+--       fazia a conta sair para menos).
 --
--- O QUE MUDA — v_cobertura_full (as 30 colunas ficam com os MESMOS nomes,
--- ordem e tipos; a regra de "dado atrasado" não muda)
---   - No MERCADO LIVRE, a venda de 7 e 30 dias (vendidas_7d, venda_liquida_7d,
---     venda_liquida_30d) vem de v_movimento_full_diario.venda_unidades — a
---     venda FULL de fact_vendas_snapshot, que já é líquida de cancelamento.
---     ATENÇÃO: no ML, vendidas_7d passa a ser LÍQUIDA (igual a
---     venda_liquida_7d); não existe mais "bruto − cancelado" no ML.
---     (Corrigido em 28/09/2026, ressalva do auditor.)
---   - dias_com_estoque_7d/30d contam só dia com venda CONHECIDA (dia depois
---     de venda_ate, ou sem saldo na véspera, fica fora do denominador).
---   - teve_full_30d também olha a entrada implícita.
---   - Saldo, trânsito, bloqueio fiscal, galpão, data do dado, origem e
---     serie_divergente continuam vindo de fact_estoque_diario.
---   - Qualquer outro marketplace (Shopee, quando entrar) continua no caminho
---     antigo, linha a linha, pelas colunas de fact_estoque_diario. A venda
---     líquida desse caminho neste arquivo saiu diferente da antiga (vendidas
---     NULL com cancelamento > 0); corrigida em sql/passo2b_ressalvas.sql.
---   - NOVA coluna 31, no fim: venda_ate (a tela mostra "venda até dd/mm").
+-- CREATE OR REPLACE mantém nomes, ordem e tipos das colunas (as três views).
+-- Nenhuma tabela é tocada.
 --
--- O QUE MUDA — v_estoque_envio_manual (as 15 colunas ficam iguais)
---   - No ML, coletado_na_janela = soma da entrada implícita dos dias da
---     janela com movimento CONHECIDO. Se nenhum dia da janela é conhecido,
---     fica NULL — nunca 0 (desconhecido não vira "não coletado").
---   - fonte_tem_sinal_coleta, no ML: o estoque tem saldo do Full em
---     fact_estoque_diario (é dele que a entrada implícita sai). Consulta à
---     tabela, e não à view, de propósito: EXISTS na view a recalcularia
---     inteira para cada agendamento.
---   - NOVA coluna 16, no fim: dias_desconhecidos_na_janela (dias da janela,
---     até ontem, sem movimento conhecido). NULL fora do ML.
---   - Fora do ML, o caminho antigo, igual.
---   - LIMITE: a entrada implícita inclui devolução de comprador e ajuste a
---     favor; um agendamento pode aparecer como "coletado" por isso.
---
--- O QUE NÃO MUDA
---   Nenhuma tabela. Nenhum alarme de "saída sem venda" (fica para depois da
---   medição do ruído foto × foto, 28–30/09/2026).
---
--- REGRA PARA QUEM MEXER DEPOIS (decisão do Mestre, 28/09/2026)
---   A "revisão 4 do DDL" (colunas coletado_manual_em / coletado_manual_por,
---   que o cobertura_full.py já lê desde o commit 225ad52 e que NUNCA foram
---   aplicadas) tem de partir da v_estoque_envio_manual DESTE PASSO — 16
---   colunas, lendo v_movimento_full_diario — e acrescentar as colunas novas
---   NO FIM. Partir da versão antiga (15 colunas, unidades_entrada_coleta)
---   desfaz este passo em silêncio. Idem para qualquer mudança futura na
---   v_cobertura_full: partir de pg_get_viewdef de produção, nunca de arquivo
---   antigo.
---
--- DESFAZER: arquivo sql/passo2_cobertura_e_envio_pelo_movimento_DESFAZER.sql
---   (CREATE OR REPLACE não remove coluna: desfazer é DROP + CREATE com as
---   definições antigas, que estão lá inteiras, prontas para colar).
---
+-- DESFAZER: sql/passo2b_ressalvas_DESFAZER.sql (reaplica os textos dos passos 1
+-- e 2 como estão hoje em produção).
 -- =============================================================================
 
 BEGIN;
@@ -82,62 +45,119 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 
 -- -----------------------------------------------------------------------------
--- 1. Guarda: as views em produção são as que este arquivo espera
+-- 1. Guarda: produção está no estado dos passos 1 e 2
 -- -----------------------------------------------------------------------------
 DO $$
-DECLARE def_cob TEXT; def_env TEXT; n_cob INTEGER; n_env INTEGER;
+DECLARE def_mov TEXT; def_cob TEXT; def_env TEXT;
 BEGIN
-    IF to_regclass('public.v_movimento_full_diario') IS NULL THEN
-        RAISE EXCEPTION
-'v_movimento_full_diario nao existe. Aplique sql/v_movimento_full_diario.sql
-antes. Nada foi aplicado.';
-    END IF;
-
+    def_mov := pg_get_viewdef('v_movimento_full_diario'::regclass, true);
     def_cob := pg_get_viewdef('v_cobertura_full'::regclass, true);
     def_env := pg_get_viewdef('v_estoque_envio_manual'::regclass, true);
-    IF def_cob ILIKE '%v_movimento_full_diario%' OR def_env ILIKE '%v_movimento_full_diario%' THEN
-        RAISE EXCEPTION
-'As views ja leem v_movimento_full_diario. Este arquivo ja rodou. Nada foi aplicado.';
+    IF def_cob NOT ILIKE '%v_movimento_full_diario%' OR def_env NOT ILIKE '%dias_desconhecidos_na_janela%' THEN
+        RAISE EXCEPTION 'O passo 2 nao esta aplicado. Nada foi aplicado.';
     END IF;
-    IF def_cob NOT ILIKE '%f.unidades_vendidas IS NOT NULL AND (f.full_disponivel > 0 OR f.unidades_vendidas > 0)) AS dias_com_estoque_30d%' THEN
-        RAISE EXCEPTION
-'v_cobertura_full nao e a esperada (sem o sql/v_cobertura_full_denominador_sem_null.sql
-ou alterada depois). Nada foi aplicado.';
+    IF def_mov ILIKE '%END::integer AS entrada_implicita%' THEN
+        RAISE EXCEPTION 'v_movimento_full_diario ja tem a correcao (b). Este arquivo ja rodou. Nada foi aplicado.';
     END IF;
-    IF def_env NOT ILIKE '%COALESCE(sum(f.unidades_entrada_coleta), 0::bigint) AS coletado_na_janela%' THEN
-        RAISE EXCEPTION
-'v_estoque_envio_manual nao e a esperada. Nada foi aplicado.';
-    END IF;
-
-    SELECT count(*) INTO n_cob FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = 'v_cobertura_full';
-    SELECT count(*) INTO n_env FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = 'v_estoque_envio_manual';
-    IF n_cob <> 30 OR n_env <> 15 THEN
-        RAISE EXCEPTION
-'Esperava 30 colunas em v_cobertura_full e 15 em v_estoque_envio_manual; achei % e %.
-Nada foi aplicado.', n_cob, n_env;
+    IF (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'v_movimento_full_diario') <> 11
+       OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'v_cobertura_full') <> 31
+       OR (SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'v_estoque_envio_manual') <> 16 THEN
+        RAISE EXCEPTION 'Numero de colunas diferente do esperado (11, 31, 16). Nada foi aplicado.';
     END IF;
 END $$;
 
 -- -----------------------------------------------------------------------------
--- 2. ANTES: foto das duas views (somem sozinhas no COMMIT)
+-- 2. ANTES
 -- -----------------------------------------------------------------------------
+CREATE TEMP TABLE movimento_antes ON COMMIT DROP AS SELECT * FROM v_movimento_full_diario;
 CREATE TEMP TABLE cobertura_antes ON COMMIT DROP AS SELECT * FROM v_cobertura_full;
 CREATE TEMP TABLE envio_antes ON COMMIT DROP AS SELECT * FROM v_estoque_envio_manual;
 
-SELECT 'ANTES' AS momento, loja, count(*) AS estoques,
-       sum(venda_liquida_7d) AS venda_7d, sum(venda_liquida_30d) AS venda_30d,
-       count(*) FILTER (WHERE venda_dia_7d IS NULL) AS sem_venda_dia_7d,
-       count(*) FILTER (WHERE dado_atrasado) AS dado_atrasado
-  FROM cobertura_antes
- GROUP BY loja
- ORDER BY loja;
+SELECT 'ANTES' AS momento, loja,
+       count(*) FILTER (WHERE NOT movimento_conhecido) AS dias_desconhecidos,
+       count(*) FILTER (WHERE NOT movimento_conhecido AND entrada_implicita = 0) AS desconhecido_com_entrada_zero
+  FROM movimento_antes
+ GROUP BY loja ORDER BY loja;
 
 -- -----------------------------------------------------------------------------
--- 3a. v_cobertura_full (copiada de pg_get_viewdef em 26/09/2026; o que mudou
---     está marcado com "<<<")
+-- 3. As três views
 -- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_movimento_full_diario AS
+WITH venda_ate AS (
+    -- Última venda do ML da loja, em qualquer logística: até onde a venda é
+    -- conhecida. Depois disso, movimento desconhecido.
+    SELECT loja_origem AS loja, max(data_venda) AS venda_ate
+      FROM fact_vendas_snapshot
+     WHERE marketplace_origem = 'MERCADO LIVRE'
+     GROUP BY loja_origem
+), ponte_sku AS (
+    SELECT loja, anuncio_id, upper(trim(sku)) AS sku, min(estoque_id) AS estoque_id
+      FROM dim_estoque_anuncio
+     WHERE marketplace = 'MERCADO LIVRE' AND sku IS NOT NULL
+     GROUP BY loja, anuncio_id, upper(trim(sku))
+    HAVING count(DISTINCT estoque_id) = 1
+), ponte_anuncio AS (
+    SELECT loja, anuncio_id, min(estoque_id) AS estoque_id
+      FROM dim_estoque_anuncio
+     WHERE marketplace = 'MERCADO LIVRE'
+     GROUP BY loja, anuncio_id
+    HAVING count(DISTINCT estoque_id) = 1
+), venda AS (
+    SELECT v.loja_origem AS loja,
+           COALESCE(ps.estoque_id, pa.estoque_id) AS estoque_id,
+           v.data_venda AS data,
+           sum(v.quantidade) AS unidades
+      FROM fact_vendas_snapshot v
+      LEFT JOIN ponte_sku ps
+             ON ps.loja = v.loja_origem AND ps.anuncio_id = v.codigo_anuncio
+            AND ps.sku = upper(trim(v.sku))
+      LEFT JOIN ponte_anuncio pa
+             ON pa.loja = v.loja_origem AND pa.anuncio_id = v.codigo_anuncio
+     WHERE v.marketplace_origem = 'MERCADO LIVRE'
+       AND upper(v.logistica) = 'FULL'
+       AND COALESCE(ps.estoque_id, pa.estoque_id) IS NOT NULL
+     GROUP BY v.loja_origem, COALESCE(ps.estoque_id, pa.estoque_id), v.data_venda
+), saldo AS (
+    SELECT f.marketplace, f.loja, f.estoque_id, f.data,
+           COALESCE(f.full_disponivel, 0) + COALESCE(f.full_em_transferencia, 0)
+         + COALESCE(f.full_bloqueado_fiscal, 0) + COALESCE(f.full_outros_indisponivel, 0)
+               AS saldo_total,
+           lag(COALESCE(f.full_disponivel, 0) + COALESCE(f.full_em_transferencia, 0)
+             + COALESCE(f.full_bloqueado_fiscal, 0) + COALESCE(f.full_outros_indisponivel, 0))
+               OVER w AS saldo_total_anterior,
+           lag(f.data) OVER w AS data_anterior
+      FROM fact_estoque_diario f
+     WHERE f.marketplace = 'MERCADO LIVRE'
+       AND f.detalhe ? 'inventory_id'          -- só estoque com Full
+    WINDOW w AS (PARTITION BY f.marketplace, f.loja, f.estoque_id ORDER BY f.data)
+), base AS (
+    SELECT s.marketplace, s.loja, s.estoque_id, s.data, s.saldo_total,
+           CASE WHEN s.data_anterior = s.data - 1 THEN s.saldo_total_anterior END
+               AS saldo_total_anterior,
+           va.venda_ate,
+           CASE WHEN va.venda_ate IS NOT NULL AND s.data <= va.venda_ate
+                THEN COALESCE(vd.unidades, 0) END AS venda_unidades
+      FROM saldo s
+      LEFT JOIN venda_ate va ON va.loja = s.loja
+      LEFT JOIN venda vd
+             ON vd.loja = s.loja AND vd.estoque_id = s.estoque_id AND vd.data = s.data
+)
+SELECT marketplace, loja, estoque_id, data,
+       saldo_total,
+       saldo_total_anterior,
+       venda_ate,
+       venda_unidades::integer AS venda_unidades,
+       -- <<< (b) GREATEST ignora NULL: sem o CASE, dia desconhecido saía 0
+       CASE WHEN saldo_total_anterior IS NOT NULL AND venda_unidades IS NOT NULL
+            THEN GREATEST(saldo_total - saldo_total_anterior + venda_unidades, 0)
+       END::integer AS entrada_implicita,
+       CASE WHEN saldo_total_anterior IS NOT NULL AND venda_unidades IS NOT NULL
+            THEN GREATEST(-(saldo_total - saldo_total_anterior + venda_unidades), 0)
+       END::integer AS saida_sem_explicacao,
+       (saldo_total_anterior IS NOT NULL AND venda_unidades IS NOT NULL)
+           AS movimento_conhecido
+  FROM base;
+
 CREATE OR REPLACE VIEW v_cobertura_full AS
  WITH ultimo AS (
          SELECT DISTINCT ON (fact_estoque_diario.marketplace, fact_estoque_diario.loja, fact_estoque_diario.estoque_id) fact_estoque_diario.marketplace,
@@ -174,7 +194,7 @@ CREATE OR REPLACE VIEW v_cobertura_full AS
                 CASE WHEN f.marketplace::text = 'MERCADO LIVRE'::text THEN m.venda_unidades
                      ELSE f.unidades_vendidas END AS venda_bruta,
                 CASE WHEN f.marketplace::text = 'MERCADO LIVRE'::text THEN m.venda_unidades
-                     ELSE f.unidades_vendidas - COALESCE(f.unidades_canceladas, 0) - COALESCE(f.unidades_canceladas_pos_envio, 0) END AS venda_liquida,
+                     ELSE COALESCE(f.unidades_vendidas, 0) - COALESCE(f.unidades_canceladas, 0) - COALESCE(f.unidades_canceladas_pos_envio, 0) END AS venda_liquida,  -- <<< (a) como era antes do passo 2
                 CASE WHEN f.marketplace::text = 'MERCADO LIVRE'::text THEN m.entrada_implicita
                      ELSE f.unidades_entrada_coleta END AS entrada
            FROM fact_estoque_diario f
@@ -272,10 +292,6 @@ CREATE OR REPLACE VIEW v_cobertura_full AS
      LEFT JOIN venda_ate va ON va.loja::text = u.loja::text AND u.marketplace::text = 'MERCADO LIVRE'::text  -- <<<
   WHERE j.teve_full_30d AND (g.hoje - u.data) <= 30;
 
--- -----------------------------------------------------------------------------
--- 3b. v_estoque_envio_manual (copiada de pg_get_viewdef em 26/09/2026; o que
---     mudou está marcado com "<<<")
--- -----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_estoque_envio_manual AS
  WITH mov AS MATERIALIZED (  -- <<< o movimento calculado UMA vez (ver v_cobertura_full)
          SELECT v_movimento_full_diario.marketplace, v_movimento_full_diario.loja,
@@ -308,7 +324,7 @@ CREATE OR REPLACE VIEW v_estoque_envio_manual AS
                   WHERE s.marketplace::text = a.marketplace::text AND s.loja::text = a.loja::text AND s.estoque_id::text = a.estoque_id::text AND s.unidades_entrada_coleta IS NOT NULL)) END AS fonte_tem_sinal_coleta,
         CASE WHEN a.marketplace::text = 'MERCADO LIVRE'::text  -- <<< coluna 16
              THEN GREATEST(LEAST(a.data_coleta + 6, (now() AT TIME ZONE 'America/Sao_Paulo'::text)::date - 1) - (a.data_coleta - 1) + 1
-                           - count(m.data) FILTER (WHERE m.movimento_conhecido), 0)::integer
+                           - count(m.data) FILTER (WHERE m.movimento_conhecido AND m.data <= (now() AT TIME ZONE 'America/Sao_Paulo'::text)::date - 1), 0)::integer  -- <<< (c)
              END AS dias_desconhecidos_na_janela
    FROM fact_estoque_envio_manual a
      LEFT JOIN fact_estoque_diario f ON f.marketplace::text = a.marketplace::text AND f.loja::text = a.loja::text AND f.estoque_id::text = a.estoque_id::text AND f.data >= (a.data_coleta - 1) AND f.data <= (a.data_coleta + 6)
@@ -317,110 +333,60 @@ CREATE OR REPLACE VIEW v_estoque_envio_manual AS
   GROUP BY a.id;
 
 -- -----------------------------------------------------------------------------
--- 4. Guarda do DEPOIS: só as colunas de venda/entrada podem ter mudado
+-- 4. Guarda do DEPOIS: só pode mudar o que as ressalvas dizem
 -- -----------------------------------------------------------------------------
 DO $$
-DECLARE n_antes INTEGER; n_depois INTEGER; mudou INTEGER; n_cob INTEGER; n_env INTEGER;
+DECLARE mudou INTEGER;
 BEGIN
-    SELECT count(*) INTO n_cob FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = 'v_cobertura_full';
-    SELECT count(*) INTO n_env FROM information_schema.columns
-     WHERE table_schema = 'public' AND table_name = 'v_estoque_envio_manual';
-    IF n_cob <> 31 OR n_env <> 16 THEN
-        RAISE EXCEPTION 'Esperava 31 e 16 colunas depois; achei % e %. Nada foi aplicado.',
-            n_cob, n_env;
-    END IF;
-
-    -- v_cobertura_full: mesmas linhas (o filtro teve_full_30d pode ganhar
-    -- estoque pela entrada implícita, nunca perder) e colunas 1–21 iguais.
-    SELECT count(*) INTO n_antes FROM cobertura_antes;
-    SELECT count(*) INTO n_depois FROM v_cobertura_full;
-    IF n_depois < n_antes THEN
-        RAISE EXCEPTION 'v_cobertura_full perdeu linhas: % -> %. Nada foi aplicado.',
-            n_antes, n_depois;
+    -- (b): mesmas linhas; dia CONHECIDO igual; dia DESCONHECIDO com entrada e
+    -- saída NULL.
+    IF (SELECT count(*) FROM movimento_antes) <> (SELECT count(*) FROM v_movimento_full_diario) THEN
+        RAISE EXCEPTION 'v_movimento_full_diario mudou de numero de linhas. Nada foi aplicado.';
     END IF;
     SELECT count(*) INTO mudou
-      FROM cobertura_antes a
-      JOIN v_cobertura_full d USING (marketplace, loja, estoque_id)
-     WHERE (a.skus, a.titulo, a.anuncios, a.qtd_anuncios, a.algum_anuncio_em_full,
-            a.algum_anuncio_ativo, a.data_do_dado, a.dias_desde_o_dado, a.dado_atrasado,
-            a.origem_ultimo_dado, a.serie_divergente, a.fonte_venda, a.full_disponivel,
-            a.full_em_transferencia, a.full_bloqueado_fiscal, a.full_outros_indisponivel,
-            a.galpao_disponivel, a.dias_bloqueio_fiscal, a.dias_com_dado_7d,
-            a.dias_com_dado_30d)
-           IS DISTINCT FROM
-           (d.skus, d.titulo, d.anuncios, d.qtd_anuncios, d.algum_anuncio_em_full,
-            d.algum_anuncio_ativo, d.data_do_dado, d.dias_desde_o_dado, d.dado_atrasado,
-            d.origem_ultimo_dado, d.serie_divergente, d.fonte_venda, d.full_disponivel,
-            d.full_em_transferencia, d.full_bloqueado_fiscal, d.full_outros_indisponivel,
-            d.galpao_disponivel, d.dias_bloqueio_fiscal, d.dias_com_dado_7d,
-            d.dias_com_dado_30d);
+      FROM movimento_antes a JOIN v_movimento_full_diario d USING (marketplace, loja, estoque_id, data)
+     WHERE (a.movimento_conhecido AND (a.*)::text IS DISTINCT FROM (d.*)::text)
+        OR (NOT d.movimento_conhecido AND (d.entrada_implicita IS NOT NULL OR d.saida_sem_explicacao IS NOT NULL));
     IF mudou > 0 THEN
-        RAISE EXCEPTION
-'% linha(s) de v_cobertura_full mudaram em coluna que nao e de venda. A copia saiu
-diferente da original. Nada foi aplicado.', mudou;
+        RAISE EXCEPTION '% linha(s) de v_movimento_full_diario fora do esperado. Nada foi aplicado.', mudou;
     END IF;
 
-    -- v_estoque_envio_manual: mesmas linhas e colunas 1–11, 13 e 14 iguais.
-    SELECT count(*) INTO n_antes FROM envio_antes;
-    SELECT count(*) INTO n_depois FROM v_estoque_envio_manual;
-    IF n_antes <> n_depois THEN
-        RAISE EXCEPTION 'v_estoque_envio_manual tinha % linhas e agora tem %. Nada foi aplicado.',
-            n_antes, n_depois;
+    -- (a): hoje só há ML em fact_estoque_diario, então v_cobertura_full fica igual.
+    IF (SELECT count(*) FROM cobertura_antes) <> (SELECT count(*) FROM v_cobertura_full) THEN
+        RAISE EXCEPTION 'v_cobertura_full mudou de numero de linhas. Nada foi aplicado.';
+    END IF;
+    SELECT count(*) INTO mudou
+      FROM cobertura_antes a JOIN v_cobertura_full d USING (marketplace, loja, estoque_id)
+     WHERE a.marketplace = 'MERCADO LIVRE' AND (a.*)::text IS DISTINCT FROM (d.*)::text;
+    IF mudou > 0 THEN
+        RAISE EXCEPTION '% linha(s) do ML mudaram em v_cobertura_full. Nada foi aplicado.', mudou;
+    END IF;
+
+    -- (c): mesmas linhas; só dias_desconhecidos_na_janela pode mudar.
+    IF (SELECT count(*) FROM envio_antes) <> (SELECT count(*) FROM v_estoque_envio_manual) THEN
+        RAISE EXCEPTION 'v_estoque_envio_manual mudou de numero de linhas. Nada foi aplicado.';
     END IF;
     SELECT count(*) INTO mudou
       FROM envio_antes a JOIN v_estoque_envio_manual d USING (id)
-     WHERE (a.marketplace, a.loja, a.estoque_id, a.data_coleta, a.quantidade, a.observacao,
-            a.criado_por, a.criado_em, a.janela_inicio, a.janela_fim, a.janela_encerrada,
-            a.dias_desde_data_agendada)
-           IS DISTINCT FROM
-           (d.marketplace, d.loja, d.estoque_id, d.data_coleta, d.quantidade, d.observacao,
-            d.criado_por, d.criado_em, d.janela_inicio, d.janela_fim, d.janela_encerrada,
-            d.dias_desde_data_agendada);
+     WHERE (a.coletado_na_janela, a.fonte_tem_sinal_coleta, a.janela_fim)
+           IS DISTINCT FROM (d.coletado_na_janela, d.fonte_tem_sinal_coleta, d.janela_fim);
     IF mudou > 0 THEN
-        RAISE EXCEPTION '% agendamento(s) mudaram fora das colunas de coleta. Nada foi aplicado.',
-            mudou;
+        RAISE EXCEPTION '% agendamento(s) mudaram fora de dias_desconhecidos_na_janela. Nada foi aplicado.', mudou;
     END IF;
 END $$;
 
 -- -----------------------------------------------------------------------------
--- 5. DEPOIS: o que mudou
+-- 5. DEPOIS
 -- -----------------------------------------------------------------------------
-SELECT 'DEPOIS' AS momento, d.loja, count(*) AS estoques,
-       sum(a.venda_liquida_7d) AS venda_7d_antes, sum(d.venda_liquida_7d) AS venda_7d_depois,
-       sum(a.venda_liquida_30d) AS venda_30d_antes, sum(d.venda_liquida_30d) AS venda_30d_depois,
-       count(*) FILTER (WHERE a.venda_dia_7d IS NULL) AS sem_venda_dia_7d_antes,
-       count(*) FILTER (WHERE d.venda_dia_7d IS NULL) AS sem_venda_dia_7d_depois,
-       count(*) FILTER (WHERE d.dias_com_estoque_7d < 3) AS abaixo_do_piso_7d_depois,
-       max(d.venda_ate) AS venda_ate
-  FROM v_cobertura_full d
-  LEFT JOIN cobertura_antes a USING (marketplace, loja, estoque_id)
- GROUP BY d.loja
- ORDER BY d.loja;
-
-SELECT 'DEPOIS envio' AS momento, d.id, d.loja, d.estoque_id, d.data_coleta, d.quantidade,
-       a.coletado_na_janela AS coletado_antes, d.coletado_na_janela AS coletado_depois,
-       d.dias_desconhecidos_na_janela, a.fonte_tem_sinal_coleta AS sinal_antes,
-       d.fonte_tem_sinal_coleta AS sinal_depois
-  FROM v_estoque_envio_manual d
-  JOIN envio_antes a USING (id)
- ORDER BY d.data_coleta DESC, d.id
- LIMIT 50;
+SELECT 'DEPOIS' AS momento, loja,
+       count(*) FILTER (WHERE NOT movimento_conhecido) AS dias_desconhecidos,
+       count(*) FILTER (WHERE NOT movimento_conhecido AND entrada_implicita IS NULL) AS desconhecido_com_entrada_null
+  FROM v_movimento_full_diario
+ GROUP BY loja ORDER BY loja;
 
 COMMIT;
 
 -- =============================================================================
--- CONFERÊNCIA DEPOIS DO COMMIT (só leitura)
--- =============================================================================
---   SELECT count(*), max(venda_ate) FROM v_cobertura_full;
---   SELECT count(*), count(coletado_na_janela) FROM v_estoque_envio_manual;
---   Abrir a tela de Cobertura do Full: tem de carregar. As colunas novas só
---   aparecem na tela depois do passo 3 (cobertura_full.py).
---
--- =============================================================================
 -- DESFAZER
 -- =============================================================================
--- Colar INTEIRO o arquivo sql/passo2_cobertura_e_envio_pelo_movimento_DESFAZER.sql
--- (DROP das duas views e CREATE com as definições de 26/09/2026, antes deste
--- passo). ATENÇÃO: se o passo 3 (cobertura_full.py lendo venda_ate) já estiver
--- publicado, desfazer o passo 3 antes, ou a tela quebra por coluna ausente.
+-- Colar INTEIRO sql/passo2b_ressalvas_DESFAZER.sql.
