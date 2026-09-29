@@ -1611,7 +1611,14 @@ _SQL_PENALIZACAO_MODELO = """
 SQL_PENALIZACAO_FRETE = _SQL_PENALIZACAO_MODELO.format(tk=_TK_TABELA)
 SQL_PENALIZACAO_FRETE_SEM_TK = _SQL_PENALIZACAO_MODELO.format(tk=_TK_VAZIO)
 
-SQL_EXISTE_TK = "SELECT to_regclass('public.fact_tiktok_frete_detalhe') IS NOT NULL"
+# Existe E o usuário do app pode ler (R3: se o app sair do neondb_owner sem o
+# GRANT, a aba cai no `tk` vazio em vez de quebrar). O CASE evita chamar
+# has_table_privilege com tabela inexistente, que dá erro.
+SQL_EXISTE_TK = """
+    SELECT CASE WHEN to_regclass('public.fact_tiktok_frete_detalhe') IS NULL THEN FALSE
+                ELSE has_table_privilege('public.fact_tiktok_frete_detalhe', 'SELECT')
+           END
+"""
 
 # Mesmo universo e mesmo filtro de loja da SQL principal: o "dado disponível
 # até" de um gestor é o das lojas dele.
@@ -1722,7 +1729,8 @@ def _render_penalizacao_frete(engine):
         "01/09/2026 (vendas pela API). Shopee-Yanni: sem dado de multa (o upload "
         "não traz). TikTok-Nala: pelo upload do relatório financeiro; peso "
         "cobrado e reembolso do TikTok só nos relatórios enviados a partir de "
-        "29/09/2026 (antes disso, \"—\")."
+        "29/09/2026 (antes disso, \"—\"). Pedido com reembolso ou devolução ao "
+        "cliente é devolução, não penalização: fica fora da soma."
     )
     if ini < date(2026, 9, 1):
         st.warning(
@@ -1821,6 +1829,11 @@ def _render_penalizacao_frete(engine):
 
     if not reembolsos.empty:
         st.markdown("#### Frete em pedido com reembolso ao cliente (TikTok) — fora da soma")
+        st.caption(
+            "Regra (Thiago, 29/09/2026): pedido com reembolso ou devolução ao "
+            "cliente é DEVOLUÇÃO, não penalização de peso/medida. O frete desses "
+            "pedidos fica fora da soma e dos cards e aparece só aqui."
+        )
         st.dataframe(pd.DataFrame({
             'SKU': reembolsos['sku'],
             'Produto': reembolsos['nome'],
