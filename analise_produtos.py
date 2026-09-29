@@ -1497,23 +1497,58 @@ def _historico_despesas_full(engine):
 #     Valor negativo é crédito a favor da Nala e fica FORA da soma.
 # O espelho da API (fact_pedidos_marketplace) entra só com o peso cobrado ×
 # peso do anúncio, informativo: nenhum valor em R$ sai dele.
+#
+# TikTok, etapa 2 (29/09/2026): fact_tiktok_frete_detalhe guarda o peso do
+# anúncio, o peso cobrado e o reembolso ao cliente, gravados pelo upload SÓ
+# DAQUI PARA FRENTE (relatório antigo não é reenviado). Liga ao snapshot só na
+# leitura, por (loja, pedido_original, codigo_anuncio = SKU TikTok). Pedido
+# com reembolso sai da soma e aparece à parte. Enquanto a tabela não existir
+# no banco, a SQL usa um `tk` vazio e a aba funciona como antes.
 
 _LOJA_EXIBICAO = {
     'Shopee Lithouse(Nala)': 'Shopee-Nala',
     'Shopee Litstore(Yanni)': 'Shopee-Yanni',
 }
 
+_TK_TABELA = """
+    tk AS (
+        SELECT loja_origem AS loja, pedido_original, sku_tiktok,
+               MAX(peso_estimado_g)    AS peso_estimado_g,
+               MAX(peso_embalagem_g)   AS peso_embalagem_g,
+               MAX(reembolso_produtos) AS reembolso_produtos
+        FROM fact_tiktok_frete_detalhe
+        GROUP BY loja_origem, pedido_original, sku_tiktok
+    )"""
+
+_TK_VAZIO = """
+    tk AS (
+        SELECT NULL::varchar AS loja, NULL::varchar AS pedido_original,
+               NULL::varchar AS sku_tiktok, NULL::numeric AS peso_estimado_g,
+               NULL::numeric AS peso_embalagem_g, NULL::numeric AS reembolso_produtos
+        WHERE FALSE
+    )"""
+
 # Parâmetros NOMEADOS do psycopg2 — nenhum % fora deles (um % solto já
 # derrubou SQL da Shopee em produção). `lojas` NULL = todas as lojas.
-SQL_PENALIZACAO_FRETE = """
-    WITH base AS (
+# `{tk}` é trocado em Python (str.format) antes de ir ao banco.
+_SQL_PENALIZACAO_MODELO = """
+    WITH {tk},
+    base AS (
         SELECT s.marketplace_origem AS marketplace,
                s.loja_origem        AS loja,
                s.sku,
                s.numero_pedido,
                COALESCE(NULLIF(s.pedido_original, ''), s.numero_pedido) AS pedido,
-               COALESCE(s.frete, 0) AS frete
+               COALESCE(s.frete, 0) AS frete,
+               COALESCE(tk.reembolso_produtos, 0) > 0 AS reembolsado,
+               tk.peso_embalagem_g,
+               tk.peso_estimado_g
         FROM fact_vendas_snapshot s
+        LEFT JOIN tk
+               ON s.marketplace_origem = 'TIKTOK'
+              AND tk.loja = s.loja_origem
+              AND tk.pedido_original = s.pedido_original
+              AND tk.sku_tiktok = s.codigo_anuncio
         WHERE s.data_venda >= %(data_ini)s
           AND s.data_venda <= %(data_fim)s
           AND (s.marketplace_origem = 'TIKTOK'
@@ -1542,15 +1577,26 @@ SQL_PENALIZACAO_FRETE = """
            b.sku,
            MAX(dp.nome) AS nome,
            COUNT(DISTINCT b.pedido) AS pedidos_total,
-           COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete > 0) AS pedidos_penalizados,
+           COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete > 0 AND NOT b.reembolsado)
+               AS pedidos_penalizados,
            -- Para o card contar PEDIDOS distintos: carrinho com 2 SKUs
            -- multados é 1 pedido, não 2.
-           ARRAY_AGG(DISTINCT b.pedido) FILTER (WHERE b.frete > 0) AS lista_pedidos_penalizados,
-           COALESCE(SUM(b.frete) FILTER (WHERE b.frete > 0), 0) AS frete_rs,
+           ARRAY_AGG(DISTINCT b.pedido) FILTER (WHERE b.frete > 0 AND NOT b.reembolsado)
+               AS lista_pedidos_penalizados,
+           COALESCE(SUM(b.frete) FILTER (WHERE b.frete > 0 AND NOT b.reembolsado), 0)
+               AS frete_rs,
+           -- Frete em pedido com reembolso ao cliente (TikTok): fora da soma.
+           COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete > 0 AND b.reembolsado)
+               AS pedidos_reembolso,
+           COALESCE(SUM(b.frete) FILTER (WHERE b.frete > 0 AND b.reembolsado), 0)
+               AS frete_reembolso_rs,
            COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete < 0) AS pedidos_credito,
            COALESCE(-SUM(b.frete) FILTER (WHERE b.frete < 0), 0) AS credito_rs,
-           AVG(pe.peso_cobrado_g / 1000.0) FILTER (WHERE b.frete > 0) AS peso_cobrado_kg,
-           AVG(pe.peso_cadastrado_kg) FILTER (WHERE b.frete > 0) AS peso_anuncio_kg
+           -- Shopee: espelho da API. TikTok: detalhe do upload (tk).
+           AVG(COALESCE(pe.peso_cobrado_g, b.peso_embalagem_g) / 1000.0)
+               FILTER (WHERE b.frete > 0 AND NOT b.reembolsado) AS peso_cobrado_kg,
+           AVG(COALESCE(pe.peso_cadastrado_kg, b.peso_estimado_g / 1000.0))
+               FILTER (WHERE b.frete > 0 AND NOT b.reembolsado) AS peso_anuncio_kg
     FROM base b
     LEFT JOIN nomes dp ON dp.sku = b.sku
     LEFT JOIN pesos pe
@@ -1561,6 +1607,11 @@ SQL_PENALIZACAO_FRETE = """
     HAVING COUNT(*) FILTER (WHERE b.frete <> 0) > 0
     ORDER BY frete_rs DESC, b.loja, b.sku
 """
+
+SQL_PENALIZACAO_FRETE = _SQL_PENALIZACAO_MODELO.format(tk=_TK_TABELA)
+SQL_PENALIZACAO_FRETE_SEM_TK = _SQL_PENALIZACAO_MODELO.format(tk=_TK_VAZIO)
+
+SQL_EXISTE_TK = "SELECT to_regclass('public.fact_tiktok_frete_detalhe') IS NOT NULL"
 
 # Mesmo universo e mesmo filtro de loja da SQL principal: o "dado disponível
 # até" de um gestor é o das lojas dele.
@@ -1596,17 +1647,26 @@ def contar_pedidos_penalizados(alarme):
     return len(pedidos)
 
 
+def sql_penalizacao_frete(tem_detalhe_tiktok):
+    """SQL da aba: com o detalhe do TikTok se a tabela existe, senão sem."""
+    return SQL_PENALIZACAO_FRETE if tem_detalhe_tiktok else SQL_PENALIZACAO_FRETE_SEM_TK
+
+
 def separar_alarme_creditos(df):
     """
-    Divide o resultado em (alarme, créditos).
+    Divide o resultado em (alarme, créditos, reembolsos).
 
     Alarme: SKUs com pedido penalizado, com R$ médio por pedido e % dos
-    pedidos do SKU. Créditos: frete negativo (a favor da Nala), fora da soma.
+    pedidos do SKU. Créditos: frete negativo (a favor da Nala). Reembolsos:
+    frete de pedido TikTok com reembolso ao cliente. Os dois últimos ficam
+    fora da soma.
     """
     df = _coerce_num(df.copy(), [
         'pedidos_total', 'pedidos_penalizados', 'frete_rs',
         'pedidos_credito', 'credito_rs', 'peso_cobrado_kg', 'peso_anuncio_kg',
+        'pedidos_reembolso', 'frete_reembolso_rs',
     ])
+    reembolsos = df[df['pedidos_reembolso'] > 0].copy()
     alarme = df[df['pedidos_penalizados'] > 0].copy()
     alarme['media_rs'] = (alarme['frete_rs'] / alarme['pedidos_penalizados']).round(2)
     alarme['pct_penalizados'] = (
@@ -1614,7 +1674,8 @@ def separar_alarme_creditos(df):
     alarme = alarme.sort_values(['frete_rs', 'loja', 'sku'],
                                 ascending=[False, True, True])
     creditos = df[df['pedidos_credito'] > 0].copy()
-    return alarme.reset_index(drop=True), creditos.reset_index(drop=True)
+    return (alarme.reset_index(drop=True), creditos.reset_index(drop=True),
+            reembolsos.reset_index(drop=True))
 
 
 def _tab_penalizacao_frete(engine):
@@ -1659,8 +1720,9 @@ def _render_penalizacao_frete(engine):
     st.info(
         "**Cobertura do dado:** Shopee-Nala e Shopee-LPT só a partir de "
         "01/09/2026 (vendas pela API). Shopee-Yanni: sem dado de multa (o upload "
-        "não traz). TikTok-Nala: pelo upload do relatório financeiro; o peso "
-        "cobrado do TikTok entra na etapa 2."
+        "não traz). TikTok-Nala: pelo upload do relatório financeiro; peso "
+        "cobrado e reembolso do TikTok só nos relatórios enviados a partir de "
+        "29/09/2026 (antes disso, \"—\")."
     )
     if ini < date(2026, 9, 1):
         st.warning(
@@ -1668,24 +1730,27 @@ def _render_penalizacao_frete(engine):
             "dado de multa, só o TikTok aparece."
         )
 
-    df = _query_to_df(engine, SQL_PENALIZACAO_FRETE,
+    tem_detalhe_tiktok = bool(_query_to_df(engine, SQL_EXISTE_TK).iloc[0, 0])
+    df = _query_to_df(engine, sql_penalizacao_frete(tem_detalhe_tiktok),
                       params_penalizacao_frete(ini, fim, lojas))
     if df.empty:
         st.success("Nenhum frete cobrado na Shopee ou no TikTok no período.")
         return
 
-    alarme, creditos = separar_alarme_creditos(df)
-    for d in (alarme, creditos):
+    alarme, creditos, reembolsos = separar_alarme_creditos(df)
+    for d in (alarme, creditos, reembolsos):
         d['loja'] = d['loja'].map(lambda l: _LOJA_EXIBICAO.get(l, l))
         d['nome'] = d['nome'].fillna('(sem nome no cadastro)')
 
-    lojas_opt = sorted(set(alarme['loja']) | set(creditos['loja']))
+    lojas_opt = sorted(set(alarme['loja']) | set(creditos['loja'])
+                       | set(reembolsos['loja']))
     lojas_sel = st.multiselect("🏪 Lojas", lojas_opt, default=[],
                                placeholder="Todas as lojas",
                                key="pen_frete_lojas")
     if lojas_sel:
         alarme = alarme[alarme['loja'].isin(lojas_sel)]
         creditos = creditos[creditos['loja'].isin(lojas_sel)]
+        reembolsos = reembolsos[reembolsos['loja'].isin(lojas_sel)]
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Frete cobrado no período (R$)", _fmt_brl(alarme['frete_rs'].sum()))
@@ -1714,18 +1779,20 @@ def _render_penalizacao_frete(engine):
             column_config={
                 'SKU': _col.TextColumn(width="medium", help="SKU da Nala"),
                 'Produto': _col.TextColumn(width="large", help="Nome do produto no cadastro"),
-                'Loja': _col.TextColumn(width="small", help="Loja com a sigla do marketplace"),
+                'Loja': _col.TextColumn(width="medium", help="Loja com a sigla do marketplace"),
                 'Frete R$': _col.TextColumn(
                     width="small", help="Frete cobrado no período (R$), soma dos pedidos penalizados"),
                 'Média R$': _col.TextColumn(
                     width="small", help="Média de frete por pedido penalizado (R$)"),
                 'Peso cobrado': _col.TextColumn(
                     width="small",
-                    help="Peso cobrado médio (kg) nos pedidos penalizados — só Shopee, "
-                         "do pedido inteiro; TikTok entra na etapa 2"),
+                    help="Peso cobrado médio (kg) nos pedidos penalizados. Shopee: "
+                         "do pedido inteiro (API). TikTok: peso da embalagem cobrável, "
+                         "só relatórios enviados a partir de 29/09/2026"),
                 'Peso anúncio': _col.TextColumn(
                     width="small",
-                    help="Peso cadastrado no anúncio (kg), média nos pedidos penalizados — só Shopee"),
+                    help="Peso do anúncio (kg), média nos pedidos penalizados. TikTok: "
+                         "peso estimado do pacote, só relatórios a partir de 29/09/2026"),
                 'Pedidos pen.': _col.NumberColumn(
                     width="small", help="Pedidos penalizados (nº): pedidos do SKU com frete cobrado"),
                 'Pedidos SKU': _col.NumberColumn(
@@ -1734,8 +1801,8 @@ def _render_penalizacao_frete(engine):
                     width="small", help="% dos pedidos do SKU que foram penalizados"),
             })
         st.caption(
-            "Peso cobrado × peso do anúncio: informativo (espelho da API da "
-            "Shopee), peso do pedido inteiro, média simples das linhas de venda "
+            "Peso cobrado × peso do anúncio: informativo (Shopee: espelho da API, "
+            "peso do pedido inteiro; TikTok: relatório financeiro), média simples das linhas de venda "
             "penalizadas do SKU. Na Shopee, pedido com vários SKUs tem a multa "
             "dividida pelo valor de cada linha — por isso a soma da coluna "
             "\"Pedidos pen.\" pode passar do card, que conta cada pedido uma vez. "
@@ -1750,6 +1817,16 @@ def _render_penalizacao_frete(engine):
             'Loja': creditos['loja'],
             'Pedidos com crédito (nº)': creditos['pedidos_credito'].astype(int),
             'Crédito (R$)': creditos['credito_rs'].map(_fmt_brl),
+        }), use_container_width=True, hide_index=True)
+
+    if not reembolsos.empty:
+        st.markdown("#### Frete em pedido com reembolso ao cliente (TikTok) — fora da soma")
+        st.dataframe(pd.DataFrame({
+            'SKU': reembolsos['sku'],
+            'Produto': reembolsos['nome'],
+            'Loja': reembolsos['loja'],
+            'Pedidos reembolsados (nº)': reembolsos['pedidos_reembolso'].astype(int),
+            'Frete (R$)': reembolsos['frete_reembolso_rs'].map(_fmt_brl),
         }), use_container_width=True, hide_index=True)
 
 
