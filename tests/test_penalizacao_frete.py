@@ -41,6 +41,31 @@ class SemBanco(unittest.TestCase):
         usados = set(re.findall(r'%\((\w+)\)s', ap.SQL_PENALIZACAO_FRETE))
         p = ap.params_penalizacao_frete(date(2026, 9, 1), date(2026, 9, 30))
         self.assertEqual(usados, set(p))
+        usados = set(re.findall(r'%\((\w+)\)s', ap.SQL_PENALIZACAO_DADO_ATE))
+        self.assertEqual(usados, set(ap.params_penalizacao_dado_ate()))
+
+    def test_card_conta_pedido_distinto_por_loja(self):
+        # SP1 multou dois SKUs: é 1 pedido. O mesmo número em outra loja é outro.
+        alarme = pd.DataFrame({
+            'loja': ['Shopee-LPT', 'Shopee-LPT', 'Shopee-Nala'],
+            'lista_pedidos_penalizados': [['SP1', 'SP2'], ['SP1'], ['SP1']],
+        })
+        self.assertEqual(ap.contar_pedidos_penalizados(alarme), 3)
+        self.assertEqual(ap.contar_pedidos_penalizados(alarme.iloc[:0]), 0)
+        self.assertEqual(ap.contar_pedidos_penalizados(
+            pd.DataFrame({'loja': ['X'], 'lista_pedidos_penalizados': [None]})), 0)
+
+    def test_gestor_sem_loja_ve_aviso_e_nao_consulta(self):
+        from unittest import mock
+        with mock.patch.object(ap, 've_todas_lojas', return_value=False), \
+             mock.patch.object(ap, 'get_lojas_usuario', return_value=[]), \
+             mock.patch.object(ap, '_query_to_df') as consulta, \
+             mock.patch.object(ap.st, 'caption') as caption, \
+             mock.patch.object(ap.st, 'success') as success:
+            ap._render_penalizacao_frete(engine=None)
+        consulta.assert_not_called()
+        success.assert_not_called()
+        caption.assert_any_call("Nenhuma loja atribuída ao seu perfil.")
 
     def test_lojas_none_e_todas_lista_vazia_e_nenhuma(self):
         self.assertIsNone(ap.params_penalizacao_frete(1, 2)['lojas'])
@@ -203,14 +228,34 @@ class ComBanco(unittest.TestCase):
         self.assertEqual({k[0] for k in self._rodar(lojas=[TT])}, {TT})
         self.assertEqual(self._rodar(lojas=[]), {})
 
+    def test_filtro_com_varias_lojas(self):
+        r = self._rodar(lojas=[LPT, TT])
+        self.assertEqual({k[0] for k in r}, {LPT, TT})
+        self.assertEqual(float(r[(LPT, 'K3-LKE-3104-4030')]['frete_rs']), 4.00)
+        self.assertEqual(float(r[(TT, 'K-L-0351')]['frete_rs']), 8.30)
+        # Loja pedida que não está no dado não quebra nem inventa linha.
+        self.assertEqual({k[0] for k in self._rodar(lojas=[NALA, 'Loja-Inexistente'])}, {NALA})
+
+    def test_carrinho_com_dois_skus_multados_e_um_pedido_na_lista(self):
+        r = self._rodar(lojas=[LPT])
+        alarme = pd.DataFrame([{'loja': k[0], 'lista_pedidos_penalizados': v['lista_pedidos_penalizados']}
+                               for k, v in r.items()])
+        # SP1 multou K3-LKE-3104-4030 e L-0320: soma por SKU daria 2.
+        self.assertEqual(sum(v['pedidos_penalizados'] for v in r.values()), 2)
+        self.assertEqual(ap.contar_pedidos_penalizados(alarme), 1)
+
     def test_duplicata_no_nome_e_no_peso_nao_dobra_a_soma(self):
         total = sum(float(v['frete_rs']) for v in self._rodar().values())
         # 4,00 + 1,76 + 2,00 (Shopee API) + 8,30 (K-L-0351) + 11,40 (L-0303)
         self.assertAlmostEqual(total, 27.46)
 
-    def test_dado_ate_executa(self):
-        self.cur.execute(ap.SQL_PENALIZACAO_DADO_ATE)
-        self.assertEqual(self.cur.fetchone()[0], date(2026, 10, 1))
+    def test_dado_ate_respeita_o_filtro_de_loja(self):
+        def dado_ate(lojas):
+            self.cur.execute(ap.SQL_PENALIZACAO_DADO_ATE, ap.params_penalizacao_dado_ate(lojas))
+            return self.cur.fetchone()[0]
+        self.assertEqual(dado_ate(None), date(2026, 10, 1))
+        self.assertEqual(dado_ate([LPT, NALA]), D)
+        self.assertIsNone(dado_ate([YANNI]))   # upload da Shopee não conta
 
 
 if __name__ == '__main__':

@@ -1543,6 +1543,9 @@ SQL_PENALIZACAO_FRETE = """
            MAX(dp.nome) AS nome,
            COUNT(DISTINCT b.pedido) AS pedidos_total,
            COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete > 0) AS pedidos_penalizados,
+           -- Para o card contar PEDIDOS distintos: carrinho com 2 SKUs
+           -- multados é 1 pedido, não 2.
+           ARRAY_AGG(DISTINCT b.pedido) FILTER (WHERE b.frete > 0) AS lista_pedidos_penalizados,
            COALESCE(SUM(b.frete) FILTER (WHERE b.frete > 0), 0) AS frete_rs,
            COUNT(DISTINCT b.pedido) FILTER (WHERE b.frete < 0) AS pedidos_credito,
            COALESCE(-SUM(b.frete) FILTER (WHERE b.frete < 0), 0) AS credito_rs,
@@ -1559,11 +1562,14 @@ SQL_PENALIZACAO_FRETE = """
     ORDER BY frete_rs DESC, b.loja, b.sku
 """
 
+# Mesmo universo e mesmo filtro de loja da SQL principal: o "dado disponível
+# até" de um gestor é o das lojas dele.
 SQL_PENALIZACAO_DADO_ATE = """
     SELECT MAX(data_venda)
     FROM fact_vendas_snapshot
-    WHERE marketplace_origem = 'TIKTOK'
-       OR (marketplace_origem = 'SHOPEE' AND arquivo_origem = 'API')
+    WHERE (marketplace_origem = 'TIKTOK'
+           OR (marketplace_origem = 'SHOPEE' AND arquivo_origem = 'API'))
+      AND (%(lojas)s::text[] IS NULL OR loja_origem = ANY(%(lojas)s::text[]))
 """
 
 
@@ -1574,6 +1580,20 @@ def params_penalizacao_frete(data_ini, data_fim, lojas=None):
         'data_fim': data_fim,
         'lojas': None if lojas is None else list(lojas),
     }
+
+
+def params_penalizacao_dado_ate(lojas=None):
+    """Parâmetros da SQL_PENALIZACAO_DADO_ATE."""
+    return {'lojas': None if lojas is None else list(lojas)}
+
+
+def contar_pedidos_penalizados(alarme):
+    """Pedidos penalizados DISTINTOS (por loja) nas linhas do alarme."""
+    pedidos = set()
+    for loja, lista in zip(alarme['loja'], alarme['lista_pedidos_penalizados']):
+        for p in (lista or []):
+            pedidos.add((loja, p))
+    return len(pedidos)
 
 
 def separar_alarme_creditos(df):
@@ -1623,7 +1643,14 @@ def _render_penalizacao_frete(engine):
         "marketplace — é lá que se corrige."
     )
 
-    dado_ate = _query_to_df(engine, SQL_PENALIZACAO_DADO_ATE).iloc[0, 0]
+    # RBAC: gestor de loja só vê as lojas dele (mesmo padrão do status do Full)
+    lojas = None if ve_todas_lojas() else list(get_lojas_usuario(engine) or [])
+    if lojas is not None and not lojas:
+        st.caption("Nenhuma loja atribuída ao seu perfil.")
+        return
+
+    dado_ate = _query_to_df(engine, SQL_PENALIZACAO_DADO_ATE,
+                            params_penalizacao_dado_ate(lojas)).iloc[0, 0]
     ini, fim = filtro_periodo("pen_frete", dado_ate=dado_ate,
                               padrao="Últimos 30 dias")
     if ini is None:
@@ -1641,7 +1668,6 @@ def _render_penalizacao_frete(engine):
             "dado de multa, só o TikTok aparece."
         )
 
-    lojas = None if ve_todas_lojas() else list(get_lojas_usuario(engine) or [])
     df = _query_to_df(engine, SQL_PENALIZACAO_FRETE,
                       params_penalizacao_frete(ini, fim, lojas))
     if df.empty:
@@ -1662,7 +1688,7 @@ def _render_penalizacao_frete(engine):
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Frete cobrado no período (R$)", _fmt_brl(alarme['frete_rs'].sum()))
-    c2.metric("Pedidos penalizados (nº)", _fmt_int(alarme['pedidos_penalizados'].sum()))
+    c2.metric("Pedidos penalizados (nº)", _fmt_int(contar_pedidos_penalizados(alarme)))
     c3.metric("SKUs a corrigir (nº)", _fmt_int(len(alarme)))
 
     if alarme.empty:
@@ -1682,9 +1708,11 @@ def _render_penalizacao_frete(engine):
         })
         st.dataframe(tabela, use_container_width=True, hide_index=True)
         st.caption(
-            "Peso cobrado × peso do anúncio: médias dos pedidos penalizados, "
-            "informativo (espelho da API da Shopee), do pedido inteiro. Na Shopee, "
-            "pedido com vários SKUs tem a multa dividida pelo valor de cada linha."
+            "Peso cobrado × peso do anúncio: informativo (espelho da API da "
+            "Shopee), peso do pedido inteiro, média simples das linhas de venda "
+            "penalizadas do SKU. Na Shopee, pedido com vários SKUs tem a multa "
+            "dividida pelo valor de cada linha — por isso a soma da coluna "
+            "\"Pedidos penalizados\" pode passar do card, que conta cada pedido uma vez."
         )
 
     if not creditos.empty:
