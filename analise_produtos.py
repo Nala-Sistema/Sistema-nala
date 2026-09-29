@@ -1681,6 +1681,7 @@ def _render_penalizacao_frete(engine):
 
     lojas_opt = sorted(set(alarme['loja']) | set(creditos['loja']))
     lojas_sel = st.multiselect("🏪 Lojas", lojas_opt, default=[],
+                               placeholder="Todas as lojas",
                                key="pen_frete_lojas")
     if lojas_sel:
         alarme = alarme[alarme['loja'].isin(lojas_sel)]
@@ -1694,25 +1695,51 @@ def _render_penalizacao_frete(engine):
     if alarme.empty:
         st.success("Nenhum SKU penalizado no período.")
     else:
+        # Já vem ordenado por Frete R$ decrescente (separar_alarme_creditos).
         tabela = pd.DataFrame({
             'SKU': alarme['sku'],
             'Produto': alarme['nome'],
             'Loja': alarme['loja'],
-            'Pedidos penalizados (nº)': alarme['pedidos_penalizados'].astype(int),
-            'Pedidos do SKU (nº)': alarme['pedidos_total'].astype(int),
-            '% dos pedidos penalizados': alarme['pct_penalizados'].map(_fmt_pct),
-            'Frete cobrado (R$)': alarme['frete_rs'].map(_fmt_brl),
-            'Média por pedido penalizado (R$)': alarme['media_rs'].map(_fmt_brl),
-            'Peso cobrado médio (kg) — Shopee': alarme['peso_cobrado_kg'].map(_fmt_kg),
-            'Peso do anúncio (kg) — Shopee': alarme['peso_anuncio_kg'].map(_fmt_kg),
+            'Frete R$': alarme['frete_rs'].map(_fmt_brl),
+            'Média R$': alarme['media_rs'].map(_fmt_brl),
+            'Peso cobrado': alarme['peso_cobrado_kg'].map(_fmt_kg),
+            'Peso anúncio': alarme['peso_anuncio_kg'].map(_fmt_kg),
+            'Pedidos pen.': alarme['pedidos_penalizados'].astype(int),
+            'Pedidos SKU': alarme['pedidos_total'].astype(int),
+            '% pen.': alarme['pct_penalizados'].map(_fmt_pct),
         })
-        st.dataframe(tabela, use_container_width=True, hide_index=True)
+        _col = st.column_config
+        st.dataframe(
+            tabela, use_container_width=True, hide_index=True,
+            column_config={
+                'SKU': _col.TextColumn(width="medium", help="SKU da Nala"),
+                'Produto': _col.TextColumn(width="large", help="Nome do produto no cadastro"),
+                'Loja': _col.TextColumn(width="small", help="Loja com a sigla do marketplace"),
+                'Frete R$': _col.TextColumn(
+                    width="small", help="Frete cobrado no período (R$), soma dos pedidos penalizados"),
+                'Média R$': _col.TextColumn(
+                    width="small", help="Média de frete por pedido penalizado (R$)"),
+                'Peso cobrado': _col.TextColumn(
+                    width="small",
+                    help="Peso cobrado médio (kg) nos pedidos penalizados — só Shopee, "
+                         "do pedido inteiro; TikTok entra na etapa 2"),
+                'Peso anúncio': _col.TextColumn(
+                    width="small",
+                    help="Peso cadastrado no anúncio (kg), média nos pedidos penalizados — só Shopee"),
+                'Pedidos pen.': _col.NumberColumn(
+                    width="small", help="Pedidos penalizados (nº): pedidos do SKU com frete cobrado"),
+                'Pedidos SKU': _col.NumberColumn(
+                    width="small", help="Pedidos do SKU no período (nº), com e sem frete"),
+                '% pen.': _col.TextColumn(
+                    width="small", help="% dos pedidos do SKU que foram penalizados"),
+            })
         st.caption(
             "Peso cobrado × peso do anúncio: informativo (espelho da API da "
             "Shopee), peso do pedido inteiro, média simples das linhas de venda "
             "penalizadas do SKU. Na Shopee, pedido com vários SKUs tem a multa "
             "dividida pelo valor de cada linha — por isso a soma da coluna "
-            "\"Pedidos penalizados\" pode passar do card, que conta cada pedido uma vez."
+            "\"Pedidos pen.\" pode passar do card, que conta cada pedido uma vez. "
+            "Passe o mouse no título da coluna para ver o que ela mede."
         )
 
     if not creditos.empty:

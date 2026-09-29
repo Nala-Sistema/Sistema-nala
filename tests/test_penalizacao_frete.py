@@ -55,6 +55,32 @@ class SemBanco(unittest.TestCase):
         self.assertEqual(ap.contar_pedidos_penalizados(
             pd.DataFrame({'loja': ['X'], 'lista_pedidos_penalizados': [None]})), 0)
 
+    def test_aba_desenha_a_tabela_na_ordem_e_com_titulos_curtos(self):
+        from unittest import mock
+        resultado = pd.DataFrame([
+            {'marketplace': 'SHOPEE', 'loja': 'Shopee-LPT', 'sku': 'K2-L-0320', 'nome': 'Kit escovas',
+             'pedidos_total': 281, 'pedidos_penalizados': 30, 'lista_pedidos_penalizados': ['A'],
+             'frete_rs': 43.37, 'pedidos_credito': 0, 'credito_rs': 0,
+             'peso_cobrado_kg': 0.74, 'peso_anuncio_kg': 0.42},
+            {'marketplace': 'TIKTOK', 'loja': 'TikTok-Nala', 'sku': 'K-L-0351', 'nome': None,
+             'pedidos_total': 39, 'pedidos_penalizados': 26, 'lista_pedidos_penalizados': ['B'],
+             'frete_rs': 53.93, 'pedidos_credito': 1, 'credito_rs': 6.0,
+             'peso_cobrado_kg': None, 'peso_anuncio_kg': None},
+        ])
+        dado_ate = pd.DataFrame([[date(2026, 9, 29)]])
+        with mock.patch.object(ap, 've_todas_lojas', return_value=True), \
+             mock.patch.object(ap, 'filtro_periodo',
+                               return_value=(date(2026, 9, 1), date(2026, 9, 29))), \
+             mock.patch.object(ap, '_query_to_df', side_effect=[dado_ate, resultado]), \
+             mock.patch.object(ap.st, 'dataframe', wraps=ap.st.dataframe) as tabela:
+            ap._render_penalizacao_frete(engine=None)
+        df, kwargs = tabela.call_args_list[0][0][0], tabela.call_args_list[0][1]
+        self.assertEqual(list(df.columns), [
+            'SKU', 'Produto', 'Loja', 'Frete R$', 'Média R$', 'Peso cobrado',
+            'Peso anúncio', 'Pedidos pen.', 'Pedidos SKU', '% pen.'])
+        self.assertEqual(list(df['SKU']), ['K-L-0351', 'K2-L-0320'])   # Frete R$ decrescente
+        self.assertEqual(set(kwargs['column_config']), set(df.columns))
+
     def test_gestor_sem_loja_ve_aviso_e_nao_consulta(self):
         from unittest import mock
         with mock.patch.object(ap, 've_todas_lojas', return_value=False), \
