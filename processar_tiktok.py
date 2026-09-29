@@ -359,9 +359,11 @@ def extrair_frete_detalhe(df):
     Linhas 'Pedido' do relatório financeiro → lista de dicts por
     (pedido_original, sku_tiktok), com peso e reembolso. Sem dado de comprador.
 
-    Mesma chave do snapshot (TKTK_{pedido}_{sku}): se o arquivo repetir a
-    chave, vale a última linha, como no ON CONFLICT do snapshot. Coluna que o
-    layout do arquivo não tiver vira None.
+    Mesma chave do snapshot (TKTK_{pedido}_{sku}). Vazio nunca apaga valor:
+    se o arquivo repetir a chave, o valor preenchido mais recente vence e a
+    célula vazia mantém o anterior — a mesma regra do COALESCE na gravação.
+    Coluna que o layout não tiver vira None; linha com os 4 campos None
+    (layout antigo, célula vazia) não é devolvida, para não gravar nada vazio.
     """
     por_chave = {}
     for _, row in df.iterrows():
@@ -371,13 +373,20 @@ def extrair_frete_detalhe(df):
         sku = str(row.get('ID do SKU', '')).strip()
         if not pedido or not sku or 'nan' in (pedido, sku) or '/' in (pedido, sku):
             continue
-        item = {'pedido_original': pedido, 'sku_tiktok': sku}
+        valores = {}
         for campo, coluna in _COLUNAS_FRETE_DETALHE.items():
-            item[campo] = _valor_ou_none(row.get(coluna)) if coluna in df.columns else None
-        if item['reembolso_produtos'] is not None:
-            item['reembolso_produtos'] = abs(item['reembolso_produtos'])
-        por_chave[(pedido, sku)] = item
-    return list(por_chave.values())
+            valores[campo] = _valor_ou_none(row.get(coluna)) if coluna in df.columns else None
+        if valores['reembolso_produtos'] is not None:
+            valores['reembolso_produtos'] = abs(valores['reembolso_produtos'])
+        item = por_chave.setdefault(
+            (pedido, sku),
+            {'pedido_original': pedido, 'sku_tiktok': sku,
+             **{c: None for c in _COLUNAS_FRETE_DETALHE}})
+        for campo, valor in valores.items():
+            if valor is not None:
+                item[campo] = valor
+    return [d for d in por_chave.values()
+            if any(d[c] is not None for c in _COLUNAS_FRETE_DETALHE)]
 
 
 _SQL_GRAVAR_FRETE_DETALHE = """
@@ -387,10 +396,15 @@ _SQL_GRAVAR_FRETE_DETALHE = """
         arquivo_origem, gravado_em
     ) VALUES %s
     ON CONFLICT (loja_origem, pedido_original, sku_tiktok) DO UPDATE SET
-        peso_estimado_g     = EXCLUDED.peso_estimado_g,
-        peso_embalagem_g    = EXCLUDED.peso_embalagem_g,
-        custo_liquido_frete = EXCLUDED.custo_liquido_frete,
-        reembolso_produtos  = EXCLUDED.reembolso_produtos,
+        -- Vazio nunca apaga valor bom (relatório sobreposto, célula vazia).
+        peso_estimado_g     = COALESCE(EXCLUDED.peso_estimado_g,
+                                       fact_tiktok_frete_detalhe.peso_estimado_g),
+        peso_embalagem_g    = COALESCE(EXCLUDED.peso_embalagem_g,
+                                       fact_tiktok_frete_detalhe.peso_embalagem_g),
+        custo_liquido_frete = COALESCE(EXCLUDED.custo_liquido_frete,
+                                       fact_tiktok_frete_detalhe.custo_liquido_frete),
+        reembolso_produtos  = COALESCE(EXCLUDED.reembolso_produtos,
+                                       fact_tiktok_frete_detalhe.reembolso_produtos),
         arquivo_origem      = EXCLUDED.arquivo_origem,
         gravado_em          = NOW()
 """
@@ -404,6 +418,8 @@ def gravar_frete_detalhe_tiktok(engine, loja, arq_nome, detalhes):
     própria, e uma falha aqui (tabela ainda não criada, layout novo...) não
     pode desfazer nem interromper a venda.
     """
+    detalhes = [d for d in (detalhes or [])
+                if any(d.get(c) is not None for c in _COLUNAS_FRETE_DETALHE)]
     if not detalhes:
         return 0, None
     conn = None

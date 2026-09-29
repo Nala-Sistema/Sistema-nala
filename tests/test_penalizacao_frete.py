@@ -154,6 +154,16 @@ _RELATORIO = pd.DataFrame([
      'ID do SKU': '1735166653608920644', 'Peso estimado do pacote cobrável': '300',
      'Peso da embalagem cobrável': '960', 'Custo líquido de frete': '-2.40',
      'Reembolsos de produtos': '0'},
+    # a mesma chave de novo com célula vazia: vazio não apaga o 960
+    {'Tipo de transação': 'Pedido', 'ID do pedido/ajuste': '585844917434419017',
+     'ID do SKU': '1735166653608920644', 'Peso estimado do pacote cobrável': '',
+     'Peso da embalagem cobrável': '', 'Custo líquido de frete': '',
+     'Reembolsos de produtos': ''},
+    # os 4 campos vazios: não vira linha
+    {'Tipo de transação': 'Pedido', 'ID do pedido/ajuste': '585000000000000009',
+     'ID do SKU': '1736000000000000009', 'Peso estimado do pacote cobrável': '',
+     'Peso da embalagem cobrável': '/', 'Custo líquido de frete': '',
+     'Reembolsos de produtos': 'nan'},
     # sem peso no arquivo: None, não zero
     {'Tipo de transação': 'Pedido', 'ID do pedido/ajuste': '585000000000000001',
      'ID do SKU': '1736547971990062660', 'Peso estimado do pacote cobrável': '',
@@ -181,16 +191,26 @@ class DetalheFreteTikTok(unittest.TestCase):
         self.assertEqual(r['custo_liquido_frete'], -7.2)
         self.assertEqual(r['reembolso_produtos'], 7.21)          # em módulo
         k = d[('585844917434419017', '1735166653608920644')]
-        self.assertEqual(k['peso_embalagem_g'], 960.0)           # última linha vence
+        self.assertEqual(k['peso_embalagem_g'], 960.0)           # última preenchida vence
+        self.assertEqual(k['custo_liquido_frete'], -2.40)        # vazio não apagou
+        self.assertNotIn(('585000000000000009', '1736000000000000009'), d)
         v = d[('585000000000000001', '1736547971990062660')]
         self.assertIsNone(v['peso_estimado_g'])
         self.assertIsNone(v['peso_embalagem_g'])
 
-    def test_layout_sem_as_colunas_novas_nao_quebra(self):
+    def test_layout_sem_as_colunas_novas_nao_quebra_nem_grava_vazio(self):
         velho = _RELATORIO[['Tipo de transação', 'ID do pedido/ajuste', 'ID do SKU']]
-        r = pt.extrair_frete_detalhe(velho)
-        self.assertEqual(len(r), 3)
-        self.assertTrue(all(x['peso_embalagem_g'] is None for x in r))
+        self.assertEqual(pt.extrair_frete_detalhe(velho), [])
+
+    def test_item_com_os_quatro_campos_vazios_nao_abre_conexao(self):
+        class EngineProibido:
+            def raw_connection(self):
+                raise AssertionError('não deveria conectar')
+        vazio = {'pedido_original': 'P', 'sku_tiktok': 'S', 'peso_estimado_g': None,
+                 'peso_embalagem_g': None, 'custo_liquido_frete': None,
+                 'reembolso_produtos': None}
+        self.assertEqual(pt.gravar_frete_detalhe_tiktok(EngineProibido(), 'X', 'a', [vazio]),
+                         (0, None))
 
     def test_falha_na_gravacao_nunca_levanta(self):
         class EngineQuebrado:
@@ -418,6 +438,23 @@ class ComBanco(unittest.TestCase):
                             FROM fact_tiktok_frete_detalhe""")
         total, peso, arquivo = self.cur.fetchone()
         self.assertEqual((total, float(peso), arquivo), (3, 1000.0, 'income2.xlsx'))
+
+    def test_regravar_com_valor_vazio_nao_apaga_o_bom(self):
+        # R1 do auditor: relatório sobreposto com célula vazia.
+        parcial = dict(_DETALHE_TT[2], peso_embalagem_g=None, reembolso_produtos=None,
+                       custo_liquido_frete=-3.50)
+        n, erro = pt.gravar_frete_detalhe_tiktok(
+            _EngineDoTeste(self.conn), TT, 'income3.xlsx', [parcial])
+        self.assertEqual((n, erro), (1, None))
+        self.cur.execute("""SELECT peso_embalagem_g, reembolso_produtos, custo_liquido_frete,
+                                   arquivo_origem
+                            FROM fact_tiktok_frete_detalhe
+                            WHERE pedido_original = 'T6' AND sku_tiktok = 'a'""")
+        peso, reemb, custo, arquivo = self.cur.fetchone()
+        self.assertEqual((float(peso), float(reemb), float(custo), arquivo),
+                         (950.0, 3.00, -3.50, 'income3.xlsx'))
+        # e o reembolso continua tirando o T6 da soma
+        self.assertEqual(self._rodar()[(TT, 'K-L-0351')]['pedidos_reembolso'], 1)
 
     def test_credito_negativo_fora_da_soma(self):
         r = self._rodar()[(TT, 'LVI-0005')]
