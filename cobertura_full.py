@@ -95,6 +95,10 @@ COLETADO = 'coletado'
 NAO_COLETADO = 'coleta não aconteceu'
 SEM_SINAL = 'sem sinal de coleta'
 
+# Até quantos dias de venda desconhecida (depois de `venda_ate`) o "giro baixo"
+# ainda vale. Mais que isso, os 30 dias estão incompletos demais para dizer.
+GIRO_TOLERA_VENDA_DESCONHECIDA_DIAS = 7
+
 
 @dataclass(frozen=True)
 class Parametros:
@@ -220,8 +224,20 @@ def avaliar(linha, p, agendado_aberto=0, dias_alvo=None, economia=None):
     if linha.get('serie_divergente'):
         avisos.append('série com movimento que a API não listou: conferir no painel do ML')
 
+    # Venda só é conhecida até a última venda registrada da loja (upload hoje;
+    # API das vendas do ML depois). Dia depois disso não é "dia sem venda".
+    venda_desconhecida_dias = 0
+    venda_ate, data_do_dado = linha.get('venda_ate'), linha.get('data_do_dado')
+    if venda_ate and data_do_dado and venda_ate < data_do_dado:
+        venda_desconhecida_dias = (data_do_dado - venda_ate).days
+        avisos.append(f'venda até {venda_ate:%d/%m}: os {venda_desconhecida_dias} dia(s) '
+                      'seguintes ficam fora da demanda')
+
     venda_30_liquida = _num(linha.get('venda_liquida_30d'))
-    giro_baixo = (venda_30_liquida or 0) < p.piso_giro_baixo_30d
+    # Com mais de uma semana de venda desconhecida, os 30 dias estão incompletos:
+    # "giro baixo" seria falso — o estoque segue avaliado pelo nível.
+    giro_baixo = (venda_desconhecida_dias <= GIRO_TOLERA_VENDA_DESCONHECIDA_DIAS
+                  and (venda_30_liquida or 0) < p.piso_giro_baixo_30d)
     margem_unitaria = (economia or {}).get('margem_unitaria')
     margem_dia = (venda_dia * margem_unitaria
                   if venda_dia is not None and margem_unitaria is not None else None)
@@ -394,8 +410,10 @@ def _classificar(ag, hoje, p):
     if coletado > 0:
         return {'situacao': COLETADO_EM_PARTE,
                 'a_descontar': quantidade - coletado if janela_aberta else 0}
-    if not ag.get('fonte_tem_sinal_coleta'):
-        # sem como saber (ex.: Shopee): desconta enquanto a janela estiver aberta
+    if not ag.get('fonte_tem_sinal_coleta') or ag.get('dias_desconhecidos_na_janela'):
+        # sem como saber (ex.: Shopee, ou dia da janela com movimento
+        # desconhecido — venda ainda não registrada ou sem saldo na véspera):
+        # desconta enquanto a janela estiver aberta, nunca "não aconteceu"
         return {'situacao': SEM_SINAL, 'a_descontar': quantidade if janela_aberta else 0}
     if hoje > ag['data_coleta'] + timedelta(days=p.tolerancia_coleta_dias):
         return {'situacao': NAO_COLETADO, 'a_descontar': 0}
@@ -418,7 +436,7 @@ SQL_COBERTURA = 'SELECT * FROM v_cobertura_full'
 
 SQL_AGENDAMENTOS = """
     SELECT id, marketplace, loja, estoque_id, data_coleta, quantidade, observacao,
-           criado_por, criado_em, fonte_tem_sinal_coleta,
+           criado_por, criado_em, fonte_tem_sinal_coleta, dias_desconhecidos_na_janela,
            coletado_manual_em, coletado_manual_por
     FROM v_estoque_envio_manual
 """
@@ -441,16 +459,31 @@ SQL_VENDAS_30D = """
     GROUP BY 1, 2, 3, 4
 """
 
+# Entrada no Full. No ML vem de v_movimento_full_diario (entrada implícita:
+# saldo − saldo da véspera + venda), porque o endpoint de operações do Full
+# deixou de responder (429 over_quota desde ~19/09/2026). Inclui devolução de
+# comprador e ajuste a favor, não só coleta. Fora do ML, o caminho antigo.
 SQL_ENTRADAS = """
+    SELECT marketplace, loja, estoque_id, data, entrada_implicita AS unidades_entrada_coleta
+    FROM v_movimento_full_diario
+    WHERE data >= %(desde)s AND entrada_implicita > 0
+    UNION ALL
     SELECT marketplace, loja, estoque_id, data, unidades_entrada_coleta
     FROM fact_estoque_diario
-    WHERE data >= %(desde)s AND unidades_entrada_coleta > 0
+    WHERE marketplace <> 'MERCADO LIVRE' AND data >= %(desde)s AND unidades_entrada_coleta > 0
 """
 
+# Só dia com movimento CONHECIDO entra na soma: dia desconhecido não é dia sem
+# coleta (antes, SUM de NULL virava 0 no `or 0` de montar_painel).
 SQL_COLETA_POR_DIA = """
+    SELECT marketplace, data, SUM(entrada_implicita) AS total
+    FROM v_movimento_full_diario
+    WHERE data >= %(desde)s AND movimento_conhecido
+    GROUP BY marketplace, data
+    UNION ALL
     SELECT marketplace, data, SUM(unidades_entrada_coleta) AS total
     FROM fact_estoque_diario
-    WHERE data >= %(desde)s
+    WHERE marketplace <> 'MERCADO LIVRE' AND data >= %(desde)s
     GROUP BY marketplace, data
 """
 
