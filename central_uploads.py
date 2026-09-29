@@ -846,7 +846,8 @@ def tab_processar_upload(engine):
                         df_proc, mktp, loja, arquivo_nome, engine,
                         pendentes_sku=info.get('pendentes_sku', []),
                         pendentes_emespera=info.get('pendentes_emespera', []),
-                        descartes=info.get('descartes', []))
+                        descartes=info.get('descartes', []),
+                        frete_detalhe=info.get('frete_detalhe', []))
                 else:
                     st.error("⚠️ Processador não identificado."); return
 

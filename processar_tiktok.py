@@ -327,6 +327,133 @@ def _processar_df(df, fonte, loja, imposto_pct, tiktok_sku_map, custos_dict):
 
 
 # ============================================================
+# DETALHE DE FRETE (peso cobrado e reembolso) — 29/09/2026
+# ============================================================
+# Na Shopee e no TikTok o frete da Nala é zero: todo frete cobrado é
+# penalização de peso/medida do anúncio (aba "🚚 Penalização de frete" em
+# Análise de Produtos). O relatório financeiro traz o peso do anúncio, o peso
+# cobrado e o reembolso ao cliente; eles vão para fact_tiktok_frete_detalhe
+# (sql/tiktok_frete_detalhe.sql), nunca para o snapshot. Só uploads novos:
+# relatório antigo não é reenviado (decisão do Thiago, 29/09/2026).
+
+_COLUNAS_FRETE_DETALHE = {
+    'peso_estimado_g': 'Peso estimado do pacote cobrável',
+    'peso_embalagem_g': 'Peso da embalagem cobrável',
+    'custo_liquido_frete': 'Custo líquido de frete',
+    'reembolso_produtos': 'Reembolsos de produtos',
+}
+
+
+def _valor_ou_none(valor):
+    """Como _limpar_valor, mas célula vazia é None (peso desconhecido ≠ zero)."""
+    if pd.isna(valor) or str(valor).strip() in ('', '/', 'nan'):
+        return None
+    try:
+        return float(str(valor).replace(',', '.').strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def extrair_frete_detalhe(df):
+    """
+    Linhas 'Pedido' do relatório financeiro → lista de dicts por
+    (pedido_original, sku_tiktok), com peso e reembolso. Sem dado de comprador.
+
+    Mesma chave do snapshot (TKTK_{pedido}_{sku}). Vazio nunca apaga valor:
+    se o arquivo repetir a chave, o valor preenchido mais recente vence e a
+    célula vazia mantém o anterior — a mesma regra do COALESCE na gravação.
+    Coluna que o layout não tiver vira None; linha com os 4 campos None
+    (layout antigo, célula vazia) não é devolvida, para não gravar nada vazio.
+    """
+    por_chave = {}
+    for _, row in df.iterrows():
+        if str(row.get('Tipo de transação', 'Pedido')).strip() != 'Pedido':
+            continue
+        pedido = str(row.get('ID do pedido/ajuste', '')).strip()
+        sku = str(row.get('ID do SKU', '')).strip()
+        if not pedido or not sku or 'nan' in (pedido, sku) or '/' in (pedido, sku):
+            continue
+        valores = {}
+        for campo, coluna in _COLUNAS_FRETE_DETALHE.items():
+            valores[campo] = _valor_ou_none(row.get(coluna)) if coluna in df.columns else None
+        if valores['reembolso_produtos'] is not None:
+            valores['reembolso_produtos'] = abs(valores['reembolso_produtos'])
+        item = por_chave.setdefault(
+            (pedido, sku),
+            {'pedido_original': pedido, 'sku_tiktok': sku,
+             **{c: None for c in _COLUNAS_FRETE_DETALHE}})
+        for campo, valor in valores.items():
+            if valor is not None:
+                item[campo] = valor
+    return [d for d in por_chave.values()
+            if any(d[c] is not None for c in _COLUNAS_FRETE_DETALHE)]
+
+
+_SQL_GRAVAR_FRETE_DETALHE = """
+    INSERT INTO fact_tiktok_frete_detalhe (
+        loja_origem, pedido_original, sku_tiktok,
+        peso_estimado_g, peso_embalagem_g, custo_liquido_frete, reembolso_produtos,
+        arquivo_origem, gravado_em
+    ) VALUES %s
+    ON CONFLICT (loja_origem, pedido_original, sku_tiktok) DO UPDATE SET
+        -- Vazio nunca apaga valor bom (relatório sobreposto, célula vazia).
+        peso_estimado_g     = COALESCE(EXCLUDED.peso_estimado_g,
+                                       fact_tiktok_frete_detalhe.peso_estimado_g),
+        peso_embalagem_g    = COALESCE(EXCLUDED.peso_embalagem_g,
+                                       fact_tiktok_frete_detalhe.peso_embalagem_g),
+        custo_liquido_frete = COALESCE(EXCLUDED.custo_liquido_frete,
+                                       fact_tiktok_frete_detalhe.custo_liquido_frete),
+        reembolso_produtos  = COALESCE(EXCLUDED.reembolso_produtos,
+                                       fact_tiktok_frete_detalhe.reembolso_produtos),
+        arquivo_origem      = EXCLUDED.arquivo_origem,
+        gravado_em          = NOW()
+"""
+
+
+def gravar_frete_detalhe_tiktok(engine, loja, arq_nome, detalhes):
+    """
+    Grava o detalhe de frete. Devolve (linhas, erro): erro None = gravou.
+
+    NUNCA levanta exceção: roda depois do commit da venda, numa conexão
+    própria, e uma falha aqui (tabela ainda não criada, layout novo...) não
+    pode desfazer nem interromper a venda.
+    """
+    detalhes = [d for d in (detalhes or [])
+                if any(d.get(c) is not None for c in _COLUNAS_FRETE_DETALHE)]
+    if not detalhes:
+        return 0, None
+    conn = None
+    try:
+        from psycopg2.extras import execute_values
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        linhas = [(loja, d['pedido_original'], d['sku_tiktok'],
+                   d['peso_estimado_g'], d['peso_embalagem_g'],
+                   d['custo_liquido_frete'], d['reembolso_produtos'],
+                   arq_nome)
+                  for d in detalhes]
+        execute_values(cursor, _SQL_GRAVAR_FRETE_DETALHE, linhas,
+                       template='(%s, %s, %s, %s, %s, %s, %s, %s, NOW())',
+                       page_size=500)
+        conn.commit()
+        cursor.close()
+        return len(linhas), None
+    except Exception as e:
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        return 0, f"{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
 # FUNÇÃO PRINCIPAL DE PROCESSAMENTO
 # ============================================================
 
@@ -362,6 +489,13 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
     vendas_fin, pend_fin, datas_fin, sem_custo_fin, nao_map_fin, desc_fin, nomes_fin, descartes_fin = _processar_df(
         df_fin, 'financeiro', loja, imposto_pct, tiktok_sku_map, custos_dict
     )
+
+    # Peso cobrado e reembolso (só do financeiro). Falha aqui não pode
+    # impedir o processamento da venda.
+    try:
+        frete_detalhe = extrair_frete_detalhe(df_fin)
+    except Exception:
+        frete_detalhe = []
 
     # ── Relatório Em Espera (opcional) ───────────────────────────────────────
     # vendas_esp = em_espera com SKU mapeado → vão para snapshot junto com financeiro
@@ -415,6 +549,7 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
         'pendentes_emespera': pend_esp,  # em_espera sem SKU mapeado (staging)
         'descartes': descartes_fin + descartes_esp,
         'divergencias': [],
+        'frete_detalhe': frete_detalhe,  # → fact_tiktok_frete_detalhe
     }
 
     return df_vendas, info
@@ -425,7 +560,8 @@ def processar_arquivo_tiktok(arq_financeiro, arq_emespera, loja, imposto_pct, en
 # ============================================================
 
 def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None, data_fim=None,
-                          pendentes_sku=None, pendentes_emespera=None, descartes=None):
+                          pendentes_sku=None, pendentes_emespera=None, descartes=None,
+                          frete_detalhe=None):
     """
     Grava vendas TikTok no banco seguindo o padrão dos demais processadores.
 
@@ -460,6 +596,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
     conn = engine.raw_connection()
     cursor = conn.cursor()
 
+    venda_commitada = False
     reg = 0
     err = 0
     skus_invalidos = set()
@@ -684,6 +821,7 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
                 err += 1
 
         conn.commit()
+        venda_commitada = True
 
     except Exception as e:
         conn.rollback()
@@ -695,6 +833,15 @@ def gravar_vendas_tiktok(df, marketplace, loja, arq_nome, engine, data_ini=None,
         conn.close()
         progress_bar.empty()
         status_text.empty()
+
+    # 7. Detalhe de frete — DEPOIS do commit da venda, conexão própria. Se
+    # falhar, a venda já está gravada: só avisa. Venda desfeita = nada aqui.
+    if frete_detalhe and venda_commitada:
+        _, erro_det = gravar_frete_detalhe_tiktok(engine, loja, arq_nome, frete_detalhe)
+        if erro_det:
+            st.warning(
+                "Vendas gravadas normalmente. O peso cobrado/reembolso do TikTok "
+                f"(aba Penalização de frete) não foi gravado: {erro_det}")
 
     return reg, err, skus_invalidos, dups, pend, desc_count, atualiz
 
