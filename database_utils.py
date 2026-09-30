@@ -571,8 +571,12 @@ def _e_pendente_api(valor_arquivo_origem):
 def _marcar_aguardando_coleta(cursor, ids):
     if not ids:
         return
+    # data_processamento vira a HORA DA CORRECAO: e' dela que a tela conta os
+    # dias de espera (R4 do auditor). Na pendente da API ela so' guardava a
+    # criacao da linha, o que fazia uma venda antiga recem-corrigida parecer
+    # atrasada.
     cursor.execute(
-        f"UPDATE fact_vendas_pendentes SET status = %s "
+        f"UPDATE fact_vendas_pendentes SET status = %s, data_processamento = NOW() "
         f"WHERE id IN ({','.join(['%s'] * len(ids))})",
         [STATUS_AGUARDANDO] + [int(i) for i in ids])
 

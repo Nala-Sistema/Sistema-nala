@@ -120,6 +120,15 @@ class SemBanco(unittest.TestCase):
                   if s.startswith('UPDATE fact_vendas_pendentes SET status = %s')]
         self.assertEqual(marcas, [['Aguardando coleta', 1]])
 
+    def test_aguardando_grava_a_hora_da_correcao_para_contar_a_espera(self):
+        """R4 do auditor: os dias de espera contam da correcao, nao da criacao
+        da pendente."""
+        _, cur = _manual([item(1, 'L-0320', 'SEM-SKU:MLB777', 'API')])
+        marca = [s for s in cur.sqls()
+                 if s.startswith('UPDATE fact_vendas_pendentes SET status = %s')]
+        self.assertEqual(len(marca), 1)
+        self.assertIn('data_processamento = NOW()', marca[0])
+
     def test_pendente_de_api_com_sku_ja_cadastrado_nao_precisa_de_mapeamento(self):
         res, cur = _manual([item(1, 'L-0320', 'L-0320', 'API')])
         self.assertFalse(any(s.startswith('INSERT INTO dim_sku_mapeamento')

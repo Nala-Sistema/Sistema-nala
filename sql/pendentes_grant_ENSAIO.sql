@@ -16,6 +16,12 @@
 --             "production", banco "neondb", SQL EDITOR, credencial do DONO
 --             (neondb_owner), antes de pendentes_grant.sql.
 --
+-- COMO LER O RESULTADO: o SQL Editor vai mostrar um ERRO. So' vale a mensagem
+-- que COMECA com "ENSAIO CONCLUIDO". QUALQUER outro erro (permission denied to
+-- set role, role already exists, relation does not exist, ...) significa que o
+-- ensaio NAO rodou: NAO interpretar como NEGADO, NAO rodar o GRANT, e voltar
+-- ao Mestre com o texto do erro.
+--
 -- RESULTADO ESPERADO (a mensagem deve conter exatamente isto):
 --   A_so_insert=NEGADO | B_insert_mais_select_3_colunas=OK | C_le_valor_venda=NEGADO
 -- Se A vier OK, o ON CONFLICT NAO exige SELECT: tirar a linha GRANT SELECT
@@ -40,6 +46,10 @@ DECLARE
         ON CONFLICT (numero_pedido, sku, loja_origem) DO NOTHING$q$;
 BEGIN
     CREATE ROLE ensaio_pend_usr NOLOGIN;
+    -- R1 do auditor: no Postgres 17 o neondb_owner nao e' superusuario e o
+    -- CREATE ROLE nao lhe da' o direito de SET ROLE no papel novo. Sem esta
+    -- linha o SET LOCAL ROLE abaixo falha com "permission denied to set role".
+    GRANT ensaio_pend_usr TO CURRENT_USER WITH SET TRUE;
     CREATE TABLE ensaio_pend_t
         (LIKE public.fact_vendas_pendentes INCLUDING INDEXES EXCLUDING DEFAULTS);
     IF NOT EXISTS (
