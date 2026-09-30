@@ -27,6 +27,7 @@ import io
 
 # v2.0: Usa get_engine de database_utils (respeita ambiente Produção/Dev)
 from database_utils import get_engine
+from kits_composicao import render_aba_kits
 
 
 def formatar_valor_br(valor):
@@ -441,7 +442,8 @@ def main():
     user_role = st.session_state.get('perfil', 'Admin')
     is_admin = user_role in ['Admin', 'Controladoria', 'ADMIN', 'CONTROLADORIA']
 
-    t1, t2, t3 = st.tabs(["📋 Lista e Busca", "⚙️ Gerenciar SKU", "📥 Importação"])
+    t1, t2, t3, t4 = st.tabs(["📋 Lista e Busca", "⚙️ Gerenciar SKU", "📥 Importação",
+                              "🧩 Kits"])
 
     # ============================================================
     # TAB 1: LISTA E BUSCA + DOWNLOAD
@@ -977,6 +979,12 @@ def main():
 
                     except Exception as e:
                         st.error(f"❌ Erro ao processar arquivo: {e}")
+
+    # ============================================================
+    # TAB 4: KITS — composição (frente [KITS], 30/09/2026)
+    # ============================================================
+    with t4:
+        render_aba_kits(engine, is_admin)
 
 
 if __name__ == "__main__":
