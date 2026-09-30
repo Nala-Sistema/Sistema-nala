@@ -165,7 +165,8 @@ def planejar(kits, cadastro, atual, pendentes_atuais, recusados_arquivo=None):
     refaz o plano e compara com o da prévia).
     """
     recusados = {k: list(v) for k, v in (recusados_arquivo or {}).items()}
-    kits_conhecidos = set(kits) | set(atual)
+    # Kit à espera de cadastro também é kit: não pode entrar como peça.
+    kits_conhecidos = set(kits) | set(atual) | set(pendentes_atuais)
     # peça -> kits EM VIGOR que a contêm (fora os que o arquivo substitui)
     pai_em_vigor = {}
     for k, comp in atual.items():
@@ -557,10 +558,30 @@ def render_aba_kits(engine, is_admin):
     import streamlit as st
 
     st.subheader("🧩 Kits — composição (fonte: export do UpSeller)")
+    # "Administrador" aqui = Admin ou Controladoria, igual às outras abas de
+    # Gestão de SKUs (is_admin vem de gestao_skus.main).
     if not is_admin:
         st.warning("⚠️ Acesso restrito a administradores.")
         return
     usuario = (st.session_state.get('usuario') or {}).get('username')
+
+    # Cada seção isolada: erro de banco numa delas vira aviso, não traceback,
+    # e não esconde as outras.
+    for nome, secao, args in (
+            ("a carga do export", _render_carga, (engine, usuario)),
+            ("as pendências de kit", _render_pendencias, (engine, usuario)),
+            ("a composição em vigor", _render_composicao, (engine,))):
+        try:
+            secao(*args)
+        except Exception as e:
+            st.error(f"❌ Não consegui carregar {nome}. Nada foi gravado. "
+                     f"Tente de novo; se continuar, avise com esta mensagem:\n\n"
+                     f"{type(e).__name__}: {str(e)[:300]}")
+        st.markdown("---")
+
+
+def _render_carga(engine, usuario):
+    import streamlit as st
 
     st.caption("Suba o export de kits do UpSeller (Export_Kit_*.xlsx). A carga é "
                "incremental: kit novo entra, composição alterada é atualizada, e kit "
@@ -615,8 +636,3 @@ def render_aba_kits(engine, is_admin):
                             f"✅ Gravado: {r['novos']} kit(s) novo(s), {r['alterados']} "
                             f"alterado(s), {r['pendentes']} em pendência, "
                             f"{r['pendencias_resolvidas']} pendência(s) resolvida(s).")
-
-    st.markdown("---")
-    _render_pendencias(engine, usuario)
-    st.markdown("---")
-    _render_composicao(engine)

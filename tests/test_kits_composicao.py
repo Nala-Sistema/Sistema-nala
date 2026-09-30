@@ -133,6 +133,14 @@ class Plano(unittest.TestCase):
         p = kc.planejar({'L-9': {'L-0320': 2}}, self.CAD, atual, {})
         self.assertEqual([k for k, _ in p['recusados']], ['L-9'])
 
+    def test_kit_que_esta_so_na_pendente_nao_entra_como_peca(self):
+        # K-ESPERA não tem cadastro (está na pendente), mas é kit.
+        p = kc.planejar({'K-GRANDE': {'K-ESPERA': 1, 'L-9': 1}},
+                        self.CAD | {'K-GRANDE', 'K-ESPERA'}, {},
+                        {'K-ESPERA': {'L-0320': 2}})
+        self.assertEqual([k for k, _ in p['recusados']], ['K-GRANDE'])
+        self.assertEqual(p['novos'], [])
+
     def test_pendencia_que_resolveu_sai(self):
         p = kc.planejar({'K2-L-0320': {'L-0320': 2}}, self.CAD, {},
                         {'K2-L-0320': {'L-0320': 2}})
@@ -154,6 +162,28 @@ class Sql(unittest.TestCase):
         # Sem "public.": o teste com banco depende das TEMP com o mesmo nome.
         for sql in kc.TODAS_AS_SQL:
             self.assertNotIn('public.', sql)
+
+
+class Tela(unittest.TestCase):
+    def test_erro_de_banco_vira_aviso_e_nao_esconde_as_outras_secoes(self):
+        from unittest import mock
+        import streamlit as st
+
+        class _EngineQuebrado:
+            def raw_connection(self):
+                raise RuntimeError('banco fora')
+
+            def connect(self):
+                raise RuntimeError('banco fora')
+
+        erros = []
+        with mock.patch.object(st, 'error', side_effect=lambda m, *a, **k: erros.append(m)), \
+                mock.patch.object(kc.pd, 'read_sql', side_effect=RuntimeError('banco fora')):
+            kc.render_aba_kits(_EngineQuebrado(), is_admin=True)   # não pode levantar
+        # Pendências e composição falham, cada uma com o seu aviso.
+        self.assertEqual(len(erros), 2)
+        self.assertIn('pendências', erros[0])
+        self.assertIn('composição em vigor', erros[1])
 
 
 # ============================================================
