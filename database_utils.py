@@ -526,6 +526,108 @@ def buscar_pendentes_resumo(engine):
         st.error(f"Erro ao buscar resumo de pendentes: {e}")
         return pd.DataFrame()
 
+# ------------------------------------------------------------
+# PENDENTE QUE VEIO DA API (arquivo_origem = 'API') — 30/09/2026
+# ------------------------------------------------------------
+# Quem grava a venda da API no snapshot e' SO o coletor: a cada coleta ele
+# apaga as linhas 'API' da janela e regrava do espelho. Linha que a aba
+# inserisse com origem 'API' seria apagada na noite seguinte (o espelho ainda
+# diria sku_valido=false) e a venda sumiria dos dois lugares; com outra
+# origem, colidiria com o INSERT do coletor (que nao tem ON CONFLICT de
+# proposito) e derrubaria a sincronizacao da loja.
+#
+# Entao, para pendente 'API' a aba NAO toca no snapshot: grava o mapeamento em
+# dim_sku_mapeamento e marca 'Aguardando coleta'. O coletor le o mapeamento,
+# rele o pedido (ate 20 por loja por noite) e a venda entra no snapshot. A
+# pendente so' vira 'Reprocessado' quando a venda APARECE no snapshot
+# (conciliar_pendentes_api), sem dar UPDATE ao coletor.
+# NAO mudar sku/numero_pedido/loja da linha pendente: sao a chave do
+# ON CONFLICT do coletor, que precisa continuar engolindo a mesma venda.
+ORIGEM_API = 'API'
+STATUS_AGUARDANDO = 'Aguardando coleta'
+
+SQL_CONCILIAR_PENDENTES_API = """
+    UPDATE fact_vendas_pendentes p
+       SET status = 'Reprocessado'
+     WHERE p.arquivo_origem = 'API'
+       AND p.status IN ('Pendente', 'Aguardando coleta')
+       AND EXISTS (
+            SELECT 1
+              FROM fact_vendas_snapshot s
+             WHERE s.arquivo_origem = 'API'
+               AND s.marketplace_origem = p.marketplace_origem
+               AND s.loja_origem = p.loja_origem
+               AND s.numero_pedido = p.numero_pedido
+               AND s.sku = COALESCE(
+                    (SELECT m.sku_correto FROM dim_sku_mapeamento m
+                      WHERE m.sku_errado = p.sku), p.sku))
+"""
+
+
+def _e_pendente_api(valor_arquivo_origem):
+    return str(valor_arquivo_origem or '').strip() == ORIGEM_API
+
+
+def _marcar_aguardando_coleta(cursor, ids):
+    if not ids:
+        return
+    # data_processamento vira a HORA DA CORRECAO: e' dela que a tela conta os
+    # dias de espera (R4 do auditor). Na pendente da API ela so' guardava a
+    # criacao da linha, o que fazia uma venda antiga recem-corrigida parecer
+    # atrasada.
+    cursor.execute(
+        f"UPDATE fact_vendas_pendentes SET status = %s, data_processamento = NOW() "
+        f"WHERE id IN ({','.join(['%s'] * len(ids))})",
+        [STATUS_AGUARDANDO] + [int(i) for i in ids])
+
+
+def _gravar_mapeamento(cursor, sku_errado, sku_correto):
+    cursor.execute("""
+        INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto)
+        VALUES (%s, %s)
+        ON CONFLICT (sku_errado)
+        DO UPDATE SET sku_correto = EXCLUDED.sku_correto, data_criacao = NOW()
+    """, (sku_errado, sku_correto))
+
+
+def conciliar_pendentes_api(engine):
+    """Fecha as pendentes da API cuja venda ja' entrou no snapshot (pela
+    coleta). Chamada ao abrir a aba Vendas Pendentes. Devolve quantas fechou."""
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(SQL_CONCILIAR_PENDENTES_API)
+        fechadas = cur.rowcount
+        conn.commit()
+        cur.close()
+        return fechadas
+    except Exception:
+        conn.rollback()
+        return 0
+    finally:
+        conn.close()
+
+
+def buscar_aguardando_coleta(engine):
+    """Pendentes da API ja' corrigidas na aba, esperando a proxima coleta."""
+    query = """
+        SELECT p.id, p.marketplace_origem, p.loja_origem, p.numero_pedido,
+               p.data_venda, p.sku AS sku_original,
+               COALESCE(m.sku_correto, p.sku) AS sku_destino,
+               p.valor_venda_efetivo,
+               GREATEST(0, CURRENT_DATE - p.data_processamento::date) AS dias_esperando
+          FROM fact_vendas_pendentes p
+          LEFT JOIN dim_sku_mapeamento m ON m.sku_errado = p.sku
+         WHERE p.status = 'Aguardando coleta' AND p.arquivo_origem = 'API'
+         ORDER BY p.data_processamento, p.id
+    """
+    try:
+        return pd.read_sql(query, engine)
+    except Exception as e:
+        st.error(f"Erro ao buscar pendentes aguardando coleta: {e}")
+        return pd.DataFrame()
+
+
 def reprocessar_pendentes_por_sku(engine, sku):
     """
     Reprocessa vendas pendentes após cadastro de SKU.
@@ -565,7 +667,13 @@ def reprocessar_pendentes_por_sku(engine, sku):
             margem_total, margem_percentual, data_processamento, arquivo_origem, logistica)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
     """
+    ids_aguardando = []
     for _, row in df_pendentes.iterrows():
+        # Pendente da API: o snapshot e' do coletor (ver ORIGEM_API acima).
+        # O SKU ja' esta cadastrado; a proxima coleta rele o pedido.
+        if _e_pendente_api(row.get('arquivo_origem')):
+            ids_aguardando.append(int(row['id']))
+            continue
         try:
             cursor.execute(f"SAVEPOINT repro_{row['id']}")
             
@@ -641,16 +749,20 @@ def reprocessar_pendentes_por_sku(engine, sku):
             f"UPDATE fact_vendas_pendentes SET status = 'Reprocessado' WHERE id IN ({','.join(['%s']*len(ids_repro))})",
             ids_repro
         )
+    _marcar_aguardando_coleta(cursor, ids_aguardando)
     
     conn.commit()
     cursor.close()
     conn.close()
     
     msg = f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s)."
+    if ids_aguardando:
+        msg += f" {len(ids_aguardando)} venda(s) da API aguardam a próxima coleta."
     if sem_config > 0:
         msg += f" ⚠️ {sem_config} venda(s) ignorada(s) — ASIN sem config cadastrada."
     
-    return {'sucesso': sucesso, 'erros': erros, 'sem_config': sem_config, 'mensagem': msg}
+    return {'sucesso': sucesso, 'erros': erros, 'sem_config': sem_config,
+            'aguardando': len(ids_aguardando), 'mensagem': msg}
 
 # ============================================================
 # VENDAS DESCARTADAS (v3.0)
@@ -841,6 +953,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     cursor = conn.cursor()
     sucesso, erros, mapeados, sem_config = 0, 0, 0, 0
     ids_processados = []
+    ids_aguardando = []
 
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (
@@ -864,6 +977,23 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
 
             if sku not in skus_validos:
                 erros += 1
+                continue
+
+            # Pendente da API: nao insere no snapshot (ver ORIGEM_API). Grava
+            # o mapeamento, se o SKU foi corrigido, e espera a proxima coleta.
+            if _e_pendente_api(item.get('arquivo_origem')):
+                cursor.execute(f"SAVEPOINT api_{id_pendente}")
+                try:
+                    if sku != sku_original and sku_original:
+                        _gravar_mapeamento(cursor, sku_original, sku)
+                        mapeados += 1
+                    cursor.execute(f"RELEASE SAVEPOINT api_{id_pendente}")
+                except Exception:
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT api_{id_pendente}")
+                    erros += 1
+                    continue
+                ids_aguardando.append(id_pendente)
+                sucesso += 1
                 continue
 
             custo_unit = custos_dict.get(sku, 0)
@@ -962,12 +1092,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             # Gravar mapeamento se SKU foi corrigido
             if sku != sku_original and sku_original:
                 try:
-                    cursor.execute("""
-                        INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto)
-                        VALUES (%s, %s)
-                        ON CONFLICT (sku_errado) 
-                        DO UPDATE SET sku_correto = EXCLUDED.sku_correto, data_criacao = NOW()
-                    """, (sku_original, sku))
+                    _gravar_mapeamento(cursor, sku_original, sku)
                     mapeados += 1
                 except Exception:
                     pass
@@ -985,12 +1110,16 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             f"UPDATE fact_vendas_pendentes SET status = 'Revisado manualmente' WHERE id IN ({placeholders})",
             ids_processados
         )
+    _marcar_aguardando_coleta(cursor, ids_aguardando)
 
     conn.commit()
     cursor.close()
     conn.close()
 
     msg = f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s), {mapeados} mapeamento(s) salvo(s)."
+    if ids_aguardando:
+        msg += (f" {len(ids_aguardando)} venda(s) da API aguardam a próxima coleta"
+                f" (ela entra no snapshot sozinha).")
     if sem_config > 0:
         msg += f" ⚠️ {sem_config} venda(s) sem config de ASIN — não gravadas."
 
@@ -999,6 +1128,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
         'erros': erros,
         'mapeados': mapeados,
         'sem_config': sem_config,
+        'aguardando': len(ids_aguardando),
         'mensagem': msg
     }
 
