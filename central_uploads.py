@@ -38,6 +38,7 @@ from database_utils import (
     reprocessar_pendentes_por_sku, recalcular_curva_abc, buscar_pendentes_por_tipo,
     reprocessar_pendentes_manual, gravar_mapeamento_sku, buscar_custos_skus,
     buscar_skus_validos, buscar_pendentes_revisados, excluir_pendentes_por_ids,
+    conciliar_pendentes_api, buscar_aguardando_coleta,
 )
 from processar_ml import processar_arquivo_ml, gravar_vendas_ml
 from processar_shopee import processar_arquivo_shopee, gravar_vendas_shopee
@@ -1391,9 +1392,15 @@ def tab_vendas_pendentes(engine):
     st.subheader("⏳ Vendas Pendentes")
     st.markdown("Vendas que precisam de revisão: **SKU não cadastrado**, **ASIN não configurado** ou **divergência financeira**.")
 
+    # Pendentes da API cuja venda ja' entrou no snapshot (pela coleta) fecham aqui.
+    fechadas = conciliar_pendentes_api(engine)
+    if fechadas:
+        st.success(f"✅ {fechadas} venda(s) da API entraram no snapshot pela coleta e sairam da fila.")
+
     df_resumo = buscar_pendentes_resumo(engine)
     if df_resumo.empty:
         st.success("✅ Nenhuma venda pendente!")
+        _secao_aguardando_coleta(engine)
         _exibir_historico(engine); return
 
     c1, c2, c3 = st.columns(3)
@@ -1403,6 +1410,7 @@ def tab_vendas_pendentes(engine):
 
     st.divider(); _secao_pend_sku(engine)
     st.divider(); _secao_pend_div(engine)
+    st.divider(); _secao_aguardando_coleta(engine)
     st.divider(); _exibir_historico(engine)
 
 
@@ -1563,6 +1571,31 @@ def _secao_pend_div(engine):
                     st.rerun()
                 else:
                     st.error(f"❌ {res_del['mensagem']}")
+
+
+def _secao_aguardando_coleta(engine):
+    """Vendas da API ja' corrigidas na aba: a proxima coleta le o pedido de novo
+    e a venda entra no snapshot sozinha. Sai daqui quando aparece la'."""
+    df = buscar_aguardando_coleta(engine)
+    if df.empty:
+        return
+    st.markdown("### ⏳ Aguardando a próxima coleta")
+    st.caption("Já corrigidas aqui (o mapeamento fica lembrado para sempre). "
+               "A coleta lê o pedido de novo e a venda entra sozinha; "
+               "esta linha some quando ela aparece nas vendas.")
+    c1, c2 = st.columns(2)
+    c1.metric("Vendas aguardando", formatar_quantidade(len(df)))
+    c2.metric("Receita a entrar", formatar_valor(df['valor_venda_efetivo'].sum()))
+    espera = int(df['dias_esperando'].max())
+    if espera > 3:
+        st.warning(f"⚠️ Há venda esperando há {espera} dias. A coleta deveria ter resolvido em "
+                   "1-2 noites: confira se o SKU corrigido está cadastrado e ativo, ou se o "
+                   "coletor está rodando.")
+    df_v = df.copy()
+    df_v['data_venda'] = pd.to_datetime(df_v['data_venda'], errors='coerce').dt.strftime('%d/%m/%Y').fillna('-')
+    df_v['valor_venda_efetivo'] = df_v['valor_venda_efetivo'].apply(formatar_valor)
+    df_v = df_v.drop(columns=['id'])
+    st.dataframe(df_v, use_container_width=True, height=250, hide_index=True)
 
 
 def _exibir_historico(engine):
