@@ -170,6 +170,132 @@ class ContaEmPeca(unittest.TestCase):
         self.assertNotIn("pecas['galpao'].sum()", fonte)
 
 
+class MaisVendidosPorPeca(unittest.TestCase):
+    """3ª entrega: seletor SKU/peça em Mais Vendidos, só unidades."""
+    COMP = {'K2-L-0320': {'L-0320': 2}, 'K-MIX': {'L-0320': 1, 'L-0321': 1}}
+
+    def test_sozinha_dentro_de_kit_total_e_percentual(self):
+        v = ep.venda_em_peca([('L-0320', 1281), ('K2-L-0320', 1359), ('K-MIX', 10)],
+                             self.COMP)
+        self.assertEqual((v['L-0320']['sozinha'], v['L-0320']['em_kit'],
+                          v['L-0320']['total']), (1281, 2718 + 10, 3999 + 10))
+        df = ep.tabela_por_peca(v)
+        self.assertEqual(list(df['peca']), ['L-0320', 'L-0321'])
+        self.assertAlmostEqual(df.iloc[0]['pct_em_kit'], 2728 / 4009)
+        self.assertEqual(df.iloc[0]['kits'], ('K-MIX', 'K2-L-0320'))
+
+    def test_kit_sem_composicao_entra_como_ele_mesmo(self):
+        v = ep.venda_em_peca([('K2-LVI-CANOA0506', 3)], self.COMP, {'K2-LVI-CANOA0506'})
+        df = ep.tabela_por_peca(v)
+        self.assertEqual(df.iloc[0]['peca'], 'K2-LVI-CANOA0506')
+        self.assertEqual(df.iloc[0]['sozinha'], 3)
+        self.assertTrue(df.iloc[0]['kit_sem_composicao'])
+
+    def test_top_n_e_sem_linha_de_total(self):
+        v = ep.venda_em_peca([('A', 5), ('B', 9), ('C', 1)], {})
+        df = ep.tabela_por_peca(v, limite=2)
+        self.assertEqual(list(df['peca']), ['B', 'A'])
+
+    def test_cobertura_e_mais_vendidos_usam_a_mesma_conta(self):
+        import inspect
+        import analise_produtos as ap
+        self.assertIn('venda_em_peca(', inspect.getsource(ep.montar))
+        fonte = inspect.getsource(ap._mais_vendidos_por_peca)
+        self.assertIn('estoque_peca.venda_em_peca(', fonte)
+        self.assertNotIn("['total'].sum()", fonte)
+
+    def test_mesmo_resultado_da_cobertura(self):
+        vendas = [('L-0320', 7, 30, 300.0), ('K2-L-0320', 7, 30, 1200.0)]
+        pecas, _, _ = ep.montar([], vendas, [('K2-L-0320', 'L-0320', 2)])
+        v = ep.venda_em_peca([(s, q30) for s, _q7, q30, _r in vendas],
+                             {'K2-L-0320': {'L-0320': 2}})
+        self.assertAlmostEqual(_linha(pecas, 'L-0320')['venda_dia_30d'] * 30,
+                               v['L-0320']['total'])
+
+
+class ReceitaEMargemPorPeca(unittest.TestCase):
+    """Regra do Thiago (01/10/2026): peça sozinha inteira; kit rateado pelo
+    peso do custo; fecha ao centavo."""
+    from decimal import Decimal as _D
+    COMP = {'K-L-0351': {'L-0303': 1, 'L-0350': 1},
+            'K10-L-0341': {'L-0337': 10, 'L-0339': 10},
+            'K2-L-0320': {'L-0320': 2}}
+    # Custo das peças em produção em 01/10/2026 (mesma regra da venda).
+    CUSTOS = {'L-0303': 18.10, 'L-0350': 14.60, 'L-0337': 1.82, 'L-0339': 2.10,
+              'L-0320': 11.30}
+
+    def _soma(self, valores, campo):
+        return sum(v[campo + '_sozinha'] + v[campo + '_kit'] for v in valores.values())
+
+    def test_kit_misto_real_rateado_pelo_peso_do_custo(self):
+        D = self._D
+        v, por_qtd = ep.valor_em_peca([('K-L-0351', '71939.68', '7442.93')],
+                                      self.COMP, self.CUSTOS)
+        self.assertEqual(por_qtd, [])
+        # peso L-0303 = 18,10 / 32,70
+        self.assertEqual(v['L-0303']['receita_kit'],
+                         (D('71939.68') * D('18.10') / D('32.70')).quantize(D('0.01')))
+        self.assertEqual(v['L-0303']['receita_kit'] + v['L-0350']['receita_kit'],
+                         D('71939.68'))
+        self.assertEqual(v['L-0303']['margem_kit'] + v['L-0350']['margem_kit'], D('7442.93'))
+
+    def test_fecha_ao_centavo_com_kit_misto_avulsa_e_margem_negativa(self):
+        vendas = [('K-L-0351', '100.01', '-3.33'), ('K10-L-0341', '16157.28', '1671.71'),
+                  ('K2-L-0320', '57888.00', '4000.01'), ('L-0320', '35720.55', '2100.07'),
+                  ('L-0303', '0.01', '-0.01')]
+        v, _ = ep.valor_em_peca(vendas, self.COMP, self.CUSTOS)
+        D = self._D
+        self.assertEqual(self._soma(v, 'receita'), sum(D(r) for _s, r, _m in vendas))
+        self.assertEqual(self._soma(v, 'margem'), sum(D(m) for _s, _r, m in vendas))
+
+    def test_peso_considera_a_quantidade_no_kit(self):
+        v, _ = ep.valor_em_peca([('K10-L-0341', '392.00', '39.20')], self.COMP, self.CUSTOS)
+        # 10 × 1,82 = 18,20 ; 10 × 2,10 = 21,00 ; total 39,20
+        self.assertEqual(v['L-0337']['receita_kit'], self._D('182.00'))
+        self.assertEqual(v['L-0339']['receita_kit'], self._D('210.00'))
+
+    def test_peca_sozinha_entra_inteira(self):
+        v, _ = ep.valor_em_peca([('L-0320', '35720.55', '2100.07')], self.COMP, self.CUSTOS)
+        self.assertEqual((v['L-0320']['receita_sozinha'], v['L-0320']['receita_kit']),
+                         (self._D('35720.55'), 0))
+
+    def test_sem_custo_zero_ou_nan_rateia_por_quantidade_e_avisa(self):
+        for ruim in (None, 0, float('nan'), 'NaN', -1):
+            custos = dict(self.CUSTOS, **{'L-0339': ruim})
+            if ruim is None:
+                del custos['L-0339']
+            v, por_qtd = ep.valor_em_peca([('K10-L-0341', '100.00', '10.00')],
+                                          self.COMP, custos)
+            self.assertEqual(por_qtd, ['K10-L-0341'], ruim)
+            self.assertEqual(v['L-0337']['receita_kit'], self._D('50.00'))
+            self.assertEqual(v['L-0337']['receita_kit'] + v['L-0339']['receita_kit'],
+                             self._D('100.00'))
+
+    def test_kit_sem_composicao_entra_inteiro(self):
+        v, _ = ep.valor_em_peca([('K2-LVI-CANOA0506', '155.86', '20.00')], self.COMP, {})
+        self.assertEqual(v['K2-LVI-CANOA0506']['receita_sozinha'], self._D('155.86'))
+
+    def test_tabela_com_valores_e_margem_percentual(self):
+        vendas = [('L-0320', 10, '300.00', '30.00'), ('K2-L-0320', 5, '500.00', '-50.00')]
+        un = ep.venda_em_peca([(s, q) for s, q, _r, _m in vendas], self.COMP)
+        val, _ = ep.valor_em_peca([(s, r, m) for s, _q, r, m in vendas], self.COMP, self.CUSTOS)
+        l = ep.tabela_por_peca(un, valores=val).iloc[0]
+        self.assertEqual(l['receita_total'], self._D('800.00'))
+        self.assertEqual(l['margem'], self._D('-20.00'))
+        self.assertAlmostEqual(float(l['margem_pct']), -0.025)
+
+    def test_custo_do_rateio_e_o_da_venda_nao_o_custo_final(self):
+        self.assertNotIn('custo_final', ep.SQL_CUSTOS)
+        self.assertIn('preco_a_ser_considerado', ep.SQL_CUSTOS)
+
+    def test_r_em_jogo_da_cobertura_nao_e_rateado(self):
+        # Na cobertura o kit inteiro está em jogo para CADA peça.
+        pecas, _, _ = ep.montar([], [('K-L-0351', 0, 10, 1000.0)],
+                                [('K-L-0351', 'L-0303', 1), ('K-L-0351', 'L-0350', 1)])
+        self.assertEqual(float(_linha(pecas, 'L-0303')['em_jogo_30d']), 1000.0)
+        self.assertEqual(float(_linha(pecas, 'L-0350')['em_jogo_30d']), 1000.0)
+
+
 class FotoParcial(unittest.TestCase):
     def test_queda_forte_de_estoques_no_ultimo_dia_avisa(self):
         contagens = [(NALA, 15, D, 338, date(2026, 9, 29)),     # caso real de 25/09
@@ -237,7 +363,7 @@ class _Conexao:
 class ComBanco(unittest.TestCase):
     TABELAS = ['fact_estoque_diario', 'dim_estoque_anuncio', 'fact_vendas_snapshot',
                'dim_kit_composicao', 'dim_kit_composicao_pendente',
-               'dim_sku_mapeamento', 'dim_produtos']
+               'dim_sku_mapeamento', 'dim_produtos', 'dim_produtos_custos']
 
     @classmethod
     def setUpClass(cls):
@@ -261,13 +387,17 @@ class ComBanco(unittest.TestCase):
             estoque_id varchar, sku varchar)""")
         c.execute("""CREATE TEMP TABLE fact_vendas_snapshot (
             sku varchar, data_venda date, quantidade integer,
-            valor_venda_efetivo numeric)""")
+            valor_venda_efetivo numeric, margem_total numeric)""")
         for ddl in _ddl_kits_em_temp():
             c.execute(ddl)
         c.execute("""CREATE TEMP TABLE dim_sku_mapeamento (
             sku_errado varchar PRIMARY KEY, sku_correto varchar NOT NULL,
             data_criacao timestamp DEFAULT now())""")
-        c.execute('CREATE TEMP TABLE dim_produtos (sku text, nome text)')
+        c.execute('CREATE TEMP TABLE dim_produtos (sku text, nome text, '
+                  'preco_a_ser_considerado numeric)')
+        c.execute("""CREATE TEMP TABLE dim_produtos_custos (
+            sku text, preco_compra numeric, embalagem numeric, mdo numeric,
+            custo_ads numeric, custo_final numeric)""")
         c.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(%s) AS t(nome) JOIN pg_class c ON c.oid = t.nome::regclass
@@ -292,7 +422,8 @@ class ComBanco(unittest.TestCase):
         c.execute("INSERT INTO dim_kit_composicao (kit_sku, peca_sku, quantidade, "
                   "arquivo_origem) VALUES ('K10-LKE-3104-4030', 'LKE-3104-4030', 10, 'x')")
         hoje = date(2026, 10, 1)
-        c.executemany('INSERT INTO fact_vendas_snapshot VALUES (%s,%s,%s,%s)', [
+        c.executemany('INSERT INTO fact_vendas_snapshot (sku, data_venda, quantidade, '
+                      'valor_venda_efetivo) VALUES (%s,%s,%s,%s)', [
             ('K10-LKE-3104-4030', date(2026, 9, 30), 3, 600),
             ('LKE-3104-4030', date(2026, 9, 1), 30, 900),     # 1º dia da janela
             ('LKE-3104-4030', date(2026, 8, 31), 500, 9999),  # fora (31 dias)
@@ -332,8 +463,34 @@ class ComBanco(unittest.TestCase):
         pecas, _, _ = ep.montar(estoque, vendas, comp, pend, mapa)
         self.assertEqual(_linha(pecas, 'LKE-3104-4030')['full'], 17 + 29 * 10)
 
+    def test_vendas_por_sku_com_o_where_dos_filtros(self):
+        where = "f.data_venda >= %s AND f.data_venda <= %s AND f.sku IN (%s, %s)"
+        r = {s: q for s, q, _r, _m in ep.ler_vendas_por_sku(
+            self.c, where, [date(2026, 9, 1), date(2026, 9, 30),
+                            'K10-LKE-3104-4030', 'LKE-3104-4030'])}
+        self.assertEqual({k: int(v) for k, v in r.items()},
+                         {'K10-LKE-3104-4030': 3, 'LKE-3104-4030': 30})
+        comp, pend, mapa = ep.ler_composicao(self.c)
+        v = ep.venda_em_peca(r.items(), ep.agrupar_composicao(comp))
+        self.assertEqual(v['LKE-3104-4030']['total'], 30 + 3 * 10)
+
+    def test_receita_margem_e_custo_pela_sql(self):
+        self.cur.execute("UPDATE fact_vendas_snapshot SET margem_total = valor_venda_efetivo / 10")
+        linhas = ep.ler_vendas_por_sku(self.c, "f.data_venda >= %s AND f.data_venda <= %s",
+                                       [date(2026, 9, 1), date(2026, 9, 30)])
+        r = {s: (float(rec), float(m)) for s, _q, rec, m in linhas}
+        self.assertEqual(r['K10-LKE-3104-4030'], (600.0, 60.0))
+        # Custo: preco_a_ser_considerado; se 0, componentes; nunca custo_final.
+        self.cur.executemany('INSERT INTO dim_produtos VALUES (%s, %s, %s)', [
+            ('L-0321', 'x', 7.20), ('L-0303', 'y', 0), ('L-0350', 'z', None)])
+        self.cur.executemany('INSERT INTO dim_produtos_custos VALUES (%s,%s,%s,%s,%s,%s)', [
+            ('L-0321', 5.80, 0.50, 0.40, 0.50, 1.88),
+            ('L-0303', 16.70, 0.50, 0.40, 0.50, 20.58)])
+        c = {k: float(v) for k, v in ep.ler_custos(self.c, {'L-0321', 'L-0303', 'L-0350'}).items()}
+        self.assertEqual(c, {'L-0321': 7.20, 'L-0303': 18.10})
+
     def test_nomes(self):
-        self.cur.execute("INSERT INTO dim_produtos VALUES ('LKE-3104-4030', 'Bandeja 40x30')")
+        self.cur.execute("INSERT INTO dim_produtos VALUES ('LKE-3104-4030', 'Bandeja 40x30', 1)")
         self.assertEqual(ep.ler_nomes(self.c, {'LKE-3104-4030', 'X'}),
                          {'LKE-3104-4030': 'Bandeja 40x30'})
 

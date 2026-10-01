@@ -29,10 +29,31 @@ REGRAS (plano aprovado pelo Mestre em 01/10/2026, medido no banco)
   - Kit sem composição (pendente) entra como ele mesmo, com aviso.
   - Nunca soma unidades de produtos diferentes. R$ em jogo = receita de 30
     dias dos SKUs (kits e a própria peça) que param se a peça acabar; o
-    total do topo soma SKUs DISTINTOS.
+    total do topo soma SKUs DISTINTOS. Aqui NÃO há rateio: kit sem uma peça
+    para inteiro.
+
+RECEITA E MARGEM POR PEÇA (Mais Vendidos "Produto (peça)"; regra do Thiago,
+01/10/2026, Manual do Notion seção 4: "sempre que falar de peças, falar de
+valores")
+  - Venda da peça sozinha entra inteira.
+  - Venda do kit é RATEADA entre as peças pelo PESO DO CUSTO:
+    peso = custo da peça × qtd ÷ Σ(custo × qtd) do kit. A margem do kit (a
+    margem real gravada na venda) é rateada pelo mesmo peso. O custo
+    cadastrado do kit não entra: só os pesos das peças.
+  - Custo da peça = o mesmo que a venda usa (coletor e upload):
+    preco_a_ser_considerado, senão a soma preço de compra + embalagem + MDO +
+    ads, senão o preço de compra. NÃO é dim_produtos_custos.custo_final, que
+    em 01/10/2026 divergia dos componentes em 792 de 982 SKUs (L-0321: 1,88
+    contra 7,20) e estava vazio em 190.
+  - Peça sem custo, zero ou NaN (lembrar 13/08): aquele kit cai para rateio
+    por QUANTIDADE e é listado em aviso. Nunca divide por zero.
+  - Fecha ao centavo: soma das peças = soma dos kits + avulsas, em receita e
+    em margem (a última peça de cada kit fica com o resto do arredondamento).
+  - Kit sem composição entra inteiro como ele mesmo.
 """
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_EVEN
 
 import pandas as pd
 
@@ -115,6 +136,32 @@ TODAS_AS_SQL = (SQL_ESTOQUE, SQL_VENDAS, SQL_COMPOSICAO, SQL_KITS_PENDENTES,
 
 QUEDA_FOTO_PARCIAL = 0.20
 
+# Mais Vendidos por peça (3ª entrega): o WHERE vem de
+# analise_produtos._montar_where_filtros (período, loja com RBAC,
+# marketplace), só com placeholders %s; os valores vão em params.
+SQL_VENDAS_POR_SKU_MODELO = """
+    SELECT f.sku, SUM(f.quantidade) AS qtd,
+           SUM(f.valor_venda_efetivo) AS receita, SUM(f.margem_total) AS margem
+      FROM fact_vendas_snapshot f
+     WHERE {where}
+     GROUP BY f.sku
+"""
+
+# Custo da peça para o PESO do rateio: a mesma regra de custo da venda
+# (nala-coletor-ml/coletor/vendas_db.py e o upload). MAX porque dim_produtos
+# já teve SKU em duplicidade.
+SQL_CUSTOS = """
+    SELECT p.sku,
+           MAX(COALESCE(NULLIF(p.preco_a_ser_considerado, 0),
+                        NULLIF(pc.preco_compra + pc.embalagem + pc.mdo + pc.custo_ads, 0),
+                        pc.preco_compra)) AS custo
+      FROM dim_produtos p
+      LEFT JOIN dim_produtos_custos pc ON pc.sku = p.sku
+     WHERE p.sku = ANY(%(skus)s)
+     GROUP BY p.sku
+"""
+TODAS_AS_SQL += (SQL_VENDAS_POR_SKU_MODELO.format(where='TRUE'), SQL_CUSTOS)
+
 
 def params_vendas(hoje):
     """30 dias fechados (até ontem): hoje ainda está vendendo."""
@@ -146,6 +193,137 @@ def ler(conn, hoje):
     finally:
         cur.close()
         conn.rollback()
+
+
+def ler_composicao(conn):
+    """(composicao, kits_pendentes, mapa) para a conta em peça. Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_COMPOSICAO)
+        composicao = cur.fetchall()
+        cur.execute(SQL_KITS_PENDENTES)
+        pendentes = {r[0] for r in cur.fetchall()}
+        cur.execute(SQL_MAPEAMENTO)
+        return composicao, pendentes, dict(cur.fetchall())
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def ler_custos(conn, skus):
+    """{sku: custo} para o peso do rateio (sem custo -> não aparece)."""
+    if not skus:
+        return {}
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_CUSTOS, {'skus': sorted(skus)})
+        return {s: c for s, c in cur.fetchall() if c is not None}
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def _custo_valido(c):
+    """Decimal > 0, ou None (sem custo, zero, NaN)."""
+    try:
+        d = Decimal(str(c))
+    except Exception:
+        return None
+    return d if d.is_finite() and d > 0 else None
+
+
+def _ratear(valor, pesos):
+    """valor (Decimal) em partes proporcionais aos pesos, ao centavo; a
+    última parte fica com o resto, então a soma é EXATAMENTE o valor."""
+    total = sum(pesos)
+    partes, acumulado = [], Decimal(0)
+    for w in pesos[:-1]:
+        parte = (valor * w / total).quantize(Decimal('0.01'), ROUND_HALF_EVEN)
+        partes.append(parte)
+        acumulado += parte
+    partes.append(valor - acumulado)
+    return partes
+
+
+def valor_em_peca(vendas_valor, comp, custos):
+    """
+    Receita e margem por peça (regra no docstring do módulo).
+
+    vendas_valor: [(sku vendido, receita, margem)].
+    custos: {peca: custo} (ler_custos).
+    Devolve ({peca: {'receita_sozinha', 'receita_kit', 'margem_sozinha',
+    'margem_kit'} em Decimal}, [kits rateados por QUANTIDADE por falta de
+    custo de alguma peça]).
+    """
+    out, por_quantidade = {}, set()
+
+    def _v(peca):
+        return out.setdefault(peca, {'receita_sozinha': Decimal(0), 'receita_kit': Decimal(0),
+                                     'margem_sozinha': Decimal(0), 'margem_kit': Decimal(0)})
+
+    for sku, receita, margem in vendas_valor:
+        receita = Decimal(str(receita or 0))
+        margem = Decimal(str(margem or 0))
+        if sku not in comp:            # avulsa (ou kit sem composição): inteira
+            v = _v(sku)
+            v['receita_sozinha'] += receita
+            v['margem_sozinha'] += margem
+            continue
+        itens = sorted(comp[sku].items())
+        custo = [_custo_valido(custos.get(p)) for p, _q in itens]
+        if all(c is not None for c in custo):
+            pesos = [c * q for c, (_p, q) in zip(custo, itens)]
+        else:
+            pesos = [Decimal(q) for _p, q in itens]
+            por_quantidade.add(sku)
+        for (peca, _q), r, m in zip(itens, _ratear(receita, pesos), _ratear(margem, pesos)):
+            v = _v(peca)
+            v['receita_kit'] += r
+            v['margem_kit'] += m
+    return out, sorted(por_quantidade)
+
+
+def ler_vendas_por_sku(conn, where_sql, params):
+    """[(sku, qtd, receita, margem)] do período/filtros da aba Mais Vendidos.
+    Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_VENDAS_POR_SKU_MODELO.format(where=where_sql), params)
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def tabela_por_peca(venda, limite=None, valores=None):
+    """
+    Saída de venda_em_peca (unidades) e, se vier, de valor_em_peca (R$) ->
+    DataFrame, uma linha por peça, maior total de unidades primeiro.
+    """
+    linhas = [{
+        'peca': peca,
+        'sozinha': v['sozinha'],
+        'em_kit': v['em_kit'],
+        'total': v['total'],
+        'pct_em_kit': v['em_kit'] / v['total'] if v['total'] else None,
+        'qtd_kits': len(v['kits']),
+        'kits': tuple(sorted(v['kits'])),
+        'kit_sem_composicao': v['kit_sem_composicao'],
+    } for peca, v in venda.items() if v['total']]
+    df = pd.DataFrame(linhas, columns=['peca', 'sozinha', 'em_kit', 'total', 'pct_em_kit',
+                                       'qtd_kits', 'kits', 'kit_sem_composicao'])
+    if valores is not None:
+        zero = {'receita_sozinha': Decimal(0), 'receita_kit': Decimal(0),
+                'margem_sozinha': Decimal(0), 'margem_kit': Decimal(0)}
+        val = df['peca'].map(lambda s: valores.get(s, zero))
+        df['receita_sozinha'] = val.map(lambda v: v['receita_sozinha'])
+        df['receita_kit'] = val.map(lambda v: v['receita_kit'])
+        df['receita_total'] = df['receita_sozinha'] + df['receita_kit']
+        df['margem'] = val.map(lambda v: v['margem_sozinha'] + v['margem_kit'])
+        df['margem_pct'] = [m / r if r else None
+                            for m, r in zip(df['margem'], df['receita_total'])]
+    df = df.sort_values(['total', 'peca'], ascending=[False, True]).reset_index(drop=True)
+    return df.head(limite) if limite else df
 
 
 def ler_contagens(conn):
@@ -192,6 +370,54 @@ def _diverge(valores):
     return alto - baixo > max(2, 0.01 * alto)
 
 
+def agrupar_composicao(composicao):
+    """[(kit, peca, qtd)] -> {kit: {peca: qtd}}."""
+    comp = {}
+    for kit, peca, qtd in composicao:
+        comp.setdefault(kit, {})[peca] = int(qtd)
+    return comp
+
+
+def kits_sem_composicao(kits_pendentes, mapa=None):
+    """Kits pendentes, pelo SKU guardado e pelo da correção (a venda chega
+    com o oficial)."""
+    mapa = mapa or {}
+    return {mapa.get(k, k) for k in kits_pendentes} | set(kits_pendentes)
+
+
+def pecas_do_sku(sku, comp):
+    """Peças de um SKU vendido: o kit vira suas peças; o resto é ele mesmo
+    (inclusive kit sem composição)."""
+    return comp[sku].items() if sku in comp else [(sku, 1)]
+
+
+def venda_em_peca(vendas_qtd, comp, sem_comp=()):
+    """
+    A ÚNICA conta de venda em peça do sistema (cobertura e Mais Vendidos).
+
+    vendas_qtd: [(sku vendido, quantidade)].
+    Devolve {peca: {'sozinha', 'em_kit', 'total', 'kits': set, 'skus': set,
+    'kit_sem_composicao': bool}}. Quantidade do kit × qtd da peça no kit.
+    Kit sem composição entra como ele mesmo, marcado.
+    """
+    out = {}
+    for sku, qtd in vendas_qtd:
+        qtd = float(qtd or 0)
+        for peca, q in pecas_do_sku(sku, comp):
+            v = out.setdefault(peca, {'sozinha': 0.0, 'em_kit': 0.0, 'total': 0.0,
+                                      'kits': set(), 'skus': set(),
+                                      'kit_sem_composicao': False})
+            if sku in comp:
+                v['em_kit'] += qtd * q
+                v['kits'].add(sku)
+            else:
+                v['sozinha'] += qtd
+                v['kit_sem_composicao'] |= sku in sem_comp
+            v['total'] += qtd * q
+            v['skus'].add(sku)
+    return out
+
+
 def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
            prazo=PRAZO_REPOSICAO_PADRAO):
     """
@@ -205,13 +431,11 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
       avisos: dict de listas para a tela.
     """
     mapa = mapa or {}
-    comp = {}
-    for kit, peca, qtd in composicao:
-        comp.setdefault(kit, {})[peca] = int(qtd)
-    sem_comp = {mapa.get(k, k) for k in kits_pendentes} | set(kits_pendentes)
+    comp = agrupar_composicao(composicao)
+    sem_comp = kits_sem_composicao(kits_pendentes, mapa)
 
     def _pecas_de(sku):
-        return comp[sku].items() if sku in comp else [(sku, 1)]
+        return pecas_do_sku(sku, comp)
 
     p = {}
 
@@ -252,18 +476,16 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
             reg['galpao_lojas'].setdefault(loja, set()).add(int(galpao))
 
     # ---- venda -----------------------------------------------------------
-    receita_sku = {}
-    for sku, q7, q30, rec in vendas:
-        receita_sku[sku] = float(rec or 0)
-        for peca, q in _pecas_de(sku):
-            reg = _p(peca)
-            reg['qtd_7d'] += float(q7 or 0) * q
-            reg['qtd_30d'] += float(q30 or 0) * q
-            reg['skus_dependentes'].add(sku)
-            if sku in comp:
-                reg['kits'].add(sku)
-            elif sku in sem_comp:
-                reg['vem_de_kit_sem_comp'] = True
+    receita_sku = {sku: float(rec or 0) for sku, _q7, _q30, rec in vendas}
+    v7 = venda_em_peca([(s, q7) for s, q7, _q30, _r in vendas], comp, sem_comp)
+    v30 = venda_em_peca([(s, q30) for s, _q7, q30, _r in vendas], comp, sem_comp)
+    for peca, v in v30.items():
+        reg = _p(peca)
+        reg['qtd_30d'] += v['total']
+        reg['qtd_7d'] += v7.get(peca, {}).get('total', 0.0)
+        reg['skus_dependentes'] |= v['skus']
+        reg['kits'] |= v['kits']
+        reg['vem_de_kit_sem_comp'] |= v['kit_sem_composicao']
     for sku in {r[2] for r in estoque} & sem_comp:
         _p(sku)['vem_de_kit_sem_comp'] = True
 
