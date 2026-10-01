@@ -333,9 +333,11 @@ def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
     unidades: receita/margem por peça ficam fora (rateio do kit misto). Nenhum
     total que some peças diferentes.
     """
-    st.caption("Venda do kit × quantidade da peça na composição (🧩 Kits em Gestão de "
-               "SKUs) + a peça vendida sozinha. Só unidades: receita e margem continuam "
-               "por SKU vendido.")
+    st.caption("Unidades: venda do kit × quantidade da peça na composição (🧩 Kits em "
+               "Gestão de SKUs) + a peça vendida sozinha. Receita e margem: a da peça "
+               "sozinha entra inteira; a do kit é RATEADA entre as peças pelo peso do "
+               "custo (custo da peça × qtd ÷ soma do kit), o mesmo custo que a venda usa. "
+               "Soma das peças = soma das vendas, ao centavo.")
     limit = st.slider("Top N", min_value=10, max_value=200, value=50, step=10,
                       key="mv_peca_limit")
     if data_ini is None or data_fim is None or data_fim < data_ini:
@@ -350,8 +352,13 @@ def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
             composicao, pendentes, mapa = estoque_peca.ler_composicao(conn)
             comp = estoque_peca.agrupar_composicao(composicao)
             venda = estoque_peca.venda_em_peca(
-                vendas, comp, estoque_peca.kits_sem_composicao(pendentes, mapa))
-            df = estoque_peca.tabela_por_peca(venda)
+                [(s, q) for s, q, _r, _m in vendas], comp,
+                estoque_peca.kits_sem_composicao(pendentes, mapa))
+            pecas_dos_kits = {p for s, *_ in vendas if s in comp for p in comp[s]}
+            custos = estoque_peca.ler_custos(conn, pecas_dos_kits)
+            valores, por_quantidade = estoque_peca.valor_em_peca(
+                [(s, r, m) for s, _q, r, m in vendas], comp, custos)
+            df = estoque_peca.tabela_por_peca(venda, valores=valores)
             nomes = estoque_peca.ler_nomes(conn, set(df['peca']))
         finally:
             conn.close()
@@ -362,9 +369,15 @@ def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
         st.info("Nenhuma venda encontrada para os filtros selecionados.")
         return
 
-    c1, c2 = st.columns(2)
+    # Cards: contagem de peças e R$ (somar R$ entre peças pode; unidades não).
+    receita = float(df['receita_total'].sum())
+    margem = float(df['margem'].sum())
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Peças com venda", _fmt_int(len(df)))
     c2.metric("Peças vendidas também dentro de kit", _fmt_int((df['em_kit'] > 0).sum()))
+    c3.metric("Receita", _fmt_brl(receita))
+    c4.metric("Margem", _fmt_brl(margem),
+              _fmt_pct(margem / receita * 100) if receita else None, delta_color="off")
 
     top = df.head(limit)
     st.dataframe(pd.DataFrame({
@@ -374,9 +387,20 @@ def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
         'Dentro de kit': top['em_kit'].map(_fmt_int),
         'Total (peças)': top['total'].map(_fmt_int),
         '% em kit': top['pct_em_kit'].map(lambda v: f"{v * 100:.0f}%"),
+        'Receita sozinha': top['receita_sozinha'].map(lambda v: _fmt_brl(float(v))),
+        'Receita em kit (rateada)': top['receita_kit'].map(lambda v: _fmt_brl(float(v))),
+        'Receita total': top['receita_total'].map(lambda v: _fmt_brl(float(v))),
+        'Margem R$': top['margem'].map(lambda v: _fmt_brl(float(v))),
+        'Margem %': top['margem_pct'].map(
+            lambda v: '—' if v is None else _fmt_pct(float(v) * 100)),
         'Kits que venderam': top['qtd_kits'],
         'Aviso': top['kit_sem_composicao'].map(lambda v: 'kit sem composição' if v else ''),
     }), use_container_width=True, hide_index=True)
+
+    if por_quantidade:
+        st.warning("Rateio por QUANTIDADE (alguma peça sem custo, zero ou inválido) "
+                   "nestes kits: " + ', '.join(por_quantidade)
+                   + ". Cadastre o custo da peça em Gestão de SKUs para ratear pelo custo.")
 
     sem = list(df.loc[df['kit_sem_composicao'], 'peca'])
     if sem:
@@ -384,7 +408,11 @@ def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
                    "como ele mesmo: " + ', '.join(sem))
 
     buf = io.BytesIO()
-    df.assign(kits=df['kits'].map(', '.join)).to_excel(buf, index=False, sheet_name='PorPeca')
+    df.assign(kits=df['kits'].map(', '.join),
+              **{c: df[c].map(float) for c in ['receita_sozinha', 'receita_kit',
+                                                'receita_total', 'margem']},
+              margem_pct=df['margem_pct'].map(lambda v: None if v is None else float(v))
+              ).to_excel(buf, index=False, sheet_name='PorPeca')
     st.download_button("⬇️ Baixar Excel completo", data=buf.getvalue(),
                        file_name=f"mais_vendidos_por_peca_{data_ini}_{data_fim}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
