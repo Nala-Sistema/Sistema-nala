@@ -198,6 +198,16 @@ class CorrecaoDeSku(unittest.TestCase):
         self.assertEqual(p['novos'], [])
         self.assertEqual(len(p['recusados']), 2)
 
+    def test_duas_pecas_do_mesmo_kit_que_viram_o_mesmo_sku_recusam_o_kit(self):
+        # L-320 corrige para L-0320, que já é a outra peça do kit: somar ou
+        # escolher uma das quantidades seria adivinhar. O kit inteiro sai.
+        p = kc.planejar({'K2-L-0320': {'L-320': 1, 'L-0320': 2}}, self.CAD, {}, {},
+                        mapa={'L-320': 'L-0320'})
+        self.assertEqual(p['novos'], [])
+        self.assertEqual(p['pendentes'], [])
+        self.assertEqual([k for k, _ in p['recusados']], ['K2-L-0320'])
+        self.assertIn('duas peças viram o mesmo SKU L-0320', p['recusados'][0][1][0])
+
     def test_pendente_renomeado_sai_do_nome_antigo(self):
         # K-A corrigido para K-B, que segue sem cadastro: sai como K-A, volta como K-B.
         p = kc.planejar({'K-A': {'L-0320': 1}}, self.CAD, {}, {'K-A': {'L-0320': 1}},
