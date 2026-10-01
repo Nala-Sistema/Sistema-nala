@@ -154,19 +154,80 @@ def texto_composicao(comp):
 # PLANO (sem banco): o que a carga faria
 # ============================================================
 
-def planejar(kits, cadastro, atual, pendentes_atuais, recusados_arquivo=None):
+def traduzir(kits, mapa):
     """
-    kits: {kit: {peca: qtd}} a carregar.
+    Aplica as correções de dim_sku_mapeamento (sku_errado -> sku_correto) no
+    kit e na peça. UM salto só, igual às vendas: A->X->B vira X.
+    Só correção registrada por gente; nada é deduzido do nome.
+
+    Devolve (kits_oficiais, traducoes, recusados): traducoes = {(original,
+    oficial)}; recusados = {kit original: [motivos]} quando a correção junta
+    dois kits ou duas peças num SKU só (o arquivo ficaria ambíguo).
+    """
+    def _um(sku):
+        return mapa.get(sku, sku)
+
+    traducoes, recusados, por_oficial = set(), {}, {}
+    for kit, comp in kits.items():
+        oficial = _um(kit)
+        if oficial != kit:
+            traducoes.add((kit, oficial))
+        nova = {}
+        for peca, qtd in comp.items():
+            p = _um(peca)
+            if p != peca:
+                traducoes.add((peca, p))
+            if p in nova:
+                recusados.setdefault(kit, []).append(
+                    f'duas peças viram o mesmo SKU {p} pela correção de SKU')
+            nova[p] = qtd
+        if kit not in recusados:
+            por_oficial.setdefault(oficial, []).append((kit, nova))
+
+    oficiais = {}
+    for oficial, origens in por_oficial.items():
+        if len(origens) > 1:
+            nomes = ', '.join(sorted(k for k, _ in origens))
+            for k, _ in origens:
+                recusados.setdefault(k, []).append(
+                    f'{nomes} viram o mesmo kit {oficial} pela correção de SKU')
+            continue
+        oficiais[oficial] = origens[0][1]
+    return oficiais, traducoes, recusados
+
+
+def planejar(kits, cadastro, atual, pendentes_atuais, recusados_arquivo=None,
+             mapa=None):
+    """
+    kits: {kit: {peca: qtd}} a carregar, com o SKU como veio do arquivo.
     cadastro: set dos SKUs de dim_produtos (comparação EXATA).
     atual: {kit: {peca: qtd}} em vigor em dim_kit_composicao.
     pendentes_atuais: {kit: {peca: qtd}} em dim_kit_composicao_pendente.
+    mapa: {sku_errado: sku_correto} de dim_sku_mapeamento (um salto só).
 
     Devolve um dict só com listas ordenadas e tuplas (comparável: a gravação
     refaz o plano e compara com o da prévia).
     """
+    mapa = mapa or {}
     recusados = {k: list(v) for k, v in (recusados_arquivo or {}).items()}
+    kits_brutos = kits
+    kits, traducoes, recusados_trad = traduzir(kits, mapa)
+    for k, motivos in recusados_trad.items():
+        recusados.setdefault(k, []).extend(motivos)
+    avisos = {}
+    for original, oficial in traducoes:
+        aviso = []
+        if oficial in mapa:
+            aviso.append(f'{oficial} também tem correção ({mapa[oficial]}): '
+                         'aplicado um salto só')
+        if oficial not in cadastro:
+            aviso.append(f'{oficial} não está no cadastro')
+        avisos[(original, oficial)] = '; '.join(aviso)
+
+    # Pendência guardada com o SKU de antes da correção: lida pelo oficial.
+    pend_oficial = {mapa.get(k, k): k for k in pendentes_atuais}
     # Kit à espera de cadastro também é kit: não pode entrar como peça.
-    kits_conhecidos = set(kits) | set(atual) | set(pendentes_atuais)
+    kits_conhecidos = set(kits) | set(atual) | set(pend_oficial)
     # peça -> kits EM VIGOR que a contêm (fora os que o arquivo substitui)
     pai_em_vigor = {}
     for k, comp in atual.items():
@@ -203,10 +264,16 @@ def planejar(kits, cadastro, atual, pendentes_atuais, recusados_arquivo=None):
         else:
             iguais.append(kit)
 
-    no_arquivo = set(kits) | set(recusados)
+    no_arquivo = set(kits) | set(kits_brutos) | set(recusados)
     ausentes = sorted(k for k in atual if k not in no_arquivo)
     entram = {k for k, _ in novos} | {k for k, _, _ in alterados} | set(iguais)
-    pendencias_resolvidas = sorted(k for k in pendentes_atuais if k in entram)
+    kits_pend = {k for k, *_ in pendentes}
+    # Saem da tabela de pendências: as que entraram, e as guardadas com o SKU
+    # de antes da correção que continuam pendentes (voltam com o oficial).
+    pendencias_resolvidas = sorted(k for k in pendentes_atuais
+                                   if mapa.get(k, k) in entram)
+    pendencias_renomeadas = sorted(k for k in pendentes_atuais
+                                   if mapa.get(k, k) != k and mapa.get(k, k) in kits_pend)
 
     return {
         'novos': novos,
@@ -216,12 +283,14 @@ def planejar(kits, cadastro, atual, pendentes_atuais, recusados_arquivo=None):
         'ausentes': ausentes,
         'recusados': sorted((k, tuple(v)) for k, v in recusados.items()),
         'pendencias_resolvidas': pendencias_resolvidas,
+        'pendencias_renomeadas': pendencias_renomeadas,
+        'traducoes': sorted((o, f, avisos[(o, f)]) for o, f in traducoes),
     }
 
 
 def tem_o_que_gravar(plano):
     return bool(plano['novos'] or plano['alterados'] or plano['pendentes']
-                or plano['pendencias_resolvidas'])
+                or plano['pendencias_resolvidas'] or plano['pendencias_renomeadas'])
 
 
 # ============================================================
@@ -305,10 +374,42 @@ SQL_APAGAR_PECAS_PENDENTES_QUE_SAIRAM = """
             WHERE n.kit_sku = c.kit_sku AND n.peca_sku = c.peca_sku)
 """
 
+# Correções de SKU registradas por gente (mesma tabela das vendas).
+SQL_MAPEAMENTO = "SELECT sku_errado, sku_correto FROM dim_sku_mapeamento"
+
+SQL_MAPEAMENTO_DE = """
+    SELECT sku_correto FROM dim_sku_mapeamento WHERE sku_errado = %(sku_errado)s
+"""
+
+# DO NOTHING de propósito: dim_sku_mapeamento também é lida pelo coletor de
+# vendas e pela aba Vendas Pendentes; correção existente nunca é trocada daqui.
+SQL_GRAVAR_MAPEAMENTO = """
+    INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto, data_criacao)
+    VALUES (%(sku_errado)s, %(sku_correto)s, now())
+    ON CONFLICT (sku_errado) DO NOTHING
+"""
+
+# Venda dos últimos 90 dias: snapshot (venda oficial) + vendas ainda
+# pendentes (SKU sem cadastro, fora do snapshot). Reprocessada não conta de
+# novo: já está no snapshot.
+SQL_VENDAS_90D = """
+    SELECT sku, SUM(receita) AS receita, SUM(qtd) AS qtd
+      FROM (SELECT sku, valor_venda_efetivo AS receita, quantidade AS qtd
+              FROM fact_vendas_snapshot
+             WHERE sku = ANY(%(skus)s) AND data_venda >= CURRENT_DATE - 90
+            UNION ALL
+            SELECT sku, valor_venda_efetivo, quantidade
+              FROM fact_vendas_pendentes
+             WHERE sku = ANY(%(skus)s) AND data_venda >= CURRENT_DATE - 90
+               AND status = 'Pendente') v
+     GROUP BY sku
+"""
+
 TODAS_AS_SQL = (SQL_TRAVAR, SQL_CADASTRO, SQL_COMPOSICAO, SQL_PENDENTES,
                 SQL_GRAVAR_COMPOSICAO, SQL_APAGAR_PECAS_QUE_SAIRAM,
                 SQL_APAGAR_PENDENTES, SQL_GRAVAR_PENDENTES,
-                SQL_APAGAR_PECAS_PENDENTES_QUE_SAIRAM)
+                SQL_APAGAR_PECAS_PENDENTES_QUE_SAIRAM, SQL_MAPEAMENTO,
+                SQL_MAPEAMENTO_DE, SQL_GRAVAR_MAPEAMENTO, SQL_VENDAS_90D)
 
 
 class PreviaDesatualizada(Exception):
@@ -323,23 +424,32 @@ def _agrupar(linhas):
 
 
 def ler_estado(cur, kits):
-    """(cadastro, atual, pendentes_atuais, arquivo_por_pendente) do banco."""
+    """
+    (cadastro, atual, pendentes_atuais, arquivo_por_pendente, mapa) do banco.
+    O cadastro cobre o SKU do arquivo e o SKU para onde a correção aponta.
+    """
     cur.execute(SQL_COMPOSICAO)
     atual = _agrupar(cur.fetchall())
     cur.execute(SQL_PENDENTES)
     rows = cur.fetchall()
     pendentes_atuais = _agrupar((k, p, q) for k, p, q, _ in rows)
     arquivo_pendente = {k: a for k, _, _, a in rows}
+    cur.execute(SQL_MAPEAMENTO)
+    mapa = {a: b for a, b in cur.fetchall()}
     skus = set(kits) | {p for c in kits.values() for p in c}
+    skus |= {mapa[s] for s in skus if s in mapa}
     cadastro = set()
     if skus:
         cur.execute(SQL_CADASTRO, {'skus': sorted(skus)})
         cadastro = {r[0] for r in cur.fetchall()}
-    return cadastro, atual, pendentes_atuais, arquivo_pendente
+    return cadastro, atual, pendentes_atuais, arquivo_pendente, mapa
 
 
 def _aplicar(cur, plano, arquivo_por_kit, usuario):
-    """Grava o plano. Chamar dentro da transação, depois de SQL_TRAVAR."""
+    """
+    Grava o plano. Chamar dentro da transação, depois de SQL_TRAVAR.
+    arquivo_por_kit: {kit oficial: arquivo}.
+    """
     entram = [(k, dict(c)) for k, c in plano['novos']]
     entram += [(k, dict(depois)) for k, _, depois in plano['alterados']]
     linhas = [(k, p, q, arquivo_por_kit[k]) for k, c in entram for p, q in sorted(c.items())]
@@ -354,8 +464,9 @@ def _aplicar(cur, plano, arquivo_por_kit, usuario):
     # Pendências: as que resolveram saem inteiras; as do plano são gravadas
     # por upsert (guardam o registrado_em) e perdem a peça que saiu do kit.
     kits_pend = [k for k, *_ in plano['pendentes']]
-    if plano['pendencias_resolvidas']:
-        cur.execute(SQL_APAGAR_PENDENTES, {'kits': plano['pendencias_resolvidas']})
+    sair = sorted(set(plano['pendencias_resolvidas']) | set(plano['pendencias_renomeadas']))
+    if sair:
+        cur.execute(SQL_APAGAR_PENDENTES, {'kits': sair})
     linhas_p = []
     for kit, comp, kit_ok, pecas_sem, _ in plano['pendentes']:
         for peca, qtd in comp:
@@ -377,8 +488,8 @@ def previa(conn, kits, recusados):
     """Plano da carga, só leitura."""
     cur = conn.cursor()
     try:
-        cadastro, atual, pend, _ = ler_estado(cur, kits)
-        return planejar(kits, cadastro, atual, pend, recusados)
+        cadastro, atual, pend, _, mapa = ler_estado(cur, kits)
+        return planejar(kits, cadastro, atual, pend, recusados, mapa)
     finally:
         cur.close()
         conn.rollback()
@@ -393,13 +504,14 @@ def gravar(conn, kits, recusados, arquivo, usuario, plano_da_previa):
     try:
         cur.execute("SET LOCAL lock_timeout = '5s'")
         cur.execute(SQL_TRAVAR)
-        cadastro, atual, pend, _ = ler_estado(cur, kits)
-        plano = planejar(kits, cadastro, atual, pend, recusados)
+        cadastro, atual, pend, _, mapa = ler_estado(cur, kits)
+        plano = planejar(kits, cadastro, atual, pend, recusados, mapa)
         if plano != plano_da_previa:
             raise PreviaDesatualizada(
-                'O cadastro ou a composição mudaram desde a prévia. '
-                'Nada foi gravado; confira a prévia de novo.')
-        resumo = _aplicar(cur, plano, {k: arquivo for k in kits}, usuario)
+                'O cadastro, a composição ou as correções de SKU mudaram desde a '
+                'prévia. Nada foi gravado; confira a prévia de novo.')
+        oficiais = {mapa.get(k, k) for k in kits}
+        resumo = _aplicar(cur, plano, {k: arquivo for k in oficiais}, usuario)
         conn.commit()
         return resumo
     except Exception:
@@ -421,13 +533,15 @@ def reprocessar_pendentes(conn, usuario):
         cur.execute(SQL_PENDENTES)
         rows = cur.fetchall()
         kits = _agrupar((k, p, q) for k, p, q, _ in rows)
-        cadastro, atual, pend, arquivo_pendente = ler_estado(cur, kits)
-        plano = planejar(kits, cadastro, atual, pend)
+        cadastro, atual, pend, arquivo_pendente, mapa = ler_estado(cur, kits)
+        plano = planejar(kits, cadastro, atual, pend, mapa=mapa)
         # Na releitura das pendências não há "ausente": o que não foi
         # reprocessado continua pendente, e composição em vigor não se mexe.
         plano['ausentes'] = []
-        resumo = _aplicar(cur, plano, arquivo_pendente, usuario)
+        arquivos = {mapa.get(k, k): a for k, a in arquivo_pendente.items()}
+        resumo = _aplicar(cur, plano, arquivos, usuario)
         resumo['recusados'] = plano['recusados']
+        resumo['traducoes'] = plano['traducoes']
         conn.commit()
         return resumo
     except Exception:
@@ -435,6 +549,68 @@ def reprocessar_pendentes(conn, usuario):
         raise
     finally:
         cur.close()
+
+
+def corrigir_sku(conn, sku_errado, sku_correto):
+    """
+    Registra sku_errado -> sku_correto em dim_sku_mapeamento (a mesma tabela
+    das vendas). Devolve (gravou, mensagem). Nunca troca correção existente.
+
+    Recusa:
+      - sku_correto fora do cadastro;
+      - sku_errado que ESTÁ no cadastro: a correção desviaria as vendas dele
+        (o coletor e o upload aplicam a mesma tabela);
+      - sku_errado que já tem correção (mostra a que existe).
+    """
+    errado, correto = normalizar_sku(sku_errado), normalizar_sku(sku_correto)
+    if not errado or not correto:
+        return False, 'Informe o SKU do UpSeller e o SKU do cadastro.'
+    if errado == correto:
+        return False, 'Os dois SKUs são iguais: não há o que corrigir.'
+    gravou = False
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_CADASTRO, {'skus': [errado, correto]})
+        cadastrados = {r[0] for r in cur.fetchall()}
+        if correto not in cadastrados:
+            return False, (f'{correto} não está no cadastro. Cadastre em ⚙️ Gerenciar SKU '
+                           'ou confira a grafia (maiúscula/minúscula conta).')
+        if errado in cadastrados:
+            return False, (f'{errado} está cadastrado: uma correção desviaria as vendas '
+                           'dele para outro SKU. Nada foi gravado.')
+        cur.execute(SQL_MAPEAMENTO_DE, {'sku_errado': errado})
+        existe = cur.fetchone()
+        if existe:
+            return False, (f'{errado} já tem correção registrada: → {existe[0]}. '
+                           'Ela também vale para as vendas, por isso não é trocada daqui.')
+        cur.execute(SQL_MAPEAMENTO_DE, {'sku_errado': correto})
+        cadeia = cur.fetchone()
+        cur.execute(SQL_GRAVAR_MAPEAMENTO, {'sku_errado': errado, 'sku_correto': correto})
+        if cur.rowcount == 0:       # outra sessão gravou no meio
+            return False, f'{errado} acabou de ganhar correção em outra tela. Recarregue.'
+        conn.commit()
+        gravou = True
+        aviso = (f' Atenção: {correto} também tem correção (→ {cadeia[0]}); vale um '
+                 'salto só.' if cadeia else '')
+        return True, (f'Correção registrada: {errado} → {correto}. Vale também para '
+                      f'vendas que chegarem com {errado}.{aviso}')
+    finally:
+        cur.close()
+        if not gravou:          # recusa, erro ou corrida: nada fica aberto
+            conn.rollback()
+
+
+def vendas_90d(conn, skus):
+    """{sku: (receita, qtd)} dos últimos 90 dias (snapshot + pendentes)."""
+    if not skus:
+        return {}
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_VENDAS_90D, {'skus': sorted(set(skus))})
+        return {s: (float(r or 0), int(q or 0)) for s, r, q in cur.fetchall()}
+    finally:
+        cur.close()
+        conn.rollback()
 
 
 # ============================================================
@@ -455,6 +631,15 @@ def _render_previa(plano):
     c[3].metric("Pendentes (cadastro)", len(plano['pendentes']))
     c[4].metric("No banco, fora do arquivo", len(plano['ausentes']))
     c[5].metric("Recusados", len(plano['recusados']))
+
+    if plano['traducoes']:
+        with st.expander(f"🔁 SKU corrigido pelas correções registradas "
+                         f"({len(plano['traducoes'])})", expanded=True):
+            st.caption("Correções de dim_sku_mapeamento (as mesmas das vendas), um "
+                       "salto só. Nada é deduzido do nome.")
+            st.dataframe(_tabela([(o, f, a or '—') for o, f, a in plano['traducoes']],
+                                 ['No UpSeller', 'No sistema', 'Aviso']),
+                         use_container_width=True, hide_index=True)
 
     if plano['alterados']:
         with st.expander(f"✏️ Composição alterada ({len(plano['alterados'])}) — confira",
@@ -494,8 +679,9 @@ def _render_pendencias(engine, usuario):
 
     st.markdown("### ⏳ Pendências de kit")
     st.caption("Kits do export que esperam cadastro do kit ou de alguma peça. "
-               "Cadastre o SKU em **⚙️ Gerenciar SKU** (exatamente como no UpSeller) "
-               "e clique em Reprocessar. O kit só entra inteiro.")
+               "Cadastre o SKU em **⚙️ Gerenciar SKU**, ou, se o SKU do UpSeller só está "
+               "escrito diferente do sistema, use **Corrigir SKU** abaixo. Depois clique "
+               "em Reprocessar. O kit só entra inteiro.")
     df = pd.read_sql(
         """SELECT kit_sku, peca_sku, quantidade, kit_cadastrado, peca_cadastrada,
                   arquivo_origem, registrado_em
@@ -503,18 +689,54 @@ def _render_pendencias(engine, usuario):
     if df.empty:
         st.success("Nenhuma pendência.")
         return
-    resumo = []
+
+    # Venda de 90 dias do kit: pelo SKU guardado e pelo da correção, se houver
+    # (a venda chega com o SKU oficial).
+    mapa = dict(pd.read_sql(SQL_MAPEAMENTO, engine).values.tolist())
+    kits = sorted(df['kit_sku'].unique())
+    conn = engine.raw_connection()
+    try:
+        vendas = vendas_90d(conn, set(kits) | {mapa[k] for k in kits if k in mapa})
+    finally:
+        conn.close()
+
+    resumo, sem_cadastro = [], {}
     for kit, g in df.groupby('kit_sku', sort=True):
-        falta = [] if g['kit_cadastrado'].iloc[0] else [f'{kit} (o kit)']
+        falta = [] if g['kit_cadastrado'].iloc[0] else [kit]
         falta += list(g.loc[~g['peca_cadastrada'], 'peca_sku'])
+        receita = sum(vendas.get(s, (0, 0))[0] for s in {kit, mapa.get(kit, kit)})
+        qtd = sum(vendas.get(s, (0, 0))[1] for s in {kit, mapa.get(kit, kit)})
+        for s in falta:
+            sem_cadastro[s] = max(sem_cadastro.get(s, 0), receita)
         resumo.append({
             'Kit': kit,
             'Composição': texto_composicao(dict(zip(g['peca_sku'], g['quantidade']))),
             'Falta cadastrar': ', '.join(falta) or '(só reprocessar)',
+            'Vendas 90d (R$)': receita,
+            'Kits vendidos 90d': qtd,
             'Desde': pd.to_datetime(g['registrado_em'].min()).strftime('%d/%m/%Y'),
             'Arquivo': g['arquivo_origem'].iloc[0],
         })
-    st.dataframe(pd.DataFrame(resumo), use_container_width=True, hide_index=True)
+    tab = pd.DataFrame(resumo).sort_values(['Vendas 90d (R$)', 'Kit'],
+                                           ascending=[False, True])
+    com_venda = tab[tab['Vendas 90d (R$)'] > 0]
+    parados = tab[tab['Vendas 90d (R$)'] <= 0]
+
+    def _brl(v):
+        return 'R$ ' + f'{v:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+    st.markdown(f"**🔥 Com venda nos últimos 90 dias ({len(com_venda)})** — resolver primeiro")
+    if com_venda.empty:
+        st.caption("Nenhum kit pendente vendeu nos últimos 90 dias.")
+    else:
+        st.dataframe(com_venda.assign(**{'Vendas 90d (R$)': com_venda['Vendas 90d (R$)'].map(_brl)}),
+                     use_container_width=True, hide_index=True)
+    with st.expander(f"💤 Sem venda em 90 dias ({len(parados)})"):
+        st.dataframe(parados.drop(columns=['Vendas 90d (R$)', 'Kits vendidos 90d']),
+                     use_container_width=True, hide_index=True)
+
+    _render_corrigir_sku(engine, sem_cadastro, mapa)
+
     if st.button("🔄 Reprocessar pendências", key="kits_reprocessar"):
         conn = engine.raw_connection()
         try:
@@ -526,9 +748,42 @@ def _render_pendencias(engine, usuario):
             conn.close()
         st.success(f"✅ {r['novos'] + r['alterados']} kit(s) entraram na composição; "
                    f"{r['pendentes']} continuam pendentes.")
+        if r['traducoes']:
+            st.info("SKU corrigido: " + '; '.join(
+                f"{o} → {f}" + (f" ({a})" if a else '') for o, f, a in r['traducoes']))
         if r['recusados']:
             st.warning("Recusados (continuam pendentes): "
                        + '; '.join(f"{k}: {' / '.join(m)}" for k, m in r['recusados']))
+
+
+def _render_corrigir_sku(engine, sem_cadastro, mapa):
+    """Padrão de Vendas Pendentes: o SKU do UpSeller aponta para o do sistema."""
+    import streamlit as st
+
+    opcoes = [s for s, _ in sorted(sem_cadastro.items(), key=lambda x: (-x[1], x[0]))
+              if s not in mapa]
+    with st.expander("✏️ Corrigir SKU (o UpSeller escreve diferente do sistema)"):
+        st.caption("Grava em dim_sku_mapeamento, a MESMA tabela das correções de "
+                   "vendas: vale para a carga de kits E para vendas que chegarem com "
+                   "esse SKU. Correção existente nunca é trocada daqui.")
+        if not opcoes:
+            st.caption("Nenhum SKU pendente sem correção.")
+            return
+        with st.form("kits_corrigir_sku"):
+            errado = st.selectbox("SKU como está no UpSeller (sem cadastro)", opcoes,
+                                  key="kits_sku_errado")
+            correto = st.text_input("SKU no sistema (tem de estar cadastrado)",
+                                    key="kits_sku_correto")
+            enviar = st.form_submit_button("Registrar correção")
+        if enviar:
+            conn = engine.raw_connection()
+            try:
+                ok, msg = corrigir_sku(conn, errado, correto)
+            finally:
+                conn.close()
+            (st.success if ok else st.warning)(msg)
+            if ok:
+                st.info("Agora clique em 🔄 Reprocessar pendências.")
 
 
 def _render_composicao(engine):
