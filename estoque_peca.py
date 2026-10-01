@@ -80,6 +80,28 @@ SQL_VENDAS = """
      GROUP BY sku
 """
 
+# Quantos estoques cada loja tem no último dia e no anterior: foto parcial
+# (coleta que parou no meio) some com estoque sem erro nenhum.
+SQL_CONTAGEM_DIAS = """
+    WITH d AS (
+        SELECT loja, data, count(*) AS n
+          FROM fact_estoque_diario
+         WHERE marketplace = %(marketplace)s
+         GROUP BY loja, data),
+    r AS (
+        SELECT loja, data, n,
+               row_number() OVER (PARTITION BY loja ORDER BY data DESC) AS k
+          FROM d)
+    SELECT loja,
+           max(n)    FILTER (WHERE k = 1) AS n_ultimo,
+           max(data) FILTER (WHERE k = 1) AS ultimo,
+           max(n)    FILTER (WHERE k = 2) AS n_anterior,
+           max(data) FILTER (WHERE k = 2) AS anterior
+      FROM r
+     WHERE k <= 2
+     GROUP BY loja
+"""
+
 SQL_COMPOSICAO = "SELECT kit_sku, peca_sku, quantidade FROM dim_kit_composicao"
 
 SQL_KITS_PENDENTES = "SELECT DISTINCT kit_sku FROM dim_kit_composicao_pendente"
@@ -89,7 +111,9 @@ SQL_MAPEAMENTO = "SELECT sku_errado, sku_correto FROM dim_sku_mapeamento"
 SQL_NOMES = "SELECT sku, nome FROM dim_produtos WHERE sku = ANY(%(skus)s)"
 
 TODAS_AS_SQL = (SQL_ESTOQUE, SQL_VENDAS, SQL_COMPOSICAO, SQL_KITS_PENDENTES,
-                SQL_MAPEAMENTO, SQL_NOMES)
+                SQL_MAPEAMENTO, SQL_NOMES, SQL_CONTAGEM_DIAS)
+
+QUEDA_FOTO_PARCIAL = 0.20
 
 
 def params_vendas(hoje):
@@ -122,6 +146,26 @@ def ler(conn, hoje):
     finally:
         cur.close()
         conn.rollback()
+
+
+def ler_contagens(conn):
+    """[(loja, n_ultimo, ultimo, n_anterior, anterior)]. Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_CONTAGEM_DIAS, {'marketplace': MARKETPLACE})
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def fotos_parciais(contagens, queda=QUEDA_FOTO_PARCIAL):
+    """Lojas cujo último dia tem bem menos estoques que o anterior (já houve:
+    ML-Nala 25/09 com 15 linhas, ML-YanniRJ 25/09 com 2). A foto é usada
+    assim mesmo; a tela avisa que pode faltar estoque."""
+    return [(loja, n_ult, ult, n_ant, ant)
+            for loja, n_ult, ult, n_ant, ant in contagens
+            if n_ant and n_ult < (1 - queda) * n_ant]
 
 
 def ler_nomes(conn, skus):
@@ -180,8 +224,13 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
     # ---- estoque ---------------------------------------------------------
     galpao_kit = {}       # kit -> maior galpão publicado (fora o prep center)
     datas_loja = {}
-    # SKU do anúncio passa pela mesma correção das vendas (um salto só).
-    estoque = [(l, e, mapa.get(s, s), d, f, t, g) for l, e, s, d, f, t, g in estoque]
+    # SKU do anúncio passa pela mesma correção das vendas (um salto só), e só
+    # DEPOIS o estoque é contado uma vez: um anúncio com o SKU errado e outro
+    # com o certo no mesmo estoque_id viram uma linha, não duas (Full dobrado).
+    unicos = {}
+    for l, e, s, d, f, t, g in estoque:
+        unicos.setdefault((l, e, mapa.get(s, s)), (l, e, mapa.get(s, s), d, f, t, g))
+    estoque = list(unicos.values())
     for loja, _eid, sku, data, full, transf, galpao in estoque:
         datas_loja[loja] = data
         for peca, q in _pecas_de(sku):
@@ -342,7 +391,7 @@ def _tabela_tela(df, nomes):
         'Produto': df['peca'].map(lambda s: nomes.get(s) or '(sem cadastro)'),
         'Galpão': df.apply(texto_galpao, axis=1),
         'Full ML (peças)': df['full'].map(_int),
-        'Em transferência': df['transferencia'].map(_int),
+        'Em transferência (fora da cobertura)': df['transferencia'].map(_int),
         'Prep center SP': df['prep_center'].map(lambda v: '—' if pd.isna(v) else _int(v)),
         'Venda/dia 7d': df['venda_dia_7d'].map(lambda v: f'{v:.1f}'),
         'Venda/dia 30d': df['venda_dia_30d'].map(lambda v: f'{v:.1f}'),
@@ -363,7 +412,9 @@ def render(engine):
         "Estoque da API do Mercado Livre, em UNIDADES DE PEÇA: o Full de cada kit vira "
         "peças pela composição. Galpão só do anúncio da própria peça (o do kit vem "
         "dividido pelo UpSeller). Venda de todos os marketplaces, 30 dias até ontem. "
-        "O Full da Shopee e da Amazon ainda não entra: a cobertura é conservadora.")
+        "O Full da Shopee e da Amazon ainda não entra, e o que está EM TRANSFERÊNCIA "
+        "para o Full aparece em coluna própria mas não conta na cobertura: ela é "
+        "conservadora.")
 
     from permissoes import ve_todas_lojas
     if not ve_todas_lojas():
@@ -383,6 +434,7 @@ def render(engine):
         pecas, kits_por_peca, avisos = montar(estoque, vendas, composicao, pendentes,
                                               mapa, prazo)
         nomes = ler_nomes(conn, set(pecas['peca']) if not pecas.empty else set())
+        parciais = fotos_parciais(ler_contagens(conn))
     finally:
         conn.close()
     if pecas.empty:
@@ -396,6 +448,10 @@ def render(engine):
         st.warning(f"⚠️ Estoque atrasado em {', '.join(atrasadas)}. Foto usada: {datas}.")
     else:
         st.caption(f"Foto do estoque: {datas}.")
+    for loja, n_ult, ult, n_ant, ant in parciais:
+        st.warning(f"⚠️ Foto possivelmente PARCIAL em {loja}: {n_ult} estoques em "
+                   f"{pd.Timestamp(ult):%d/%m} contra {n_ant} em {pd.Timestamp(ant):%d/%m}. "
+                   "Pode faltar estoque dessa loja nesta tela.")
 
     if busca:
         b = busca.strip().lower()

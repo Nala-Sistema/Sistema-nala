@@ -147,12 +147,40 @@ class ContaEmPeca(unittest.TestCase):
                                    mapa={'LKE-3104': 'LKE-3104-4030'})
         self.assertEqual(list(pecas['peca']), ['LKE-3104-4030'])
 
+    def test_anuncio_de_sku_errado_e_certo_no_mesmo_estoque_conta_uma_vez(self):
+        # Ressalva 2 do auditor: o DISTINCT vem DEPOIS da correção de SKU.
+        pecas, _, _ = self._montar(
+            [(LPT, 'e2', 'K-10-LKE-3104-4030', D, 29, 0, 131),
+             (LPT, 'e2', 'K10-LKE-3104-4030', D, 29, 0, 131)],
+            mapa={'K-10-LKE-3104-4030': 'K10-LKE-3104-4030'})
+        self.assertEqual(_linha(pecas, 'LKE-3104-4030')['full'], 29 * 10)
+
+    def test_transferencia_fica_fora_da_cobertura(self):
+        pecas, _, _ = self._montar([(LPT, 'e1', 'L-0320', D, 0, 300, 30)],
+                                   vendas=[('L-0320', 7, 90, 900.0)])
+        self.assertAlmostEqual(_linha(pecas, 'L-0320')['cobertura_dias'], 10)
+        import inspect
+        self.assertIn('EM TRANSFERÊNCIA', inspect.getsource(ep.render))
+
     def test_nunca_existe_total_de_unidades(self):
         # A tela não soma unidades de peças diferentes: só contagens e R$.
         import inspect
         fonte = inspect.getsource(ep.render)
         self.assertNotIn("pecas['full'].sum()", fonte)
         self.assertNotIn("pecas['galpao'].sum()", fonte)
+
+
+class FotoParcial(unittest.TestCase):
+    def test_queda_forte_de_estoques_no_ultimo_dia_avisa(self):
+        contagens = [(NALA, 15, D, 338, date(2026, 9, 29)),     # caso real de 25/09
+                     (LPT, 301, D, 301, date(2026, 9, 29)),
+                     (RJ, 61, D, 75, date(2026, 9, 29)),         # -18,7%: tolera
+                     (SP, 12, D, None, None)]                    # sem dia anterior
+        self.assertEqual([c[0] for c in ep.fotos_parciais(contagens)], [NALA])
+
+    def test_limite_de_vinte_por_cento(self):
+        self.assertEqual(ep.fotos_parciais([(LPT, 79, D, 100, D)])[0][0], LPT)
+        self.assertEqual(ep.fotos_parciais([(LPT, 80, D, 100, D)]), [])
 
 
 class Datas(unittest.TestCase):
@@ -288,6 +316,21 @@ class ComBanco(unittest.TestCase):
         self.assertAlmostEqual(l['venda_dia_30d'], (30 + 30) / 30)
         self.assertAlmostEqual(l['em_jogo_30d'], 1500)
         self.assertEqual([k['Kit'] for k in kits['LKE-3104-4030']], ['K10-LKE-3104-4030'])
+
+    def test_contagem_dos_dois_ultimos_dias_por_loja(self):
+        c = dict((r[0], r[1:]) for r in ep.ler_contagens(self.c))
+        self.assertEqual(c[LPT], (2, D, 1, date(2026, 9, 29)))
+        self.assertEqual(c[NALA], (1, D, None, None))
+        self.assertNotIn('Shopee-LPT', c)
+
+    def test_sku_errado_e_certo_no_mesmo_estoque_pela_sql(self):
+        self.cur.execute("INSERT INTO dim_estoque_anuncio VALUES "
+                         "('MERCADO LIVRE', %s, 'MLB9', 'e2', 'K-10-LKE-3104-4030')", (LPT,))
+        self.cur.execute("INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto) "
+                         "VALUES ('K-10-LKE-3104-4030', 'K10-LKE-3104-4030')")
+        estoque, vendas, comp, pend, mapa = ep.ler(self.c, self.hoje)
+        pecas, _, _ = ep.montar(estoque, vendas, comp, pend, mapa)
+        self.assertEqual(_linha(pecas, 'LKE-3104-4030')['full'], 17 + 29 * 10)
 
     def test_nomes(self):
         self.cur.execute("INSERT INTO dim_produtos VALUES ('LKE-3104-4030', 'Bandeja 40x30')")
