@@ -170,6 +170,49 @@ class ContaEmPeca(unittest.TestCase):
         self.assertNotIn("pecas['galpao'].sum()", fonte)
 
 
+class MaisVendidosPorPeca(unittest.TestCase):
+    """3ª entrega: seletor SKU/peça em Mais Vendidos, só unidades."""
+    COMP = {'K2-L-0320': {'L-0320': 2}, 'K-MIX': {'L-0320': 1, 'L-0321': 1}}
+
+    def test_sozinha_dentro_de_kit_total_e_percentual(self):
+        v = ep.venda_em_peca([('L-0320', 1281), ('K2-L-0320', 1359), ('K-MIX', 10)],
+                             self.COMP)
+        self.assertEqual((v['L-0320']['sozinha'], v['L-0320']['em_kit'],
+                          v['L-0320']['total']), (1281, 2718 + 10, 3999 + 10))
+        df = ep.tabela_por_peca(v)
+        self.assertEqual(list(df['peca']), ['L-0320', 'L-0321'])
+        self.assertAlmostEqual(df.iloc[0]['pct_em_kit'], 2728 / 4009)
+        self.assertEqual(df.iloc[0]['kits'], ('K-MIX', 'K2-L-0320'))
+
+    def test_kit_sem_composicao_entra_como_ele_mesmo(self):
+        v = ep.venda_em_peca([('K2-LVI-CANOA0506', 3)], self.COMP, {'K2-LVI-CANOA0506'})
+        df = ep.tabela_por_peca(v)
+        self.assertEqual(df.iloc[0]['peca'], 'K2-LVI-CANOA0506')
+        self.assertEqual(df.iloc[0]['sozinha'], 3)
+        self.assertTrue(df.iloc[0]['kit_sem_composicao'])
+
+    def test_top_n_e_sem_linha_de_total(self):
+        v = ep.venda_em_peca([('A', 5), ('B', 9), ('C', 1)], {})
+        df = ep.tabela_por_peca(v, limite=2)
+        self.assertEqual(list(df['peca']), ['B', 'A'])
+
+    def test_cobertura_e_mais_vendidos_usam_a_mesma_conta(self):
+        import inspect
+        import analise_produtos as ap
+        self.assertIn('venda_em_peca(', inspect.getsource(ep.montar))
+        fonte = inspect.getsource(ap._mais_vendidos_por_peca)
+        self.assertIn('estoque_peca.venda_em_peca(', fonte)
+        self.assertNotIn("['total'].sum()", fonte)
+
+    def test_mesmo_resultado_da_cobertura(self):
+        vendas = [('L-0320', 7, 30, 300.0), ('K2-L-0320', 7, 30, 1200.0)]
+        pecas, _, _ = ep.montar([], vendas, [('K2-L-0320', 'L-0320', 2)])
+        v = ep.venda_em_peca([(s, q30) for s, _q7, q30, _r in vendas],
+                             {'K2-L-0320': {'L-0320': 2}})
+        self.assertAlmostEqual(_linha(pecas, 'L-0320')['venda_dia_30d'] * 30,
+                               v['L-0320']['total'])
+
+
 class FotoParcial(unittest.TestCase):
     def test_queda_forte_de_estoques_no_ultimo_dia_avisa(self):
         contagens = [(NALA, 15, D, 338, date(2026, 9, 29)),     # caso real de 25/09
@@ -331,6 +374,16 @@ class ComBanco(unittest.TestCase):
         estoque, vendas, comp, pend, mapa = ep.ler(self.c, self.hoje)
         pecas, _, _ = ep.montar(estoque, vendas, comp, pend, mapa)
         self.assertEqual(_linha(pecas, 'LKE-3104-4030')['full'], 17 + 29 * 10)
+
+    def test_vendas_por_sku_com_o_where_dos_filtros(self):
+        where = "f.data_venda >= %s AND f.data_venda <= %s AND f.sku IN (%s, %s)"
+        r = dict(ep.ler_vendas_por_sku(self.c, where, [date(2026, 9, 1), date(2026, 9, 30),
+                                                       'K10-LKE-3104-4030', 'LKE-3104-4030']))
+        self.assertEqual({k: int(v) for k, v in r.items()},
+                         {'K10-LKE-3104-4030': 3, 'LKE-3104-4030': 30})
+        comp, pend, mapa = ep.ler_composicao(self.c)
+        v = ep.venda_em_peca(r.items(), ep.agrupar_composicao(comp))
+        self.assertEqual(v['LKE-3104-4030']['total'], 30 + 3 * 10)
 
     def test_nomes(self):
         self.cur.execute("INSERT INTO dim_produtos VALUES ('LKE-3104-4030', 'Bandeja 40x30')")

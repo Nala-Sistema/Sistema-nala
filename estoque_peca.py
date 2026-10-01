@@ -115,6 +115,17 @@ TODAS_AS_SQL = (SQL_ESTOQUE, SQL_VENDAS, SQL_COMPOSICAO, SQL_KITS_PENDENTES,
 
 QUEDA_FOTO_PARCIAL = 0.20
 
+# Mais Vendidos por peça (3ª entrega): o WHERE vem de
+# analise_produtos._montar_where_filtros (período, loja com RBAC,
+# marketplace), só com placeholders %s; os valores vão em params.
+SQL_VENDAS_POR_SKU_MODELO = """
+    SELECT f.sku, SUM(f.quantidade) AS qtd
+      FROM fact_vendas_snapshot f
+     WHERE {where}
+     GROUP BY f.sku
+"""
+TODAS_AS_SQL += (SQL_VENDAS_POR_SKU_MODELO.format(where='TRUE'),)
+
 
 def params_vendas(hoje):
     """30 dias fechados (até ontem): hoje ainda está vendendo."""
@@ -146,6 +157,54 @@ def ler(conn, hoje):
     finally:
         cur.close()
         conn.rollback()
+
+
+def ler_composicao(conn):
+    """(composicao, kits_pendentes, mapa) para a conta em peça. Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_COMPOSICAO)
+        composicao = cur.fetchall()
+        cur.execute(SQL_KITS_PENDENTES)
+        pendentes = {r[0] for r in cur.fetchall()}
+        cur.execute(SQL_MAPEAMENTO)
+        return composicao, pendentes, dict(cur.fetchall())
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def ler_vendas_por_sku(conn, where_sql, params):
+    """[(sku, qtd)] do período/filtros da aba Mais Vendidos. Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_VENDAS_POR_SKU_MODELO.format(where=where_sql), params)
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.rollback()
+
+
+def tabela_por_peca(venda, limite=None):
+    """
+    Saída de venda_em_peca -> DataFrame, uma linha por peça, maior total
+    primeiro. Só unidades: receita e margem por peça ficam fora (exigiriam
+    ratear a receita do kit misto).
+    """
+    linhas = [{
+        'peca': peca,
+        'sozinha': v['sozinha'],
+        'em_kit': v['em_kit'],
+        'total': v['total'],
+        'pct_em_kit': v['em_kit'] / v['total'] if v['total'] else None,
+        'qtd_kits': len(v['kits']),
+        'kits': tuple(sorted(v['kits'])),
+        'kit_sem_composicao': v['kit_sem_composicao'],
+    } for peca, v in venda.items() if v['total']]
+    df = pd.DataFrame(linhas, columns=['peca', 'sozinha', 'em_kit', 'total', 'pct_em_kit',
+                                       'qtd_kits', 'kits', 'kit_sem_composicao'])
+    df = df.sort_values(['total', 'peca'], ascending=[False, True]).reset_index(drop=True)
+    return df.head(limite) if limite else df
 
 
 def ler_contagens(conn):
@@ -192,6 +251,54 @@ def _diverge(valores):
     return alto - baixo > max(2, 0.01 * alto)
 
 
+def agrupar_composicao(composicao):
+    """[(kit, peca, qtd)] -> {kit: {peca: qtd}}."""
+    comp = {}
+    for kit, peca, qtd in composicao:
+        comp.setdefault(kit, {})[peca] = int(qtd)
+    return comp
+
+
+def kits_sem_composicao(kits_pendentes, mapa=None):
+    """Kits pendentes, pelo SKU guardado e pelo da correção (a venda chega
+    com o oficial)."""
+    mapa = mapa or {}
+    return {mapa.get(k, k) for k in kits_pendentes} | set(kits_pendentes)
+
+
+def pecas_do_sku(sku, comp):
+    """Peças de um SKU vendido: o kit vira suas peças; o resto é ele mesmo
+    (inclusive kit sem composição)."""
+    return comp[sku].items() if sku in comp else [(sku, 1)]
+
+
+def venda_em_peca(vendas_qtd, comp, sem_comp=()):
+    """
+    A ÚNICA conta de venda em peça do sistema (cobertura e Mais Vendidos).
+
+    vendas_qtd: [(sku vendido, quantidade)].
+    Devolve {peca: {'sozinha', 'em_kit', 'total', 'kits': set, 'skus': set,
+    'kit_sem_composicao': bool}}. Quantidade do kit × qtd da peça no kit.
+    Kit sem composição entra como ele mesmo, marcado.
+    """
+    out = {}
+    for sku, qtd in vendas_qtd:
+        qtd = float(qtd or 0)
+        for peca, q in pecas_do_sku(sku, comp):
+            v = out.setdefault(peca, {'sozinha': 0.0, 'em_kit': 0.0, 'total': 0.0,
+                                      'kits': set(), 'skus': set(),
+                                      'kit_sem_composicao': False})
+            if sku in comp:
+                v['em_kit'] += qtd * q
+                v['kits'].add(sku)
+            else:
+                v['sozinha'] += qtd
+                v['kit_sem_composicao'] |= sku in sem_comp
+            v['total'] += qtd * q
+            v['skus'].add(sku)
+    return out
+
+
 def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
            prazo=PRAZO_REPOSICAO_PADRAO):
     """
@@ -205,13 +312,11 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
       avisos: dict de listas para a tela.
     """
     mapa = mapa or {}
-    comp = {}
-    for kit, peca, qtd in composicao:
-        comp.setdefault(kit, {})[peca] = int(qtd)
-    sem_comp = {mapa.get(k, k) for k in kits_pendentes} | set(kits_pendentes)
+    comp = agrupar_composicao(composicao)
+    sem_comp = kits_sem_composicao(kits_pendentes, mapa)
 
     def _pecas_de(sku):
-        return comp[sku].items() if sku in comp else [(sku, 1)]
+        return pecas_do_sku(sku, comp)
 
     p = {}
 
@@ -252,18 +357,16 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
             reg['galpao_lojas'].setdefault(loja, set()).add(int(galpao))
 
     # ---- venda -----------------------------------------------------------
-    receita_sku = {}
-    for sku, q7, q30, rec in vendas:
-        receita_sku[sku] = float(rec or 0)
-        for peca, q in _pecas_de(sku):
-            reg = _p(peca)
-            reg['qtd_7d'] += float(q7 or 0) * q
-            reg['qtd_30d'] += float(q30 or 0) * q
-            reg['skus_dependentes'].add(sku)
-            if sku in comp:
-                reg['kits'].add(sku)
-            elif sku in sem_comp:
-                reg['vem_de_kit_sem_comp'] = True
+    receita_sku = {sku: float(rec or 0) for sku, _q7, _q30, rec in vendas}
+    v7 = venda_em_peca([(s, q7) for s, q7, _q30, _r in vendas], comp, sem_comp)
+    v30 = venda_em_peca([(s, q30) for s, _q7, q30, _r in vendas], comp, sem_comp)
+    for peca, v in v30.items():
+        reg = _p(peca)
+        reg['qtd_30d'] += v['total']
+        reg['qtd_7d'] += v7.get(peca, {}).get('total', 0.0)
+        reg['skus_dependentes'] |= v['skus']
+        reg['kits'] |= v['kits']
+        reg['vem_de_kit_sem_comp'] |= v['kit_sem_composicao']
     for sku in {r[2] for r in estoque} & sem_comp:
         _p(sku)['vem_de_kit_sem_comp'] = True
 

@@ -213,6 +213,12 @@ def _tab_mais_vendidos(engine):
 
     data_ini, data_fim, lojas, mkts = _filtros_periodo_loja_marketplace("mv")
 
+    ver_por = st.radio("Ver por", ["SKU vendido", "Produto (peça)"], horizontal=True,
+                       key="mv_ver_por")
+    if ver_por == "Produto (peça)":
+        _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts)
+        return
+
     col_a, col_b = st.columns([1, 3])
     with col_a:
         ordenar_por = st.selectbox(
@@ -318,6 +324,71 @@ def _tab_mais_vendidos(engine):
         file_name=f"mais_vendidos_{data_ini}_{data_fim}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
+    """
+    Mais Vendidos em UNIDADES DE PEÇA (frente [KITS], 3ª entrega, 01/10/2026).
+    A conta é estoque_peca.venda_em_peca, a mesma da Cobertura em peça. Só
+    unidades: receita/margem por peça ficam fora (rateio do kit misto). Nenhum
+    total que some peças diferentes.
+    """
+    st.caption("Venda do kit × quantidade da peça na composição (🧩 Kits em Gestão de "
+               "SKUs) + a peça vendida sozinha. Só unidades: receita e margem continuam "
+               "por SKU vendido.")
+    limit = st.slider("Top N", min_value=10, max_value=200, value=50, step=10,
+                      key="mv_peca_limit")
+    if data_ini is None or data_fim is None or data_fim < data_ini:
+        st.warning("Período inválido — ajuste as datas.")
+        return
+    where_parts, params = _montar_where_filtros(data_ini, data_fim, lojas, mkts, engine,
+                                                 alias='f.')
+    try:
+        conn = engine.raw_connection()
+        try:
+            vendas = estoque_peca.ler_vendas_por_sku(conn, " AND ".join(where_parts), params)
+            composicao, pendentes, mapa = estoque_peca.ler_composicao(conn)
+            comp = estoque_peca.agrupar_composicao(composicao)
+            venda = estoque_peca.venda_em_peca(
+                vendas, comp, estoque_peca.kits_sem_composicao(pendentes, mapa))
+            df = estoque_peca.tabela_por_peca(venda)
+            nomes = estoque_peca.ler_nomes(conn, set(df['peca']))
+        finally:
+            conn.close()
+    except Exception as e:
+        st.error(f"Erro ao consultar vendas por peça: {e}")
+        return
+    if df.empty:
+        st.info("Nenhuma venda encontrada para os filtros selecionados.")
+        return
+
+    c1, c2 = st.columns(2)
+    c1.metric("Peças com venda", _fmt_int(len(df)))
+    c2.metric("Peças vendidas também dentro de kit", _fmt_int((df['em_kit'] > 0).sum()))
+
+    top = df.head(limit)
+    st.dataframe(pd.DataFrame({
+        'Peça': top['peca'],
+        'Produto': top['peca'].map(lambda s: nomes.get(s) or '(sem cadastro)'),
+        'Vendida sozinha': top['sozinha'].map(_fmt_int),
+        'Dentro de kit': top['em_kit'].map(_fmt_int),
+        'Total (peças)': top['total'].map(_fmt_int),
+        '% em kit': top['pct_em_kit'].map(lambda v: f"{v * 100:.0f}%"),
+        'Kits que venderam': top['qtd_kits'],
+        'Aviso': top['kit_sem_composicao'].map(lambda v: 'kit sem composição' if v else ''),
+    }), use_container_width=True, hide_index=True)
+
+    sem = list(df.loc[df['kit_sem_composicao'], 'peca'])
+    if sem:
+        st.warning("Kit sem composição (pendente em Gestão de SKUs → 🧩 Kits), contado "
+                   "como ele mesmo: " + ', '.join(sem))
+
+    buf = io.BytesIO()
+    df.assign(kits=df['kits'].map(', '.join)).to_excel(buf, index=False, sheet_name='PorPeca')
+    st.download_button("⬇️ Baixar Excel completo", data=buf.getvalue(),
+                       file_name=f"mais_vendidos_por_peca_{data_ini}_{data_fim}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="mv_peca_xlsx")
 
 
 # ============================================================
