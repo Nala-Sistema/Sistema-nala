@@ -152,6 +152,70 @@ class Plano(unittest.TestCase):
         self.assertEqual(kc.planejar(*args), kc.planejar(*args))
 
 
+class CorrecaoDeSku(unittest.TestCase):
+    """dim_sku_mapeamento aplicada na carga (aprovado pelo Mestre em 01/10/2026)."""
+    REAL = {'K-10-LKE-3104-4030': 'K10-LKE-3104-4030'}     # registrada em julho
+    CAD = {'K10-LKE-3104-4030', 'LKE-3104-4030', 'L-0320', 'L-0321', 'K2-L-0320'}
+
+    def test_caso_real_entra_com_o_sku_do_sistema(self):
+        p = kc.planejar({'K-10-LKE-3104-4030': {'LKE-3104-4030': 10}}, self.CAD, {}, {},
+                        mapa=self.REAL)
+        self.assertEqual(p['novos'], [('K10-LKE-3104-4030', (('LKE-3104-4030', 10),))])
+        self.assertEqual(p['traducoes'],
+                         [('K-10-LKE-3104-4030', 'K10-LKE-3104-4030', '')])
+        self.assertEqual(p['pendentes'], [])
+
+    def test_sem_correcao_registrada_continua_pendente(self):
+        p = kc.planejar({'K-10-LKE-3104-4030': {'LKE-3104-4030': 10}}, self.CAD, {}, {})
+        self.assertEqual([k for k, *_ in p['pendentes']], ['K-10-LKE-3104-4030'])
+        self.assertEqual(p['traducoes'], [])
+
+    def test_pendencia_guardada_com_o_sku_antigo_sai_quando_entra(self):
+        p = kc.planejar({'K-10-LKE-3104-4030': {'LKE-3104-4030': 10}}, self.CAD, {},
+                        {'K-10-LKE-3104-4030': {'LKE-3104-4030': 10}}, mapa=self.REAL)
+        self.assertEqual(p['pendencias_resolvidas'], ['K-10-LKE-3104-4030'])
+
+    def test_correcao_na_peca(self):
+        p = kc.planejar({'K2-L-0320': {'L-320': 2}}, self.CAD, {}, {},
+                        mapa={'L-320': 'L-0320'})
+        self.assertEqual(p['novos'], [('K2-L-0320', (('L-0320', 2),))])
+
+    def test_cadeia_aplica_um_salto_e_avisa(self):
+        p = kc.planejar({'K-A': {'L-0320': 1}}, self.CAD | {'K-X'}, {}, {},
+                        mapa={'K-A': 'K-X', 'K-X': 'K-B'})
+        self.assertEqual([k for k, _ in p['novos']], ['K-X'])
+        self.assertIn('um salto só', p['traducoes'][0][2])
+
+    def test_destino_fora_do_cadastro_avisa_e_fica_pendente(self):
+        p = kc.planejar({'K-A': {'L-0320': 1}}, self.CAD, {}, {}, mapa={'K-A': 'K-NOVO'})
+        self.assertEqual([k for k, *_ in p['pendentes']], ['K-NOVO'])
+        self.assertIn('não está no cadastro', p['traducoes'][0][2])
+
+    def test_dois_kits_que_viram_o_mesmo_sao_recusados(self):
+        p = kc.planejar({'K-10-LKE-3104-4030': {'LKE-3104-4030': 10},
+                         'K10-LKE-3104-4030': {'LKE-3104-4030': 10}},
+                        self.CAD, {}, {}, mapa=self.REAL)
+        self.assertEqual(p['novos'], [])
+        self.assertEqual(len(p['recusados']), 2)
+
+    def test_duas_pecas_do_mesmo_kit_que_viram_o_mesmo_sku_recusam_o_kit(self):
+        # L-320 corrige para L-0320, que já é a outra peça do kit: somar ou
+        # escolher uma das quantidades seria adivinhar. O kit inteiro sai.
+        p = kc.planejar({'K2-L-0320': {'L-320': 1, 'L-0320': 2}}, self.CAD, {}, {},
+                        mapa={'L-320': 'L-0320'})
+        self.assertEqual(p['novos'], [])
+        self.assertEqual(p['pendentes'], [])
+        self.assertEqual([k for k, _ in p['recusados']], ['K2-L-0320'])
+        self.assertIn('duas peças viram o mesmo SKU L-0320', p['recusados'][0][1][0])
+
+    def test_pendente_renomeado_sai_do_nome_antigo(self):
+        # K-A corrigido para K-B, que segue sem cadastro: sai como K-A, volta como K-B.
+        p = kc.planejar({'K-A': {'L-0320': 1}}, self.CAD, {}, {'K-A': {'L-0320': 1}},
+                        mapa={'K-A': 'K-B'})
+        self.assertEqual([k for k, *_ in p['pendentes']], ['K-B'])
+        self.assertEqual(p['pendencias_renomeadas'], ['K-A'])
+
+
 class Sql(unittest.TestCase):
     def test_nenhum_percent_solto_fora_dos_parametros(self):
         for sql in kc.TODAS_AS_SQL:
@@ -234,18 +298,32 @@ class ComBanco(unittest.TestCase):
         self.cur.execute('CREATE TEMP TABLE dim_produtos (sku text)')
         for ddl in _ddl_real_em_temp():
             self.cur.execute(ddl)
-        # Trava de segurança: os três nomes TÊM de resolver para pg_temp antes
-        # de qualquer INSERT.
+        # Mesmas colunas e PK de produção (conferido em 01/10/2026).
+        self.cur.execute("""
+            CREATE TEMP TABLE dim_sku_mapeamento (
+                sku_errado varchar PRIMARY KEY, sku_correto varchar NOT NULL,
+                data_criacao timestamp DEFAULT now())""")
+        self.cur.execute("""
+            CREATE TEMP TABLE fact_vendas_snapshot (
+                sku varchar, data_venda date, quantidade integer,
+                valor_venda_efetivo numeric)""")
+        self.cur.execute("""
+            CREATE TEMP TABLE fact_vendas_pendentes (
+                sku varchar, data_venda date, quantidade integer,
+                valor_venda_efetivo numeric, status varchar)""")
+        # Trava de segurança: os nomes TÊM de resolver para pg_temp antes de
+        # qualquer INSERT.
         self.cur.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(ARRAY['dim_produtos', 'dim_kit_composicao',
-                              'dim_kit_composicao_pendente']) AS t(nome)
+                              'dim_kit_composicao_pendente', 'dim_sku_mapeamento',
+                              'fact_vendas_snapshot', 'fact_vendas_pendentes']) AS t(nome)
             JOIN pg_class c ON c.oid = t.nome::regclass
         """)
         self.assertTrue(self.cur.fetchone()[0], 'tabela não resolveu para pg_temp')
         self.cur.executemany('INSERT INTO dim_produtos VALUES (%s)', [
             ('K2-L-0320',), ('L-0320',), ('K-L-0351',), ('L-0351',), ('L-0352',),
-            ('k3-L-0426',), ('L-0426',)])
+            ('k3-L-0426',), ('L-0426',), ('K10-LKE-3104-4030',), ('LKE-3104-4030',)])
         self.c = _Conexao(self.conn)
 
     def tearDown(self):
@@ -317,6 +395,67 @@ class ComBanco(unittest.TestCase):
             self.cur.execute("INSERT INTO dim_kit_composicao (kit_sku, peca_sku, quantidade, "
                              "arquivo_origem) VALUES ('K-1 ', 'L-1', 1, 'x')")
         self.cur.execute('ROLLBACK TO SAVEPOINT s')
+
+    # --- correção de SKU (01/10/2026) -------------------------------------
+
+    def _mapear(self, errado, correto):
+        self.cur.execute('INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto) '
+                         'VALUES (%s, %s)', (errado, correto))
+
+    def test_caso_real_entra_na_carga_pela_correcao(self):
+        self._mapear('K-10-LKE-3104-4030', 'K10-LKE-3104-4030')
+        r = self._carregar([['K-10-LKE-3104-4030', 't', 'LKE-3104-4030', 10]])
+        self.assertEqual(r['novos'], 1)
+        self.assertEqual(self._composicao(), {'K10-LKE-3104-4030': {'LKE-3104-4030': 10}})
+
+    def test_caso_real_entra_no_reprocessar(self):
+        # Como está em produção hoje: gravado pendente antes da correção valer.
+        self._carregar([['K-10-LKE-3104-4030', 't', 'LKE-3104-4030', 10]])
+        self.assertEqual(self._pendentes(),
+                         [('K-10-LKE-3104-4030', 'LKE-3104-4030', False, True)])
+        self._mapear('K-10-LKE-3104-4030', 'K10-LKE-3104-4030')
+        r = kc.reprocessar_pendentes(self.c, 'teste')
+        self.assertEqual(r['novos'], 1)
+        self.assertEqual(r['traducoes'][0][:2], ('K-10-LKE-3104-4030', 'K10-LKE-3104-4030'))
+        self.assertEqual(self._pendentes(), [])
+        self.assertEqual(self._composicao(), {'K10-LKE-3104-4030': {'LKE-3104-4030': 10}})
+
+    def test_corrigir_sku_grava_e_reprocessar_usa(self):
+        self._carregar([['K-NOVO', 't', 'L-0320', 2]])
+        ok, msg = kc.corrigir_sku(self.c, 'K-NOVO', 'K2-L-0320')
+        self.assertTrue(ok, msg)
+        self.assertEqual(kc.reprocessar_pendentes(self.c, 'teste')['novos'], 1)
+        self.assertEqual(self._composicao(), {'K2-L-0320': {'L-0320': 2}})
+
+    def test_corrigir_sku_nao_troca_correcao_existente(self):
+        self._mapear('K-X', 'K2-L-0320')
+        ok, msg = kc.corrigir_sku(self.c, 'K-X', 'K-L-0351')
+        self.assertFalse(ok)
+        self.assertIn('K2-L-0320', msg)
+        self.cur.execute("SELECT sku_correto FROM dim_sku_mapeamento WHERE sku_errado = 'K-X'")
+        self.assertEqual(self.cur.fetchone()[0], 'K2-L-0320')
+
+    def test_corrigir_sku_exige_destino_cadastrado(self):
+        ok, _ = kc.corrigir_sku(self.c, 'K-X', 'K-NAO-EXISTE')
+        self.assertFalse(ok)
+        self.cur.execute('SELECT count(*) FROM dim_sku_mapeamento')
+        self.assertEqual(self.cur.fetchone()[0], 0)
+
+    def test_corrigir_sku_recusa_sku_cadastrado_como_errado(self):
+        # Mapear um SKU cadastrado desviaria as vendas dele.
+        ok, msg = kc.corrigir_sku(self.c, 'L-0320', 'L-0351')
+        self.assertFalse(ok)
+        self.assertIn('desviaria', msg)
+
+    def test_vendas_90d_soma_snapshot_e_so_pendente_em_aberto(self):
+        self.cur.executemany(
+            'INSERT INTO fact_vendas_snapshot VALUES (%s, CURRENT_DATE - %s, %s, %s)',
+            [('K10-LKE-3104-4030', 5, 2, 400), ('K10-LKE-3104-4030', 120, 1, 200)])
+        self.cur.executemany(
+            'INSERT INTO fact_vendas_pendentes VALUES (%s, CURRENT_DATE - 3, 1, %s, %s)',
+            [('K-NOVO', 50, 'Pendente'), ('K-NOVO', 70, 'Reprocessado')])
+        v = kc.vendas_90d(self.c, ['K10-LKE-3104-4030', 'K-NOVO'])
+        self.assertEqual(v, {'K10-LKE-3104-4030': (400.0, 2), 'K-NOVO': (50.0, 1)})
 
 
 if __name__ == '__main__':
