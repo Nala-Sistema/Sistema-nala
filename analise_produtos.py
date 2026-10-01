@@ -13,14 +13,12 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
         Compara dois períodos contíguos. Mostra top 20 em alta e top 20
         em queda por delta % de quantidade vendida.
 
-  Tab 3 — 📦 Cobertura de Estoque
-        Para cada SKU em dim_estoque: estoque_atual, vendas_30d,
-        venda/dia, dias de cobertura, status visual.
-
-  Tab 4 — ⬆️ Atualizar Estoque (Upseller)
-        Upload do relatório semanal (.xlsx). Detecta colunas SKU/Estoque,
-        valida contra dim_produtos, faz UPSERT em dim_estoque, registra
-        em log_uploads.
+  Tab 3 — 📦 Cobertura em peça (ML)  (01/10/2026)
+        Estoque da API do ML (galpão + Full) e venda de todos os
+        marketplaces em UNIDADES DE PEÇA (kit × composição). Ruptura
+        iminente ordenada pelo R$ em jogo. Conta em estoque_peca.py.
+        Substituiu a cobertura por dim_estoque e a aba de upload do
+        UpSeller que a alimentava (fonte única: estoque só da API).
 
   Tab 5 — 💸 Despesas de Full
         Upload dos relatórios de custo de Full do ML.
@@ -28,7 +26,7 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
   Tab 6 — 🧾 Fechamento de Estoque
         Foto mensal valorizada do galpão e de cada Full, ao preço de compra
         congelado no upload, em fact_estoque_mensal. É outra coisa da tab 3:
-        aquela é o saldo de hoje para calcular giro, esta é o dia 1º por
+        a tab 3 é o saldo de hoje para calcular giro, esta é o dia 1º por
         local, que ninguém sobrescreve. A leitura dos quatro formatos de
         relatório mora em processar_estoque_full.py.
 
@@ -47,6 +45,8 @@ Dependências internas:
 import streamlit as st
 import pandas as pd
 import io
+
+import estoque_peca
 from datetime import date, timedelta
 
 from database_utils import get_engine, gravar_log_upload
@@ -457,362 +457,18 @@ def _tab_crescimento(engine):
 
 
 # ============================================================
-# TAB 3 — COBERTURA DE ESTOQUE
+# TAB 3 — COBERTURA EM PEÇA (ML)  (frente [KITS], 01/10/2026)
 # ============================================================
+# Substitui a cobertura que lia dim_estoque (upload do UpSeller, parado desde
+# 17/05) e a aba de upload que a alimentava: estoque agora só da API do ML.
+# dim_estoque fica no banco, sem tela. A conta mora em estoque_peca.py.
 
-def _tab_cobertura(engine):
-    st.subheader("📦 Cobertura de Estoque")
-    st.caption("Dias restantes = estoque atual ÷ (vendas dos últimos 30 dias ÷ 30).")
-
-    # Última atualização do estoque
+def _tab_cobertura_peca(engine):
     try:
-        df_meta = _query_to_df(engine,
-            "SELECT MAX(data_atualizacao) AS ult, COUNT(*) AS itens, "
-            "       SUM(quantidade) AS soma FROM dim_estoque")
-        if not df_meta.empty and pd.notna(df_meta.iloc[0]['ult']):
-            ult = df_meta.iloc[0]['ult']
-            ult_str = ult.strftime('%d/%m/%Y %H:%M') if hasattr(ult, 'strftime') else str(ult)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Última atualização", ult_str)
-            c2.metric("SKUs com estoque", _fmt_int(df_meta.iloc[0]['itens']))
-            c3.metric("Unidades totais", _fmt_int(df_meta.iloc[0]['soma'] or 0))
-        else:
-            st.warning("⚠️ Nenhum estoque carregado. Use a tab **Atualizar Estoque** para subir o relatório Upseller.")
-            return
-    except Exception:
-        st.error("Não foi possível ler dim_estoque.")
-        return
-
-    # Filtros (período é fixo em 30d para o cálculo de cobertura)
-    _, lojas_opt = _opcoes_lojas_marketplaces()
-    if not ve_todas_lojas():
-        lojas_permitidas = set(get_lojas_usuario())
-        lojas_opt = [l for l in lojas_opt if l in lojas_permitidas]
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        marketplaces_opt, _ = _opcoes_lojas_marketplaces()
-        mkts = st.multiselect("🛒 Marketplaces (vendas)", marketplaces_opt,
-                              default=[], key="cob_mkts")
-    with col2:
-        lojas = st.multiselect("🏪 Lojas (vendas)", lojas_opt, default=[],
-                               key="cob_lojas")
-    with col3:
-        status_filter = st.multiselect(
-            "🎯 Status",
-            ["🔴 Crítico (<15d)", "🟡 Atenção (15-30d)", "🟢 OK (>30d)", "⚪ Sem giro"],
-            default=[],
-            key="cob_status",
-        )
-
-    hoje = date.today()
-    ini = hoje - timedelta(days=30)
-
-    where_parts, params = _montar_where_filtros(ini, hoje, lojas, mkts, engine, alias='f.')
-    where_sql = " AND ".join(where_parts)
-
-    query = f"""
-        WITH v30 AS (
-            SELECT f.sku, SUM(f.quantidade)::bigint AS vendas_30d
-            FROM fact_vendas_snapshot f
-            WHERE {where_sql}
-            GROUP BY f.sku
-        )
-        SELECT
-            e.sku,
-            COALESCE(p.nome, '(sem cadastro)') AS nome,
-            e.quantidade            AS estoque,
-            COALESCE(v.vendas_30d, 0) AS vendas_30d,
-            e.data_atualizacao
-        FROM dim_estoque e
-        LEFT JOIN v30 v        ON v.sku = e.sku
-        LEFT JOIN dim_produtos p ON p.sku = e.sku
-        ORDER BY e.sku
-    """
-
-    try:
-        df = _query_to_df(engine, query, params)
-    except Exception as exc:
-        st.error(f"Erro ao calcular cobertura: {exc}")
-        return
-
-    if df.empty:
-        st.info("Nenhum SKU no estoque.")
-        return
-
-    df = _coerce_num(df, ['estoque', 'vendas_30d'])
-    df['venda_dia']  = df['vendas_30d'].fillna(0).astype(float) / 30.0
-    df['dias_cobertura'] = df.apply(
-        lambda r: (float(r['estoque']) / r['venda_dia']) if r['venda_dia'] > 0 else None,
-        axis=1,
-    )
-
-    def _status(d, vendas):
-        if vendas == 0:
-            return "⚪ Sem giro"
-        if d is None:
-            return "⚪ Sem giro"
-        if d < 15:
-            return "🔴 Crítico (<15d)"
-        if d < 30:
-            return "🟡 Atenção (15-30d)"
-        return "🟢 OK (>30d)"
-
-    df['status'] = df.apply(
-        lambda r: _status(r['dias_cobertura'], r['vendas_30d']),
-        axis=1,
-    )
-
-    if status_filter:
-        df = df[df['status'].isin(status_filter)]
-
-    # Métricas
-    s_critico = (df['status'] == "🔴 Crítico (<15d)").sum()
-    s_aten    = (df['status'] == "🟡 Atenção (15-30d)").sum()
-    s_ok      = (df['status'] == "🟢 OK (>30d)").sum()
-    s_sem     = (df['status'] == "⚪ Sem giro").sum()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🔴 Crítico", _fmt_int(s_critico))
-    c2.metric("🟡 Atenção", _fmt_int(s_aten))
-    c3.metric("🟢 OK", _fmt_int(s_ok))
-    c4.metric("⚪ Sem giro", _fmt_int(s_sem))
-
-    st.markdown("---")
-
-    # Tabela
-    df_disp = df.copy()
-    df_disp['Estoque']      = df_disp['estoque'].apply(_fmt_int)
-    df_disp['Vendas 30d']   = df_disp['vendas_30d'].apply(_fmt_int)
-    df_disp['Venda/dia']    = df_disp['venda_dia'].apply(lambda v: f"{v:.2f}".replace(".", ","))
-    df_disp['Dias rest.']   = df_disp['dias_cobertura'].apply(
-        lambda v: "∞" if v is None else f"{v:.0f}"
-    )
-    df_disp['Atualizado']   = df_disp['data_atualizacao'].apply(
-        lambda v: v.strftime('%d/%m/%Y') if hasattr(v, 'strftime') else str(v)
-    )
-    cols = ['sku', 'nome', 'Estoque', 'Vendas 30d', 'Venda/dia',
-            'Dias rest.', 'status', 'Atualizado']
-    st.dataframe(
-        df_disp[cols].rename(columns={'sku': 'SKU', 'nome': 'Produto',
-                                       'status': 'Status'}),
-        use_container_width=True, hide_index=True,
-    )
-
-    with st.expander("💾 Exportar Excel"):
-        buf = io.BytesIO()
-        df.to_excel(buf, index=False, sheet_name='Cobertura')
-        st.download_button(
-            "⬇️ Download",
-            data=buf.getvalue(),
-            file_name=f"cobertura_estoque_{hoje}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-
-# ============================================================
-# TAB 4 — UPLOAD ESTOQUE (UPSELLER)
-# ============================================================
-
-def _detectar_coluna(df, candidatos):
-    """Devolve o nome da coluna que casa (case-insensitive, contém) com algum candidato."""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for cand in candidatos:
-        c_low = cand.lower()
-        if c_low in cols_lower:
-            return cols_lower[c_low]
-    for c in df.columns:
-        c_low = c.lower()
-        for cand in candidatos:
-            if cand.lower() in c_low:
-                return c
-    return None
-
-
-def _tab_upload_estoque(engine):
-    st.subheader("⬆️ Atualizar Estoque (Upseller)")
-    st.caption("Suba o relatório semanal (.xlsx) do Upseller. UPSERT em dim_estoque por SKU.")
-
-    arquivo = st.file_uploader("Selecione o arquivo .xlsx", type=['xlsx', 'xls'],
-                                key="upl_estoque")
-
-    if arquivo is None:
-        st.info("Aguardando arquivo...")
-        _historico_uploads_estoque(engine)
-        return
-
-    # Lê tentando detectar cabeçalho
-    try:
-        df_raw = pd.read_excel(arquivo, sheet_name=0, dtype=str)
-    except Exception as exc:
-        st.error(f"Falha ao ler arquivo: {exc}")
-        return
-
-    # Se as colunas vierem como 'Unnamed: 0', tentamos avançar header
-    if all(str(c).startswith("Unnamed") for c in df_raw.columns):
-        for header_idx in range(1, 10):
-            arquivo.seek(0)
-            try:
-                df_try = pd.read_excel(arquivo, sheet_name=0, header=header_idx, dtype=str)
-                if not all(str(c).startswith("Unnamed") for c in df_try.columns):
-                    df_raw = df_try
-                    break
-            except Exception:
-                pass
-
-    st.write(f"📋 **{len(df_raw)} linhas** lidas. Pré-visualização:")
-    st.dataframe(df_raw.head(10), use_container_width=True)
-
-    # Mapeamento de colunas (autodetect com override)
-    col_sku_auto = _detectar_coluna(df_raw, ['sku', 'codigo', 'código', 'cod'])
-    col_estoque_auto = _detectar_coluna(df_raw, ['estoque', 'saldo', 'qtd', 'quantidade',
-                                                  'disponivel', 'disponível'])
-
-    colunas = list(df_raw.columns)
-    c1, c2 = st.columns(2)
-    with c1:
-        col_sku = st.selectbox(
-            "Coluna do SKU",
-            colunas,
-            index=colunas.index(col_sku_auto) if col_sku_auto in colunas else 0,
-            key="upl_col_sku",
-        )
-    with c2:
-        col_estoque = st.selectbox(
-            "Coluna do Estoque (quantidade)",
-            colunas,
-            index=colunas.index(col_estoque_auto) if col_estoque_auto in colunas else 0,
-            key="upl_col_est",
-        )
-
-    # Normaliza
-    df = pd.DataFrame({
-        'sku': df_raw[col_sku].astype(str).str.strip(),
-        'quantidade_raw': df_raw[col_estoque],
-    })
-    df = df[df['sku'].notna() & (df['sku'] != '') & (df['sku'].str.lower() != 'nan')]
-
-    def _to_int(v):
-        try:
-            s = str(v).strip().replace('.', '').replace(',', '.')
-            return int(float(s)) if s else 0
-        except (TypeError, ValueError):
-            return 0
-
-    df['quantidade'] = df['quantidade_raw'].apply(_to_int)
-    df = df[['sku', 'quantidade']].drop_duplicates(subset=['sku'], keep='last')
-
-    # Valida contra dim_produtos
-    try:
-        df_skus_cadastrados = pd.read_sql("SELECT sku FROM dim_produtos", engine)
-        cadastrados = set(df_skus_cadastrados['sku'].astype(str).str.strip())
-    except Exception:
-        cadastrados = set()
-
-    df['cadastrado'] = df['sku'].isin(cadastrados)
-    qtd_total = len(df)
-    qtd_ok = int(df['cadastrado'].sum())
-    qtd_naocad = qtd_total - qtd_ok
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Linhas válidas", _fmt_int(qtd_total))
-    c2.metric("SKUs cadastrados", _fmt_int(qtd_ok))
-    c3.metric("Não cadastrados", _fmt_int(qtd_naocad),
-              delta=f"{qtd_naocad}" if qtd_naocad else None,
-              delta_color="inverse")
-
-    if qtd_naocad > 0:
-        with st.expander(f"⚠️ Ver {qtd_naocad} SKU(s) não cadastrados — serão gravados mesmo assim"):
-            st.dataframe(df[~df['cadastrado']][['sku', 'quantidade']],
-                          use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-
-    col_btn1, col_btn2 = st.columns([1, 4])
-    with col_btn1:
-        if st.button("💾 Gravar estoque", type="primary",
-                     key="upl_btn_save", disabled=(qtd_total == 0)):
-            _gravar_estoque(engine, df, arquivo.name)
-            st.cache_data.clear()
-            st.success(f"✅ {qtd_total} SKU(s) atualizado(s) em dim_estoque.")
-            st.rerun()
-
-    _historico_uploads_estoque(engine)
-
-
-def _gravar_estoque(engine, df, arquivo_nome):
-    """Faz UPSERT em dim_estoque + grava em log_uploads."""
-    conn = engine.raw_connection()
-    try:
-        cursor = conn.cursor()
-        sql = """
-            INSERT INTO dim_estoque (sku, quantidade, data_atualizacao, arquivo_origem)
-            VALUES (%s, %s, NOW(), %s)
-            ON CONFLICT (sku) DO UPDATE
-            SET quantidade = EXCLUDED.quantidade,
-                data_atualizacao = NOW(),
-                arquivo_origem = EXCLUDED.arquivo_origem
-        """
-        importados = 0
-        erros = 0
-        for _, r in df.iterrows():
-            try:
-                cursor.execute(sql, (
-                    str(r['sku']).strip(),
-                    int(r['quantidade']),
-                    arquivo_nome,
-                ))
-                importados += 1
-            except Exception:
-                erros += 1
-        conn.commit()
-        cursor.close()
-    except Exception as exc:
-        st.error(f"Erro ao gravar: {exc}")
-        importados = 0
-        erros = len(df)
-    finally:
-        conn.close()
-
-    gravar_log_upload(engine, {
-        'marketplace': 'UPSELLER',
-        'loja': 'ESTOQUE',
-        'arquivo_nome': arquivo_nome,
-        'periodo_inicio': None,
-        'periodo_fim': None,
-        'total_linhas': int(len(df)),
-        'linhas_importadas': importados,
-        'linhas_erro': erros,
-    })
-
-
-def _historico_uploads_estoque(engine):
-    st.markdown("### 🗂️ Últimos uploads de estoque")
-    try:
-        df = _query_to_df(
-            engine,
-            """
-            SELECT data_upload, arquivo_nome, total_linhas,
-                   linhas_importadas, linhas_erro, status
-            FROM log_uploads
-            WHERE marketplace = 'UPSELLER'
-            ORDER BY data_upload DESC
-            LIMIT 10
-            """,
-        )
-        if df.empty:
-            st.caption("Nenhum upload de estoque registrado ainda.")
-        else:
-            df['data_upload'] = pd.to_datetime(df['data_upload']).dt.strftime('%d/%m/%Y %H:%M')
-            st.dataframe(df.rename(columns={
-                'data_upload': 'Quando',
-                'arquivo_nome': 'Arquivo',
-                'total_linhas': 'Linhas',
-                'linhas_importadas': 'Importadas',
-                'linhas_erro': 'Erros',
-                'status': 'Status',
-            }), use_container_width=True, hide_index=True)
-    except Exception:
-        st.caption("Histórico indisponível (log_uploads ainda sem registros de estoque).")
+        estoque_peca.render(engine)
+    except Exception as e:
+        st.error(f"❌ Não consegui montar a cobertura em peça. Tente de novo; se "
+                 f"continuar, avise com esta mensagem:\n\n{type(e).__name__}: {str(e)[:300]}")
 
 
 # ============================================================
@@ -1847,11 +1503,10 @@ def main():
     st.header("📈 Análise de Produtos")
     engine = get_engine()
 
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+    t1, t2, t3, t5, t6, t7 = st.tabs([
         "🏆 Mais Vendidos",
         "📈 Crescimento & Queda",
-        "📦 Cobertura de Estoque",
-        "⬆️ Atualizar Estoque (Upseller)",
+        "📦 Cobertura em peça (ML)",
         "💸 Despesas de Full",
         "🧾 Fechamento de Estoque",
         "🚚 Penalização de frete",
@@ -1861,9 +1516,7 @@ def main():
     with t2:
         _tab_crescimento(engine)
     with t3:
-        _tab_cobertura(engine)
-    with t4:
-        _tab_upload_estoque(engine)
+        _tab_cobertura_peca(engine)
     with t5:
         _tab_despesas_full(engine)
     with t6:
