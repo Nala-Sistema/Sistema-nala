@@ -550,6 +550,33 @@ class Ciente(unittest.TestCase):
             sd._render_mercado_livre(st, mock.MagicMock())
         return st
 
+    def test_sinal_que_piorou_nao_fica_em_silenciados(self):
+        ativos, sil = sd.aplicar_cientes(
+            [self._full(0)], [_ciente(LPT, 'full_cobertura', 'E1', medida=6, id_=7)], HOJE)
+        cientes = [dict(zip(sd.CIENTE_COLS,
+                            _ciente(LPT, 'full_cobertura', 'E1', medida=6, id_=7)))]
+        self.assertEqual(ativos[0]['ciente_voltou'], 7)
+        self.assertTrue(sd.tabela_silenciados(sil, cientes, HOJE, {}, ativos).empty)
+        self.assertEqual(sd.cientes_silenciando(cientes, ativos, HOJE), [])
+        # sem a piora, continua listado
+        ativos, sil = sd.aplicar_cientes(
+            [self._full(6)], [_ciente(LPT, 'full_cobertura', 'E1', medida=6, id_=7)], HOJE)
+        self.assertEqual(len(sd.tabela_silenciados(sil, cientes, HOJE, {}, ativos)), 1)
+
+    def test_campanha_sem_mlb_com_nome_comprido_cabe_na_chave(self):
+        nome = 'Campanha de natal ' * 20
+        config = [(LPT, nome, nome, date(2026, 10, 4), HOJE, 14, 10, 12, 12)]
+        s = sd.sinais_ads({}, config, {}, {}, sd.janelas(HOJE))
+        self.assertRegex(s[0]['objeto'], r'^camp:[0-9a-f]{12}@2026-10-05$')
+        self.assertEqual(s[0]['objeto'], sd.objeto_campanha(None, nome, HOJE))
+        self.assertNotEqual(s[0]['objeto'], sd.objeto_campanha(None, nome + 'x', HOJE))
+
+    def test_reativar_exige_usuario(self):
+        conn = mock.Mock()
+        with self.assertRaises(ValueError):
+            sd.reativar_ciente(conn, 1, '  ', [LPT])
+        conn.cursor.assert_not_called()
+
     def test_tela_gestora_marca_ciente_diretor_so_ve(self):
         silenciado = [_ciente(LPT, 'vendas_queda', 'MLB2', medida=-1.0)]
         st = self._render('GESTOR', silenciado)
@@ -661,6 +688,14 @@ class ComBanco(unittest.TestCase):
         c = self.cur = self.conn.cursor()
         for ddl in _DDL:
             c.execute(ddl)
+        # visão e tabela que JÁ podem existir em produção: TEMP vazias, para o
+        # to_regclass do código achar a TEMP e nunca o objeto real
+        c.execute("""CREATE TEMP VIEW vw_visitas_dia AS
+            SELECT NULL::varchar AS marketplace, NULL::varchar AS loja,
+                   NULL::varchar AS codigo_anuncio, NULL::date AS data,
+                   NULL::integer AS visitas WHERE false""")
+        for ddl in _ddl_ciente_em_temp():
+            c.execute(ddl)
         copiadas = {t: self._copiar_checks(t) for t in TABELAS}
         # as CHECK que existem hoje em produção (05/10/2026) chegaram à TEMP
         self.assertGreaterEqual(copiadas['fact_estoque_diario'], 2)
@@ -670,7 +705,7 @@ class ComBanco(unittest.TestCase):
         c.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(%s) AS t(nome) JOIN pg_class c ON c.oid = t.nome::regclass
-        """, (TABELAS,))
+        """, (TABELAS + ['vw_visitas_dia', 'sinal_ciente'],))
         self.assertTrue(c.fetchone()[0], 'tabela não resolveu para pg_temp')
         self._popular()
         self.c = _Conexao(self.conn)
@@ -731,8 +766,8 @@ class ComBanco(unittest.TestCase):
     def test_ponta_a_ponta_pelas_sql(self):
         dados, erros = sd.ler_tudo(self.c, HOJE, [LPT, NALA])
         self.assertEqual(erros, {})
-        self.assertIsNone(dados['visitas'])                  # view ainda não existe
-        self.assertIsNone(dados['ciente'])                   # tabela da v1.1 não existe
+        self.assertEqual(dados['visitas'], [])               # TEMP vazia, nunca a real
+        self.assertEqual(dados['ciente'], [])                # TEMP vazia, nunca a real
         s, erros_bloco = sd.montar_sinais(dados, HOJE)
         self.assertEqual(erros_bloco, {})
         por = {(x['loja'], x['tipo'], x['numero'].split(':')[0].split(' ')[0]): x for x in s}
@@ -768,7 +803,7 @@ class ComBanco(unittest.TestCase):
         self.assertTrue(all(r[0] == NALA for r in dados['foto']))
 
     def test_visitas_le_da_view_quando_ela_existe(self):
-        self.cur.execute("""CREATE TEMP VIEW vw_visitas_dia AS
+        self.cur.execute("""CREATE OR REPLACE TEMP VIEW vw_visitas_dia AS
             SELECT 'MERCADO LIVRE'::varchar AS marketplace, 'ML-LPT'::varchar AS loja,
                    'MLB5183384677'::varchar AS codigo_anuncio, d::date AS data,
                    CASE WHEN d >= '2026-09-26' THEN 10 ELSE 100 END AS visitas
@@ -864,6 +899,13 @@ class CienteComBanco(unittest.TestCase):
                  {'silenciar_ate': datetime.now(sd.BRT).date() + timedelta(days=61)},
                  {'silenciar_ate': datetime.now(sd.BRT).date() - timedelta(days=1)},
                  {'objeto': ' '}]
+        self.cur.execute(sd.SQL_INSERIR_CIENTE, {**base, 'objeto': 'E8'})
+        for sem_quem in ("encerrado_por = NULL", "encerrado_por = '  '"):
+            self.cur.execute('SAVEPOINT q')
+            with self.assertRaises(psycopg2.errors.CheckViolation, msg=sem_quem):
+                self.cur.execute(f"UPDATE sinal_ciente SET encerrado_em = now(), {sem_quem}, "
+                                 "como_encerrou = 'reativado' WHERE objeto = 'E8'")
+            self.cur.execute('ROLLBACK TO SAVEPOINT q')
         for mudanca in ruins:
             self.cur.execute('SAVEPOINT r')
             with self.assertRaises(psycopg2.errors.CheckViolation, msg=str(mudanca)):

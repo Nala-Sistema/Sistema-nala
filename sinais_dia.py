@@ -86,6 +86,7 @@ RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
     aviso erra em 3 horas.
 """
 
+import hashlib
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -499,6 +500,17 @@ def anuncio_da_campanha(id_campanha, campanha=None):
     return None
 
 
+def objeto_campanha(anuncio, campanha, dia):
+    """Objeto do ciente de mudança de ROAS/orçamento: MLB@data; campanha sem
+    MLB vira camp:<hash curto do nome>@data (nome comprido não pode estourar o
+    varchar(120) e derrubar o lote)."""
+    data = f"{pd.Timestamp(dia):%Y-%m-%d}"
+    if anuncio:
+        return f"{anuncio}@{data}"
+    h = hashlib.sha1((campanha or '').encode('utf-8')).hexdigest()[:12]
+    return f"camp:{h}@{data}"
+
+
 def agregar_vendas(vendas):
     """[(loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30)]
     -> (por_anuncio, por_anuncio_sku).
@@ -675,7 +687,7 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
             loja, 'ADS', anuncio or camp, a.get('skus'),
             "Mudou ontem: " + '; '.join(partes) + f" (foto de {pd.Timestamp(d_antes):%d/%m} → hoje)",
             "Acompanhar venda e TACOS nos próximos 3 dias", a.get('rec_30', 0.0),
-            regra='ads_config', objeto=f"{anuncio or camp}@{pd.Timestamp(d_agora):%Y-%m-%d}"))
+            regra='ads_config', objeto=objeto_campanha(anuncio, camp, d_agora)))
 
     semana = 7
     for (loja, anuncio), d in ads.items():
@@ -910,6 +922,8 @@ def piorou(regra, agora, antes):
     if regra in ('vendas_queda', 'visitas_queda'):      # variação (−0,55 = −55%)
         return agora <= antes - PIORA_QUEDA_PP or (agora <= -1.0 < antes)
     if regra == 'exp_anuncio':                          # nota
+        # CALIBRAR ([MESTRE ANÁLISES], auditor 05/10): hoje QUALQUER queda de
+        # nota reativa (75 -> 65 já volta). Pode virar "caiu de faixa".
         return agora < antes
     if regra == 'exp_familia':                          # nº de anúncios piorados
         return agora > antes
@@ -953,7 +967,7 @@ def aplicar_cientes(sinais, cientes, hoje):
         ate = pd.Timestamp(c['silenciar_ate']).date()
         quando = f"{pd.Timestamp(c['criado_em']):%d/%m}"
         if piorou(s['regra'], s['medida'], c['medida_no_ciente']):
-            ativos.append({**s, 'voltou': (
+            ativos.append({**s, 'ciente_voltou': c['id'], 'voltou': (
                 f"🔁 piorou: {texto_medida(s['regra'], c['medida_no_ciente'])} → "
                 f"{texto_medida(s['regra'], s['medida'])} (ciente de {quando}, "
                 f"{MOTIVOS.get(c['motivo'], c['motivo'])})")})
@@ -985,8 +999,11 @@ def gravar_cientes(conn, sinais, motivo, nota, ate, usuario, hoje, lojas_permiti
     """Grava o ciente de cada sinal numa transação só. Ciente aberto na mesma
     chave é encerrado ('substituido') antes. Devolve quantos gravou."""
     erros = validar_ciente(motivo, nota, ate, hoje)
-    if not usuario:
+    if not (usuario or '').strip():
         erros.append("Usuário não identificado.")
+    longos = [s['objeto'] for s in sinais if len(s['objeto']) > 120]
+    if longos:
+        erros.append(f"Chave do sinal longa demais: {longos[0][:40]}…")
     if erros:
         raise ValueError(' '.join(erros))
     fora = sorted({s['loja'] for s in sinais if s['loja'] not in lojas_permitidas})
@@ -1013,6 +1030,8 @@ def gravar_cientes(conn, sinais, motivo, nota, ate, usuario, hoje, lojas_permiti
 def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas):
     """Encerra um ciente ('reativado'): o sinal volta a aparecer. Só nas lojas
     do usuário. Devolve quantas linhas mudou (0 ou 1)."""
+    if not (usuario or '').strip():
+        raise ValueError("Usuário não identificado.")
     cur = conn.cursor()
     try:
         cur.execute(SQL_REATIVAR, {'id': id_ciente, 'usuario': usuario,
@@ -1136,14 +1155,20 @@ def tabela_sinais(sinais, nomes):
     })
 
 
-def tabela_silenciados(silenciados, cientes_loja, hoje, nomes):
-    """Cientes abertos e dentro da data da loja, com o motivo à vista; diz se
-    o sinal ainda dispara hoje."""
+def cientes_silenciando(cientes_loja, ativos, hoje):
+    """Cientes que estão calando algo hoje: abertos, dentro da data e cujo
+    sinal NÃO voltou por piora (esse já está nos ativos com o selo)."""
+    voltaram = {x.get('ciente_voltou') for x in ativos}
+    return [c for c in cientes_loja
+            if pd.Timestamp(c['silenciar_ate']).date() >= hoje and c['id'] not in voltaram]
+
+
+def tabela_silenciados(silenciados, cientes_loja, hoje, nomes, ativos=()):
+    """Cientes que estão calando algo, com o motivo à vista; diz se o sinal
+    ainda dispara hoje."""
     disparando = {(x['regra'], x['objeto']) for x in silenciados}
     linhas = []
-    for c in cientes_loja:
-        if pd.Timestamp(c['silenciar_ate']).date() < hoje:
-            continue
+    for c in cientes_silenciando(cientes_loja, ativos, hoje):
         linhas.append({
             'Regra': REGRAS.get(c['regra'], c['regra']),
             'Objeto': c['objeto'],
@@ -1245,7 +1270,7 @@ def _render_mercado_livre(st, engine):
         ctx = {'frescor': frescor, 'atrasadas': atrasadas, 'datas_foto': datas_foto,
                'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
                'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
-               'com_ciente': com_ciente, 'silenciados': silenciados,
+               'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
                'cientes': [c for c in cientes if c['loja'] == loja]}
         try:
             _render_loja(st, loja, ativos, ctx)
@@ -1300,15 +1325,15 @@ def _render_form_ciente(st, loja, marcados, ctx):
 def _render_silenciados(st, loja, ctx):
     import streamlit
     sil = [x for x in ctx['silenciados'] if x['loja'] == loja]
-    df = tabela_silenciados(sil, ctx['cientes'], ctx['hoje'], ctx['nomes'])
+    ativos = [x for x in ctx['ativos'] if x['loja'] == loja]
+    df = tabela_silenciados(sil, ctx['cientes'], ctx['hoje'], ctx['nomes'], ativos)
     if df.empty:
         return
     with st.expander(f"🔕 Silenciados ({len(df)})"):
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not ctx['pode']:
             return
-        abertos = [c for c in ctx['cientes']
-                   if pd.Timestamp(c['silenciar_ate']).date() >= ctx['hoje']]
+        abertos = cientes_silenciando(ctx['cientes'], ativos, ctx['hoje'])
         escolha = st.selectbox(
             "Reativar (o sinal volta a aparecer)", [c['id'] for c in abertos],
             format_func=lambda i: next(f"{REGRAS.get(c['regra'], c['regra'])} · {c['objeto']}"

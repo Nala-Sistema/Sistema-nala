@@ -85,7 +85,8 @@ CREATE TABLE public.sinal_ciente (
         silenciar_ate >= criado_em::date AND silenciar_ate <= criado_em::date + 60),
     CONSTRAINT sinal_ciente_encerramento CHECK (
         (encerrado_em IS NULL AND encerrado_por IS NULL AND como_encerrou IS NULL)
-        OR (encerrado_em IS NOT NULL AND btrim(encerrado_por) <> ''
+        OR (encerrado_em IS NOT NULL AND encerrado_por IS NOT NULL
+            AND btrim(encerrado_por) <> ''
             AND como_encerrou IN ('reativado', 'substituido')))
 );
 
