@@ -8,6 +8,11 @@ Duas partes:
     ruptura), família de alicates (experiência por peça base) —, janelas com
     D-1/D-2 fora, corte de 10 por loja, permissão que NÃO abre tudo para
     usuário sem loja, e % solto nas SQL.
+  - Ciente (v1.1): chave regra + loja + objeto, quando o silenciado volta
+    (data ou piora, por regra), validação, permissão de quem grava; com banco,
+    o ciclo gravar -> substituir -> reativar numa TEMP criada com o DDL LIDO de
+    sql/sinais_ciente.sql (a tabela ainda não existe em produção; depois de
+    aplicada, um teste confere que as CHECK reais são as do arquivo).
   - Com banco (NALA_TEST_DB_URL, usuário de permissão mínima): EXECUTA as SQL
     de verdade em tabelas TEMPORÁRIAS com os nomes das reais, com as CHECK
     COPIADAS da tabela real (lição de 05/10: a TEMP sem CHECK aceitava o que
@@ -21,7 +26,7 @@ import os
 import re
 import sys
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -387,9 +392,180 @@ class Sql(unittest.TestCase):
 
     def test_todo_parametro_da_sql_existe(self):
         p = sd.params(HOJE, [LPT])
+        escrita = (sd.SQL_FECHAR_ABERTO, sd.SQL_INSERIR_CIENTE, sd.SQL_REATIVAR)
+        p_escrita = {'marketplace', 'loja', 'regra', 'objeto', 'motivo', 'nota',
+                     'silenciar_ate', 'medida', 'texto', 'usuario', 'id', 'lojas'}
         for sql in sd.TODAS_AS_SQL:
             for nome in re.findall(r'%\((\w+)\)s', sql):
-                self.assertIn(nome, p, nome)
+                self.assertIn(nome, p_escrita if sql in escrita else p, nome)
+
+
+# ============================================================
+# CIENTE (v1.1) — sem banco
+# ============================================================
+
+SQL_CIENTE = os.path.join(RAIZ, 'sql', 'sinais_ciente.sql')
+
+
+def _ddl_ciente_em_temp():
+    with open(SQL_CIENTE, encoding='utf-8') as f:
+        texto = f.read()
+    tabela = re.findall(r'^CREATE TABLE public\.sinal_ciente \(.*?^\);', texto, re.S | re.M)
+    indice = re.findall(r'^CREATE UNIQUE INDEX .*?;$', texto, re.M)
+    assert len(tabela) == 1 and len(indice) == 1, 'DDL de sql/sinais_ciente.sql mudou'
+    return [x.replace('public.', 'pg_temp.') for x in tabela + indice]
+
+
+def _ciente(loja, regra, objeto, motivo='falta_fornecedor', ate=date(2026, 10, 12),
+            medida=None, id_=1, texto='', criado=datetime(2026, 10, 5, 9, 0)):
+    return (id_, loja, regra, objeto, motivo, None, ate, medida, texto, 'larissa', criado)
+
+
+class Ciente(unittest.TestCase):
+    def _full(self, full, eid='E1', regra='full_cobertura'):
+        return sd._sinal(LPT, 'FULL', 'MLB1', ['K-L-0421-A'], 'x', 's', 100,
+                         regra=regra, objeto=eid, medida=full)
+
+    def test_silenciado_sai_dos_ativos_e_vai_para_silenciados(self):
+        ativos, sil = sd.aplicar_cientes([self._full(6)],
+                                         [_ciente(LPT, 'full_cobertura', 'E1', medida=6)], HOJE)
+        self.assertEqual(ativos, [])
+        self.assertEqual(len(sil), 1)
+        self.assertEqual(sil[0]['ciente']['motivo'], 'falta_fornecedor')
+
+    def test_volta_quando_piora_full_zerou(self):
+        ativos, sil = sd.aplicar_cientes([self._full(0)],
+                                         [_ciente(LPT, 'full_cobertura', 'E1', medida=6)], HOJE)
+        self.assertEqual(sil, [])
+        self.assertIn('piorou: 6 un. no Full → 0 un. no Full', ativos[0]['voltou'])
+        self.assertIn('Falta no fornecedor', ativos[0]['voltou'])
+
+    def test_volta_quando_a_data_passa_com_selo_por_7_dias(self):
+        c = [_ciente(LPT, 'full_cobertura', 'E1', medida=6, ate=date(2026, 10, 1))]
+        ativos, _ = sd.aplicar_cientes([self._full(6)], c, HOJE)
+        self.assertIn('silêncio venceu em 01/10', ativos[0]['voltou'])
+        ativos, _ = sd.aplicar_cientes([self._full(6)], c, date(2026, 10, 20))
+        self.assertEqual(ativos[0]['voltou'], '')
+        ativos, sil = sd.aplicar_cientes([self._full(6)], c, date(2026, 10, 1))
+        self.assertEqual(len(sil), 1)                      # no último dia ainda calado
+
+    def test_chave_e_regra_nao_tipo(self):
+        zerado = self._full(0, regra='full_zerado_ads')
+        ativos, sil = sd.aplicar_cientes([zerado],
+                                         [_ciente(LPT, 'full_cobertura', 'E1', medida=6)], HOJE)
+        self.assertEqual(len(ativos), 1)                   # outra regra: não é calada
+        outra_loja = sd._sinal(NALA, 'FULL', 'MLB1', [], 'x', 's', 1, regra='full_cobertura',
+                               objeto='E1', medida=6)
+        ativos, _ = sd.aplicar_cientes([outra_loja],
+                                       [_ciente(LPT, 'full_cobertura', 'E1', medida=6)], HOJE)
+        self.assertEqual(len(ativos), 1)
+
+    def test_piora_por_regra(self):
+        casos = [('full_cobertura', 0, 6, True), ('full_cobertura', 2, 6, False),
+                 ('full_cobertura', 0, 0, False),
+                 ('full_zerado_ads', 20, 10, True), ('full_zerado_ads', 19, 10, False),
+                 ('ads_sem_venda', 60, 30, True), ('ads_sem_venda', 50, 30, False),
+                 ('ads_espiral', 150, 100, True), ('ads_espiral', 140, 100, False),
+                 ('full_ruptura', 150, 100, True), ('ads_custo', 3, 2, True),
+                 ('vendas_queda', -0.75, -0.55, True), ('vendas_queda', -0.70, -0.55, False),
+                 ('vendas_queda', -1.0, -0.90, True), ('visitas_queda', -0.80, -0.55, True),
+                 ('exp_anuncio', 30, 65, True), ('exp_anuncio', 65, 65, False),
+                 ('exp_familia', 5, 4, True), ('exp_familia', 4, 4, False),
+                 ('vendas_alta', 9, 1, False), ('visitas_alta', 9, 1, False),
+                 ('full_envio', 9, 1, False), ('ads_config', None, None, False)]
+        for regra, agora, antes, esperado in casos:
+            self.assertEqual(sd.piorou(regra, agora, antes), esperado, (regra, agora, antes))
+
+    def test_objeto_de_evento_leva_a_data(self):
+        config = [(LPT, 'MLB5 Pote', 'MLB5 Pote', date(2026, 10, 4), HOJE, 14, 10, 12, 12)]
+        s = sd.sinais_ads({}, config, {}, {}, sd.janelas(HOJE))
+        self.assertEqual((s[0]['regra'], s[0]['objeto']), ('ads_config', 'MLB5@2026-10-05'))
+        _a, por_sku = sd.agregar_vendas([])
+        f = sd.sinais_full([(LPT, 'E1', date(2026, 10, 4), 50, 0, 40)],
+                           [(LPT, 'MLB1', 'E1', 'A', True)], por_sku, {}, sd.janelas(HOJE))
+        self.assertEqual((f[0]['regra'], f[0]['objeto']), ('full_envio', 'E1@2026-10-04'))
+
+    def test_todo_sinal_tem_regra_conhecida(self):
+        dados = {'vendas': [_vend(NALA, 'MLB7', 'X', rec_sem=150, rec_base=3200),
+                            _vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000)],
+                 'ads': [(NALA, 'MLB7', 10, 300, 0, 0, 0, 0, 0, 0, 0)],
+                 'estoque_semana': [], 'ponte': [], 'foto': [], 'config': [],
+                 'experiencia': [(LPT, 'MLB1', HOJE, 30, 'Ruim', 100, 'Boa')]}
+        s, _ = sd.montar_sinais(dados, HOJE)
+        self.assertTrue(s)
+        for x in s:
+            self.assertIn(x['regra'], sd.REGRAS)
+            self.assertTrue(x['objeto'])
+
+    def test_validacao(self):
+        self.assertEqual(sd.validar_ciente('proposital', '', HOJE, HOJE), [])
+        self.assertTrue(sd.validar_ciente('outro', '  ', HOJE, HOJE))
+        self.assertTrue(sd.validar_ciente('xpto', 'n', HOJE, HOJE))
+        self.assertTrue(sd.validar_ciente('proposital', '', date(2026, 10, 4), HOJE))
+        self.assertEqual(sd.validar_ciente('proposital', '', date(2026, 12, 4), HOJE), [])
+        self.assertTrue(sd.validar_ciente('proposital', '', date(2026, 12, 5), HOJE))
+
+    def test_gravar_recusa_sem_tocar_no_banco(self):
+        conn = mock.Mock()
+        s = [self._full(6)]
+        with self.assertRaises(ValueError):
+            sd.gravar_cientes(conn, s, 'outro', '', HOJE, 'larissa', HOJE, [LPT])
+        with self.assertRaises(PermissionError):
+            sd.gravar_cientes(conn, s, 'proposital', '', HOJE, 'larissa', HOJE, [NALA])
+        with self.assertRaises(ValueError):
+            sd.gravar_cientes(conn, s, 'proposital', '', HOJE, '', HOJE, [LPT])
+        conn.cursor.assert_not_called()
+
+    def test_listas_do_codigo_iguais_as_check_do_sql(self):
+        with open(SQL_CIENTE, encoding='utf-8') as f:
+            texto = f.read()
+        regra = re.search(r'sinal_ciente_regra_valida CHECK \(regra IN \((.*?)\)\)', texto, re.S)
+        motivo = re.search(r'sinal_ciente_motivo_valido CHECK \(motivo IN \((.*?)\)\)', texto, re.S)
+        self.assertEqual(set(re.findall(r"'(\w+)'", regra.group(1))), set(sd.REGRAS))
+        self.assertEqual(set(re.findall(r"'(\w+)'", motivo.group(1))), set(sd.MOTIVOS))
+        self.assertIn(f"criado_em::date + {sd.DIAS_SILENCIO_MAX})", texto)
+
+    def test_quem_pode_dar_ciente(self):
+        import permissoes
+        for perfil, pode in (('ADMIN', True), ('CONTROLADORIA', True), ('COMPRAS', True),
+                             ('GESTOR', True), ('DIRETOR', False), ('', False)):
+            with mock.patch.object(permissoes, '_get_role', return_value=perfil):
+                self.assertEqual(sd.pode_dar_ciente(), pode, perfil)
+
+    def _render(self, perfil, cientes):
+        import permissoes
+        dados = {'vendas': [_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000),
+                            _vend(LPT, 'MLB2', 'B', rec_sem=0, rec_base=8000)],
+                 'resumo': [], 'metas': [], 'frescor': [], 'visitas': None,
+                 'ciente': cientes}
+        st = mock.MagicMock()
+        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        st.data_editor.side_effect = lambda df, **kw: df
+        with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
+             mock.patch.object(sd, '_ler', return_value=[(LPT,)]), \
+             mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
+             mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
+             mock.patch.object(permissoes, '_get_role', return_value=perfil):
+            sd._render_mercado_livre(st, mock.MagicMock())
+        return st
+
+    def test_tela_gestora_marca_ciente_diretor_so_ve(self):
+        silenciado = [_ciente(LPT, 'vendas_queda', 'MLB2', medida=-1.0)]
+        st = self._render('GESTOR', silenciado)
+        df = st.data_editor.call_args.args[0]
+        self.assertEqual(list(df['Anúncio']), ['MLB1'])     # o silenciado saiu
+        self.assertEqual(list(df.columns[:1]), ['Ciente'])
+        self.assertTrue(any('Silenciados (1)' in str(c.args[0])
+                            for c in st.expander.call_args_list))
+        st = self._render('DIRETOR', silenciado)
+        st.data_editor.assert_not_called()
+        self.assertEqual(st.dataframe.call_count, 2)        # sinais + silenciados
+
+    def test_sem_tabela_a_tela_e_a_v1(self):
+        st = self._render('GESTOR', None)
+        st.data_editor.assert_not_called()
+        self.assertEqual(list(st.dataframe.call_args_list[0].args[0]['Anúncio']), ['MLB2', 'MLB1'])
 
 
 # ============================================================
@@ -434,17 +610,25 @@ TABELAS = ['fact_vendas_snapshot', 'dim_metas_loja', 'dim_estoque_anuncio',
 
 
 class _Conexao:
-    """Repassa o cursor da conexão do teste e IGNORA rollback/close: o
-    ROLLBACK de verdade é do teste (tearDown), senão as TEMP somem no meio."""
+    """Repassa o cursor da conexão do teste e IGNORA commit/rollback/close: o
+    ROLLBACK de verdade é do teste (tearDown), senão as TEMP somem no meio.
+    savepoint=True: o rollback do código volta ao SAVEPOINT (testa atomicidade)."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, savepoint=False):
         self._conn = conn
+        self._sp = savepoint
+        if savepoint:
+            conn.cursor().execute('SAVEPOINT antes_do_codigo')
 
     def cursor(self):
         return self._conn.cursor()
 
-    def rollback(self):
+    def commit(self):
         pass
+
+    def rollback(self):
+        if self._sp:
+            self._conn.cursor().execute('ROLLBACK TO SAVEPOINT antes_do_codigo')
 
     def close(self):
         pass
@@ -548,6 +732,7 @@ class ComBanco(unittest.TestCase):
         dados, erros = sd.ler_tudo(self.c, HOJE, [LPT, NALA])
         self.assertEqual(erros, {})
         self.assertIsNone(dados['visitas'])                  # view ainda não existe
+        self.assertIsNone(dados['ciente'])                   # tabela da v1.1 não existe
         s, erros_bloco = sd.montar_sinais(dados, HOJE)
         self.assertEqual(erros_bloco, {})
         por = {(x['loja'], x['tipo'], x['numero'].split(':')[0].split(' ')[0]): x for x in s}
@@ -593,6 +778,138 @@ class ComBanco(unittest.TestCase):
         self.assertEqual([tuple(r[:2]) for r in dados['visitas']], [(LPT, 'MLB5183384677')])
         self.assertEqual(int(dados['visitas'][0][2]), 70)    # 7 dias × 10
         self.assertEqual(int(dados['visitas'][0][3]), 2800)  # 28 dias × 100
+
+
+@unittest.skipUnless(DB_URL, 'defina NALA_TEST_DB_URL (usuário de permissão mínima)')
+class CienteComBanco(unittest.TestCase):
+    """Ciclo do Ciente em TEMP criada com o DDL LIDO de sql/sinais_ciente.sql."""
+
+    @classmethod
+    def setUpClass(cls):
+        import psycopg2
+        cls.conn = psycopg2.connect(DB_URL, connect_timeout=15)
+        cls.conn.autocommit = False
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.conn.rollback()
+        cls.conn.close()
+
+    def setUp(self):
+        c = self.cur = self.conn.cursor()
+        for ddl in _ddl_ciente_em_temp():
+            c.execute(ddl)
+        c.execute("SELECT 'sinal_ciente'::regclass::oid IN "
+                  "(SELECT oid FROM pg_class WHERE relnamespace = pg_my_temp_schema())")
+        self.assertTrue(c.fetchone()[0], 'tabela não resolveu para pg_temp')
+        c.execute("SELECT count(*) FROM pg_constraint WHERE conrelid = 'sinal_ciente'::regclass "
+                  "AND contype = 'c'")
+        self.assertEqual(c.fetchone()[0], 7)
+
+    def tearDown(self):
+        self.cur.close()
+        self.conn.rollback()
+
+    def _s(self, objeto='E1', regra='full_cobertura', loja=LPT, medida=6):
+        return sd._sinal(loja, 'FULL', 'MLB1', ['A'], 'texto do sinal', 's', 1,
+                         regra=regra, objeto=objeto, medida=medida)
+
+    def _abertos(self, lojas=(LPT, NALA)):
+        return sd._ler(_Conexao(self.conn), sd.SQL_CIENTES_ABERTOS,
+                       {'marketplace': sd.MARKETPLACE, 'lojas': list(lojas)})
+
+    def test_grava_le_e_silencia(self):
+        hoje = datetime.now(sd.BRT).date()
+        n = sd.gravar_cientes(_Conexao(self.conn), [self._s(), self._s('E2')], 'outro',
+                              'abraçadeira em falta', hoje + timedelta(days=7), 'larissa',
+                              hoje, [LPT])
+        self.assertEqual(n, 2)
+        abertos = self._abertos()
+        self.assertEqual(len(abertos), 2)
+        c = dict(zip(sd.CIENTE_COLS, abertos[0]))
+        self.assertEqual((c['motivo'], c['nota'], c['criado_por']),
+                         ('outro', 'abraçadeira em falta', 'larissa'))
+        self.assertEqual(c['texto_no_ciente'], 'texto do sinal')
+        self.assertEqual(float(c['medida_no_ciente']), 6)
+        ativos, sil = sd.aplicar_cientes([self._s(), self._s('E3')], abertos, hoje)
+        self.assertEqual([x['objeto'] for x in ativos], ['E3'])
+        self.assertEqual([x['objeto'] for x in sil], ['E1'])
+
+    def test_novo_ciente_substitui_o_aberto(self):
+        hoje = datetime.now(sd.BRT).date()
+        for motivo in ('em_andamento', 'proposital'):
+            sd.gravar_cientes(_Conexao(self.conn), [self._s()], motivo, '', hoje, 'larissa',
+                              hoje, [LPT])
+        self.cur.execute("SELECT motivo, como_encerrou, encerrado_por FROM sinal_ciente ORDER BY id")
+        self.assertEqual(self.cur.fetchall(), [('em_andamento', 'substituido', 'larissa'),
+                                               ('proposital', None, None)])
+
+    def test_indice_impede_dois_abertos_na_mesma_chave(self):
+        import psycopg2
+        ins = ("INSERT INTO sinal_ciente (marketplace, loja, regra, objeto, motivo, "
+               "silenciar_ate, criado_por) VALUES ('MERCADO LIVRE', 'ML-LPT', "
+               "'full_cobertura', 'E1', 'proposital', CURRENT_DATE, 'x')")
+        self.cur.execute(ins)
+        with self.assertRaises(psycopg2.errors.UniqueViolation):
+            self.cur.execute(ins)
+
+    def test_check_recusam_o_que_o_codigo_nunca_deveria_gravar(self):
+        import psycopg2
+        base = {'marketplace': 'MERCADO LIVRE', 'loja': LPT, 'regra': 'full_cobertura',
+                'objeto': 'E9', 'motivo': 'proposital', 'nota': None,
+                'silenciar_ate': datetime.now(sd.BRT).date(), 'medida': 1, 'texto': 't',
+                'usuario': 'x'}
+        ruins = [{'motivo': 'esqueci'}, {'motivo': 'outro', 'nota': '  '},
+                 {'regra': 'qualquer'}, {'marketplace': 'Mercado Livre'},
+                 {'silenciar_ate': datetime.now(sd.BRT).date() + timedelta(days=61)},
+                 {'silenciar_ate': datetime.now(sd.BRT).date() - timedelta(days=1)},
+                 {'objeto': ' '}]
+        for mudanca in ruins:
+            self.cur.execute('SAVEPOINT r')
+            with self.assertRaises(psycopg2.errors.CheckViolation, msg=str(mudanca)):
+                self.cur.execute(sd.SQL_INSERIR_CIENTE, {**base, **mudanca})
+            self.cur.execute('ROLLBACK TO SAVEPOINT r')
+        self.cur.execute(sd.SQL_INSERIR_CIENTE, base)        # o caso bom passa
+
+    def test_transacao_unica_um_erro_nao_grava_nada(self):
+        hoje = datetime.now(sd.BRT).date()
+        ruim = self._s('E2', regra='regra_que_nao_existe')
+        with self.assertRaises(Exception):
+            sd.gravar_cientes(_Conexao(self.conn, savepoint=True), [self._s(), ruim],
+                              'proposital', '', hoje, 'larissa', hoje, [LPT])
+        self.cur.execute('SELECT count(*) FROM sinal_ciente')
+        self.assertEqual(self.cur.fetchone()[0], 0)
+
+    def test_reativar_so_nas_lojas_do_usuario(self):
+        hoje = datetime.now(sd.BRT).date()
+        sd.gravar_cientes(_Conexao(self.conn), [self._s()], 'proposital', '', hoje,
+                          'larissa', hoje, [LPT])
+        id_ = self._abertos()[0][0]
+        self.assertEqual(sd.reativar_ciente(_Conexao(self.conn), id_, 'patricia', [NALA]), 0)
+        self.assertEqual(sd.reativar_ciente(_Conexao(self.conn), id_, 'larissa', [LPT]), 1)
+        self.assertEqual(self._abertos(), [])
+        self.cur.execute("SELECT como_encerrou, encerrado_por FROM sinal_ciente")
+        self.assertEqual(self.cur.fetchall(), [('reativado', 'larissa')])
+
+    def test_ler_tudo_le_os_cientes_quando_a_tabela_existe(self):
+        hoje = datetime.now(sd.BRT).date()
+        sd.gravar_cientes(_Conexao(self.conn), [self._s(), self._s(loja=NALA)], 'proposital',
+                          '', hoje, 'larissa', hoje, [LPT, NALA])
+        c = _Conexao(self.conn)
+        self.assertTrue(sd._ler(c, sd.SQL_EXISTE_CIENTE, {})[0][0])  # ler_tudo usa isto
+        p = sd.params(hoje, [LPT])
+        self.assertEqual([r[1] for r in sd._ler(c, sd.SQL_CIENTES_ABERTOS, p)], [LPT])
+
+    def test_check_de_producao_iguais_as_do_arquivo_quando_aplicado(self):
+        self.cur.execute("SELECT to_regclass('public.sinal_ciente') IS NOT NULL")
+        if not self.cur.fetchone()[0]:
+            self.skipTest('sql/sinais_ciente.sql ainda não aplicado em produção')
+        q = ("SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+             "WHERE conrelid = %s::regclass AND contype = 'c' ORDER BY conname")
+        self.cur.execute(q, ('public.sinal_ciente',))
+        real = self.cur.fetchall()
+        self.cur.execute(q, ('pg_temp.sinal_ciente',))
+        self.assertEqual(real, self.cur.fetchall())
 
 
 if __name__ == '__main__':
