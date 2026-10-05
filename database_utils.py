@@ -543,14 +543,26 @@ def buscar_pendentes_resumo(engine):
 # (conciliar_pendentes_api), sem dar UPDATE ao coletor.
 # NAO mudar sku/numero_pedido/loja da linha pendente: sao a chave do
 # ON CONFLICT do coletor, que precisa continuar engolindo a mesma venda.
+#
+# "SOB A API" (05/10/2026): a regra vale tambem para pendente de UPLOAD cuja
+# venda a API ja' cobre: loja com fonte='api' em dim_fonte_dados (assunto
+# vendas) e data_venda >= api_desde. Caso real: 3 pendentes do ML-YanniRJ
+# (K2-LVI-CANOA0506) nascidas de upload em 23-28/09, que a API nao
+# reinseriu (mesma chave, ON CONFLICT). Reprocessar essas pela via de upload
+# poria a venda no snapshot com origem de upload E, depois, de novo pela API.
 ORIGEM_API = 'API'
 STATUS_AGUARDANDO = 'Aguardando coleta'
 
 SQL_CONCILIAR_PENDENTES_API = """
     UPDATE fact_vendas_pendentes p
        SET status = 'Reprocessado'
-     WHERE p.arquivo_origem = 'API'
-       AND p.status IN ('Pendente', 'Aguardando coleta')
+     WHERE p.status IN ('Pendente', 'Aguardando coleta')
+       AND (p.arquivo_origem = 'API'
+            OR EXISTS (SELECT 1 FROM dim_fonte_dados f
+                        WHERE f.assunto = 'vendas' AND f.fonte = 'api'
+                          AND f.api_desde IS NOT NULL
+                          AND f.loja = p.loja_origem
+                          AND p.data_venda >= f.api_desde))
        AND EXISTS (
             SELECT 1
               FROM fact_vendas_snapshot s
@@ -566,6 +578,32 @@ SQL_CONCILIAR_PENDENTES_API = """
 
 def _e_pendente_api(valor_arquivo_origem):
     return str(valor_arquivo_origem or '').strip() == ORIGEM_API
+
+
+def _carregar_lojas_api(cursor):
+    """{loja: api_desde (date)} das lojas cujas vendas vem da API. Se a
+    consulta falhar, a excecao SOBE: nao reprocessar sem saber e' mais seguro
+    do que arriscar a venda duplicada."""
+    cursor.execute("SELECT loja, api_desde FROM dim_fonte_dados "
+                   "WHERE assunto = 'vendas' AND fonte = 'api' "
+                   "AND api_desde IS NOT NULL")
+    return {loja: (desde.date() if hasattr(desde, 'date') else desde)
+            for loja, desde in cursor.fetchall()}
+
+
+def _sob_a_api(arquivo_origem, loja, data_venda, lojas_api):
+    """True se a venda ja' e' da API: origem 'API', ou loja com fonte='api' e
+    data_venda >= api_desde. Data ilegivel em loja API conta como sob a API
+    (na duvida, nao grava no snapshot)."""
+    if _e_pendente_api(arquivo_origem):
+        return True
+    desde = lojas_api.get(str(loja or '').strip())
+    if desde is None:
+        return False
+    if data_venda is None or pd.isna(data_venda):
+        return True
+    dia = data_venda.date() if hasattr(data_venda, 'date') else data_venda
+    return dia >= desde
 
 
 def _marcar_aguardando_coleta(cursor, ids):
@@ -609,7 +647,7 @@ def conciliar_pendentes_api(engine):
 
 
 def buscar_aguardando_coleta(engine):
-    """Pendentes da API ja' corrigidas na aba, esperando a proxima coleta."""
+    """Pendentes sob a API ja' corrigidas na aba, esperando a proxima coleta."""
     query = """
         SELECT p.id, p.marketplace_origem, p.loja_origem, p.numero_pedido,
                p.data_venda, p.sku AS sku_original,
@@ -618,7 +656,7 @@ def buscar_aguardando_coleta(engine):
                GREATEST(0, CURRENT_DATE - p.data_processamento::date) AS dias_esperando
           FROM fact_vendas_pendentes p
           LEFT JOIN dim_sku_mapeamento m ON m.sku_errado = p.sku
-         WHERE p.status = 'Aguardando coleta' AND p.arquivo_origem = 'API'
+         WHERE p.status = 'Aguardando coleta'
          ORDER BY p.data_processamento, p.id
     """
     try:
@@ -668,10 +706,13 @@ def reprocessar_pendentes_por_sku(engine, sku):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
     """
     ids_aguardando = []
+    lojas_api = _carregar_lojas_api(cursor)
     for _, row in df_pendentes.iterrows():
-        # Pendente da API: o snapshot e' do coletor (ver ORIGEM_API acima).
+        # Pendente sob a API: o snapshot e' do coletor (ver ORIGEM_API acima).
         # O SKU ja' esta cadastrado; a proxima coleta rele o pedido.
-        if _e_pendente_api(row.get('arquivo_origem')):
+        if _sob_a_api(row.get('arquivo_origem'), row.get('loja_origem'),
+                      pd.to_datetime(row.get('data_venda'), errors='coerce'),
+                      lojas_api):
             ids_aguardando.append(int(row['id']))
             continue
         try:
@@ -954,6 +995,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     sucesso, erros, mapeados, sem_config = 0, 0, 0, 0
     ids_processados = []
     ids_aguardando = []
+    lojas_api = _carregar_lojas_api(cursor)
 
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (
@@ -979,9 +1021,11 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                 erros += 1
                 continue
 
-            # Pendente da API: nao insere no snapshot (ver ORIGEM_API). Grava
-            # o mapeamento, se o SKU foi corrigido, e espera a proxima coleta.
-            if _e_pendente_api(item.get('arquivo_origem')):
+            # Pendente sob a API (origem 'API' ou loja/periodo ja' na API): nao
+            # insere no snapshot (ver ORIGEM_API). Grava o mapeamento, se o SKU
+            # foi corrigido, e espera a proxima coleta.
+            if _sob_a_api(item.get('arquivo_origem'), item.get('loja_origem'),
+                          item.get('data_venda'), lojas_api):
                 cursor.execute(f"SAVEPOINT api_{id_pendente}")
                 try:
                     if sku != sku_original and sku_original:
