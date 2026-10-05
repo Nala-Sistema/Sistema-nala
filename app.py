@@ -883,6 +883,13 @@ def _area_logada(engine):
         from tabela_preco import tabela_preco_page
         tabela_preco_page()
 
+    elif modulo == 'sinais':
+        mostrar_badge_filtro_loja()
+        import sinais_dia
+        if _is_dev_environment() or st.session_state.get('_force_reload_modules', False):
+            importlib.reload(sinais_dia)
+        sinais_dia.render(engine)
+
     elif modulo == 'ads':
         mostrar_badge_filtro_loja()
         from analise_ads import modulo_ads

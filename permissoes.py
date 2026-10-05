@@ -24,7 +24,7 @@ import pandas as pd
 MODULOS = [
     'inicio', 'performance', 'skus', 'vendas', 'tags',
     'compras', 'config', 'calculadora', 'ia', 'kanban',
-    'tabela_preco', 'ads', 'analise_produtos',
+    'tabela_preco', 'ads', 'analise_produtos', 'sinais',
 ]
 
 # Mapa de permissões por perfil
@@ -44,6 +44,7 @@ PERMISSOES = {
         'tabela_preco':      'completo',
         'ads':               'completo',
         'analise_produtos':  'completo',
+        'sinais':            'completo',
     },
     'CONTROLADORIA': {
         'inicio':            'completo',
@@ -59,6 +60,7 @@ PERMISSOES = {
         'tabela_preco':      'completo',
         'ads':               'completo',
         'analise_produtos':  'completo',
+        'sinais':            'completo',
     },
     'DIRETOR': {
         'inicio':            'leitura',
@@ -74,6 +76,7 @@ PERMISSOES = {
         'tabela_preco':      'leitura',
         'ads':               'leitura',
         'analise_produtos':  'leitura',
+        'sinais':            'leitura',
     },
     'COMPRAS': {
         'inicio':            'completo',
@@ -89,6 +92,7 @@ PERMISSOES = {
         'tabela_preco':      'completo',
         'ads':               'completo',
         'analise_produtos':  'completo',
+        'sinais':            'completo',
     },
     'GESTOR': {
         'inicio':            'parcial',      # filtrado por loja
@@ -104,6 +108,7 @@ PERMISSOES = {
         'tabela_preco':      'parcial',      # filtrado por marketplace
         'ads':               'parcial',      # filtrado por marketplace
         'analise_produtos':  'parcial',      # filtrado por loja
+        'sinais':            'parcial',      # filtrado por loja; sem loja = não vê nada
     },
 }
 
@@ -129,6 +134,7 @@ MENU_MODULOS = {
     '📊 Performance':           'performance',
     '📦 SKUs':                  'skus',
     '💰 Vendas':                'vendas',
+    '📡 Sinais do Dia':         'sinais',
     '📈 Análise de Produtos':   'analise_produtos',
     '🏷️ Tags':                 'tags',
     '🛒 Compras':               'compras',
