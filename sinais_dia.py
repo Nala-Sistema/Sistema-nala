@@ -51,6 +51,20 @@ v_cobertura_full (não auditados).
 
 Os limiares abaixo são CONSTANTES para a gestora e o [MESTRE ANÁLISES]
 calibrarem nas 2 primeiras semanas.
+
+RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
+  - R1: o mesmo SKU em DOIS estoques do mesmo anúncio conta a venda nos dois
+    (a venda não diz de qual variação saiu). O alarme fica pessimista (cada
+    estoque vê a venda inteira). Em 05/10 era 1 caso, fora do Full.
+  - R2: "Full zerado com ads" usa o gasto do ANÚNCIO inteiro (a API de ads
+    não separa por variação); o texto do sinal diz isso.
+  - R3: cada bloco (vendas, Full, ads, experiência, visitas) é montado e
+    cada loja é desenhada isoladamente: um dado inesperado derruba só aquele
+    bloco/loja, com st.error próprio.
+  - R4: o aviso de "coletor não rodou" assume que data_processamento,
+    data_captura e data_importacao estão em horário de Brasília sem fuso (é
+    como os coletores gravam hoje). Se um coletor passar a gravar em UTC, o
+    aviso erra em 3 horas.
 """
 
 import re
@@ -514,7 +528,8 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
         if full == 0 and ads_ontem > 0:
             out.append(_sinal(
                 loja, 'FULL', anuncio, e['skus'],
-                f"Full zerado com ads ligado (gasto ontem {_brl(ads_ontem)}"
+                f"Full zerado com ads ligado (gasto ontem {_brl(ads_ontem)} = ads do "
+                f"anúncio, todas as variações"
                 + (f"; {transf} em transferência" if transf else '') + ")",
                 "Baixar/pausar o ads até o Full voltar", max(rec_30, ads_ontem),
                 urgente=True))
@@ -730,37 +745,55 @@ def ads_por_anuncio(linhas):
     return {(r[0], r[1]): dict(zip(cols, r[2:])) for r in linhas}
 
 
+def _bloco(nome, erros, padrao, f, *args, **kw):
+    """Roda uma parte da montagem; se quebrar, guarda o erro em `erros[nome]`
+    e devolve `padrao`. Um bloco quebrado não derruba os outros (R3)."""
+    try:
+        return f(*args, **kw)
+    except Exception as e:  # noqa: BLE001 — vira st.error do bloco na tela
+        erros[nome] = e
+        return padrao
+
+
 def montar_sinais(dados, hoje):
-    """Lista de sinais (dicts) de todas as lojas, a partir do que ler_tudo leu.
-    Fonte que não veio (erro) só deixa de gerar os seus sinais."""
+    """(sinais, erros_por_bloco), a partir do que ler_tudo leu. Fonte que não
+    veio (erro de leitura) só deixa de gerar os seus sinais; bloco que quebra
+    na conta aparece em erros_por_bloco e os outros seguem."""
     j = janelas(hoje)
+    erros = {}
     mapa = dados.get('mapa') or {}
-    comp = ep.agrupar_composicao(dados.get('composicao') or [])
-    por_anuncio, por_sku = agregar_vendas(dados.get('vendas') or [])
-    ponte = _ponte_mapeada(dados.get('ponte') or [], mapa)
-    ads = ads_por_anuncio(dados.get('ads') or [])
+    comp = _bloco('experiencia', erros, {}, ep.agrupar_composicao,
+                  dados.get('composicao') or [])
+    por_anuncio, por_sku = _bloco('vendas', erros, ({}, {}), agregar_vendas,
+                                  dados.get('vendas') or [])
+    ponte = _bloco('full', erros, [], _ponte_mapeada, dados.get('ponte') or [], mapa)
+    ads = _bloco('ads', erros, {}, ads_por_anuncio, dados.get('ads') or [])
 
     sinais = []
-    if 'vendas' in dados:
-        sinais += sinais_vendas(por_anuncio, j)
-    if 'foto' in dados and 'ponte' in dados and 'vendas' in dados:
-        sinais += sinais_full(dados['foto'], ponte, por_sku, ads, j)
-    if 'ads' in dados or 'config' in dados:
-        dias_est = dias_com_estoque(dados.get('estoque_semana') or [], ponte)
-        sinais += sinais_ads(ads, dados.get('config') or [], por_anuncio, dias_est, j,
-                             com_estoque='estoque_semana' in dados and 'ponte' in dados)
-    if 'experiencia' in dados:
-        sinais += sinais_experiencia(dados['experiencia'], ponte, comp, por_anuncio)
+    if 'vendas' in dados and 'vendas' not in erros:
+        sinais += _bloco('vendas', erros, [], sinais_vendas, por_anuncio, j)
+    if 'foto' in dados and 'ponte' in dados and 'vendas' in dados and 'full' not in erros:
+        sinais += _bloco('full', erros, [], sinais_full, dados['foto'], ponte, por_sku, ads, j)
+    if ('ads' in dados or 'config' in dados) and 'ads' not in erros:
+        dias_est = _bloco('ads', erros, {}, dias_com_estoque,
+                          dados.get('estoque_semana') or [], ponte)
+        sinais += _bloco('ads', erros, [], sinais_ads, ads, dados.get('config') or [],
+                         por_anuncio, dias_est, j,
+                         com_estoque='estoque_semana' in dados and 'ponte' in dados)
+    if 'experiencia' in dados and 'experiencia' not in erros:
+        sinais += _bloco('experiencia', erros, [], sinais_experiencia,
+                         dados['experiencia'], ponte, comp, por_anuncio)
     if dados.get('visitas'):
-        sinais += sinais_visitas(dados['visitas'], por_anuncio, j)
+        sinais += _bloco('visitas', erros, [], sinais_visitas, dados['visitas'], por_anuncio, j)
 
     # Espiral/ruptura explicam a queda: o sinal genérico de VENDAS do mesmo
     # anúncio sai, para não ocupar duas linhas das 10.
     explicados = {(s['loja'], s['anuncio']) for s in sinais
                   if s['numero'].startswith(('Espiral', 'Ruptura'))}
-    return [s for s in sinais
-            if not (s['tipo'] == 'VENDAS' and s['numero'].startswith('Queda')
-                    and (s['loja'], s['anuncio']) in explicados)]
+    sinais = [s for s in sinais
+              if not (s['tipo'] == 'VENDAS' and s['numero'].startswith('Queda')
+                      and (s['loja'], s['anuncio']) in explicados)]
+    return sinais, erros
 
 
 def sinais_da_loja(sinais, loja, limite=MAX_SINAIS_POR_LOJA):
@@ -841,6 +874,9 @@ ROTULO_FONTE = {
     'frescor': 'datas de chegada', 'composicao': 'composição de kits', 'visitas': 'visitas',
 }
 
+ROTULO_BLOCO = {'vendas': 'VENDAS', 'full': 'FULL', 'ads': 'ADS',
+                'experiencia': 'EXPERIÊNCIA', 'visitas': 'VISITAS'}
+
 ICONE = {'VENDAS': '📉', 'FULL': '📦', 'ADS': '📣', 'EXPERIÊNCIA': '⭐', 'VISITAS': '👀'}
 
 
@@ -904,7 +940,7 @@ def _render_mercado_livre(st, engine):
             parciais = [p for p in ep.fotos_parciais(ep.ler_contagens(conn)) if p[0] in lojas]
         except Exception:  # noqa: BLE001
             pass
-        sinais = montar_sinais(dados, hoje)
+        sinais, erros_bloco = montar_sinais(dados, hoje)
         skus = {s for x in sinais for s in x['skus']}
         try:
             nomes = ep.ler_nomes(conn, skus)
@@ -922,6 +958,9 @@ def _render_mercado_livre(st, engine):
     if erros:
         st.error("Não consegui ler agora: " + ', '.join(ROTULO_FONTE.get(k, k) for k in erros)
                  + ". Os sinais dessas fontes ficaram de fora; o resto está abaixo.")
+    for bloco in erros_bloco:
+        st.error(f"Os sinais de {ROTULO_BLOCO.get(bloco, bloco)} não puderam ser montados "
+                 "agora; os outros blocos estão abaixo.")
     if dados.get('visitas') is None and 'visitas' not in erros:
         st.info("👀 Visitas: coleta de visitas em construção.")
 
@@ -933,34 +972,49 @@ def _render_mercado_livre(st, engine):
     for loja in lojas:
         st.markdown("---")
         st.subheader(loja)
-        avisos = frescor.get(loja, [])
-        atr = [t for n, t in avisos if n == 'atrasado']
-        cedo = [t for n, t in avisos if n == 'cedo']
-        if atr:
-            st.warning("⚠️ O coletor de hoje ainda não trouxe: " + '; '.join(atr))
-        elif cedo:
-            st.caption("⏳ O coletor do dia pode ainda não ter rodado: " + '; '.join(cedo))
-        if loja in atrasadas:
-            st.warning(f"⚠️ Foto do estoque atrasada: {pd.Timestamp(datas_foto[loja]):%d/%m}.")
-        for l, n_ult, ult, n_ant, ant in parciais:
-            if l == loja:
-                st.warning(f"⚠️ Foto do estoque possivelmente PARCIAL: {n_ult} estoques em "
-                           f"{pd.Timestamp(ult):%d/%m} contra {n_ant} em {pd.Timestamp(ant):%d/%m}.")
+        try:
+            _render_loja(st, loja, frescor, atrasadas, datas_foto, parciais, erros,
+                         resumo, sinais, nomes, j)
+        except Exception:  # noqa: BLE001 — uma loja quebrada não esconde as outras
+            st.error(f"{loja}: não consegui mostrar esta loja agora; as outras seguem.")
 
-        if 'resumo' in erros:
-            st.error("Resumo indisponível agora.")
-        else:
+
+def _render_loja(st, loja, frescor, atrasadas, datas_foto, parciais, erros, resumo,
+                 sinais, nomes, j):
+    avisos = frescor.get(loja, [])
+    atr = [t for n, t in avisos if n == 'atrasado']
+    cedo = [t for n, t in avisos if n == 'cedo']
+    if atr:
+        st.warning("⚠️ O coletor de hoje ainda não trouxe: " + '; '.join(atr))
+    elif cedo:
+        st.caption("⏳ O coletor do dia pode ainda não ter rodado: " + '; '.join(cedo))
+    if loja in atrasadas:
+        st.warning(f"⚠️ Foto do estoque atrasada: {pd.Timestamp(datas_foto[loja]):%d/%m}.")
+    for l, n_ult, ult, n_ant, ant in parciais:
+        if l == loja:
+            st.warning(f"⚠️ Foto do estoque possivelmente PARCIAL: {n_ult} estoques em "
+                       f"{pd.Timestamp(ult):%d/%m} contra {n_ant} em {pd.Timestamp(ant):%d/%m}.")
+
+    if 'resumo' in erros:
+        st.error("Resumo indisponível agora.")
+    else:
+        try:
             _render_resumo(st, loja, resumo[loja], j['ontem'])
+        except Exception:  # noqa: BLE001
+            st.error("Resumo indisponível agora.")
 
+    try:
         top, resto = sinais_da_loja(sinais, loja)
         if not top:
             st.success("Nenhum sinal hoje.")
-            continue
+            return
         st.dataframe(tabela_sinais(top, nomes), use_container_width=True, hide_index=True)
         if resto:
             with st.expander(f"Mais {len(resto)} sinais (menor R$ em jogo)"):
                 st.dataframe(tabela_sinais(resto, nomes), use_container_width=True,
                              hide_index=True)
+    except Exception:  # noqa: BLE001
+        st.error("Tabela de sinais indisponível agora para esta loja.")
 
 
 def render(engine):

@@ -120,6 +120,7 @@ class Full(unittest.TestCase):
         s = self._full(foto=foto, ads=ads)
         textos = [x['numero'] for x in s]
         self.assertTrue(any(t.startswith('Full zerado com ads ligado') and '30 em transferência' in t
+                            and 'ads do anúncio, todas as variações' in t
                             for t in textos))
         self.assertTrue(any(t.startswith('Envio entrou no Full em 04/10: +40') for t in textos))
 
@@ -260,7 +261,8 @@ class VendasEOrdem(unittest.TestCase):
         dados = {'vendas': [_vend(NALA, 'MLB7', 'LTT-CT3821', rec_sem=150, rec_base=3200)],
                  'ads': [(NALA, 'MLB7', 10, 300, 0, 0, 0, 0, 0, 0, 0)],
                  'estoque_semana': [], 'ponte': [], 'foto': [], 'config': []}
-        s = sd.montar_sinais(dados, HOJE)
+        s, erros = sd.montar_sinais(dados, HOJE)
+        self.assertEqual(erros, {})
         self.assertEqual([(x['tipo'], x['numero'].split(':')[0]) for x in s], [('FULL', 'Ruptura')])
 
     def test_corte_de_10_por_loja_ordenado_por_r(self):
@@ -274,8 +276,20 @@ class VendasEOrdem(unittest.TestCase):
 
     def test_fonte_com_erro_nao_derruba_as_outras(self):
         dados = {'vendas': [_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000)]}
-        s = sd.montar_sinais(dados, HOJE)       # sem ponte/foto/ads/experiência
+        s, erros = sd.montar_sinais(dados, HOJE)   # sem ponte/foto/ads/experiência
         self.assertEqual([x['tipo'] for x in s], ['VENDAS'])
+        self.assertEqual(erros, {})
+
+    def test_bloco_que_quebra_nao_derruba_os_outros(self):
+        dados = {'vendas': [_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000)],
+                 'foto': [(LPT, 'E1', date(2026, 10, 4), 0, 0, 0)],
+                 'ponte': [(LPT, 'MLB1', 'E1', 'A', True)],
+                 'experiencia': [(LPT, 'MLB1', HOJE, 30, 'Ruim', 100, 'Boa')],
+                 'ads': [], 'config': [], 'estoque_semana': []}
+        with mock.patch.object(sd, 'sinais_full', side_effect=KeyError('dado inesperado')):
+            s, erros = sd.montar_sinais(dados, HOJE)
+        self.assertEqual(set(erros), {'full'})
+        self.assertEqual(sorted({x['tipo'] for x in s}), ['EXPERIÊNCIA', 'VENDAS'])
 
 
 class ResumoEFrescor(unittest.TestCase):
@@ -308,6 +322,44 @@ class Permissao(unittest.TestCase):
             sd._render_mercado_livre(st, engine)
         engine.raw_connection.assert_not_called()
         st.caption.assert_called_with("Nenhuma loja atribuída ao seu perfil.")
+
+    def test_tela_mostra_erro_do_bloco_e_as_outras_lojas_seguem(self):
+        dados = {'vendas': [_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000),
+                            _vend(NALA, 'MLB2', 'B', rec_sem=0, rec_base=4000)],
+                 'foto': [], 'ponte': [], 'resumo': [], 'metas': [], 'frescor': [],
+                 'visitas': None}
+        st = mock.MagicMock()
+        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        engine = mock.MagicMock()
+        tabela_real = sd.tabela_sinais
+
+        def tabela_que_quebra_na_lpt(sinais, nomes):
+            if sinais and sinais[0]['loja'] == LPT:
+                raise ValueError('dado inesperado')
+            return tabela_real(sinais, nomes)
+        with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
+             mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
+             mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
+             mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
+             mock.patch.object(sd, 'sinais_vendas', side_effect=[KeyError('x')]):
+            sd._render_mercado_livre(st, engine)
+        erros = [c.args[0] for c in st.error.call_args_list]
+        self.assertTrue(any('VENDAS' in e for e in erros), erros)
+        self.assertEqual(st.success.call_count, 2)      # as duas lojas seguem: "Nenhum sinal"
+
+        st = mock.MagicMock()
+        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
+             mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
+             mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
+             mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
+             mock.patch.object(sd, 'tabela_sinais', side_effect=tabela_que_quebra_na_lpt):
+            sd._render_mercado_livre(st, engine)
+        erros = [c.args[0] for c in st.error.call_args_list]
+        self.assertEqual(erros, ["Tabela de sinais indisponível agora para esta loja."])
+        self.assertEqual(st.dataframe.call_count, 1)    # a ML-Nala apareceu
 
     def test_restricao_e_lojas_visiveis(self):
         import permissoes
@@ -496,7 +548,8 @@ class ComBanco(unittest.TestCase):
         dados, erros = sd.ler_tudo(self.c, HOJE, [LPT, NALA])
         self.assertEqual(erros, {})
         self.assertIsNone(dados['visitas'])                  # view ainda não existe
-        s = sd.montar_sinais(dados, HOJE)
+        s, erros_bloco = sd.montar_sinais(dados, HOJE)
+        self.assertEqual(erros_bloco, {})
         por = {(x['loja'], x['tipo'], x['numero'].split(':')[0].split(' ')[0]): x for x in s}
 
         full = [x for x in s if x['tipo'] == 'FULL' and x['loja'] == LPT]
