@@ -43,10 +43,18 @@ MKT = 'MERCADO LIVRE'
 class CursorGravador:
     """Cursor falso: guarda (sql, params) na ordem em que foram executados."""
 
-    def __init__(self, lojas_api=None):
+    def __init__(self, lojas_api=None, ja_no_snapshot=None, rowcount=0):
         self.executados = []
-        self.rowcount = 0
+        self.rowcount = rowcount
         self._lojas_api = lojas_api or {}
+        # (numero_pedido, sku, loja) que ja' estao no snapshot
+        self._ja_no_snapshot = set(ja_no_snapshot or [])
+
+    def fetchone(self):
+        sql, params = self.executados[-1]
+        if sql.startswith('SELECT 1 FROM fact_vendas_snapshot'):
+            return (1,) if tuple(params[:3]) in self._ja_no_snapshot else None
+        return None
 
     def execute(self, sql, params=None):
         self.executados.append((' '.join(sql.split()), params))
@@ -63,8 +71,8 @@ class CursorGravador:
 
 
 class ConexaoFalsa:
-    def __init__(self, lojas_api=None):
-        self.cur = CursorGravador(lojas_api)
+    def __init__(self, lojas_api=None, ja_no_snapshot=None, rowcount=0):
+        self.cur = CursorGravador(lojas_api, ja_no_snapshot, rowcount)
         self.commits = 0
 
     def cursor(self):
@@ -81,8 +89,8 @@ class ConexaoFalsa:
 
 
 class EngineFalso:
-    def __init__(self, lojas_api=None):
-        self.conn = ConexaoFalsa(lojas_api)
+    def __init__(self, lojas_api=None, ja_no_snapshot=None, rowcount=0):
+        self.conn = ConexaoFalsa(lojas_api, ja_no_snapshot, rowcount)
 
     def raw_connection(self):
         return self.conn
@@ -99,8 +107,8 @@ def item(id_, sku, sku_original, origem):
         'logistica': None}
 
 
-def _manual(itens, lojas_api=None):
-    engine = EngineFalso(lojas_api)
+def _manual(itens, lojas_api=None, ja_no_snapshot=None):
+    engine = EngineFalso(lojas_api, ja_no_snapshot)
     with mock.patch.object(du, 'buscar_skus_validos', lambda e: {'L-0320'}), \
          mock.patch.object(du, 'buscar_custos_skus', lambda e: {'L-0320': 20.0}):
         res = du.reprocessar_pendentes_manual(engine, itens)
@@ -250,6 +258,73 @@ class SemBanco(unittest.TestCase):
                                   'database_utils.py'), encoding='utf-8').read()
         for achado in re.findall(r"SET status = '([^']+)'", fonte):
             self.assertIn(achado, gravados)
+
+    # ---- venda que JA' esta no snapshot (05/10/2026) ----
+
+    def test_venda_ja_no_snapshot_fecha_a_pendente_sem_inserir_e_avisa(self):
+        """Ex. real: L-0429 da ML-LPT, 12/08, entrou pelo upload seguinte; o
+        reprocessar dava 'erro' calado pela chave unica."""
+        it = item(7, 'L-0320', 'L-0320', 'vendas.xlsx')
+        res, cur = _manual([it], ja_no_snapshot={('P7', 'L-0320', LOJA)})
+        sqls = cur.sqls()
+        self.assertFalse(any('INSERT INTO fact_vendas_snapshot' in s for s in sqls))
+        fechou = [p for s, p in cur.executados
+                  if s.startswith("UPDATE fact_vendas_pendentes SET status = 'Reprocessado'")]
+        self.assertEqual(fechou, [[7]])
+        self.assertFalse(any("'Revisado manualmente'" in s for s in sqls))
+        self.assertEqual((res['sucesso'], res['erros'], res['ja_existia']), (1, 0, 1))
+        self.assertIn('já estava(m) nas vendas', res['mensagem'])
+
+    def test_venda_ja_no_snapshot_com_sku_corrigido_ainda_lembra_o_mapeamento(self):
+        it = item(7, 'L-0320', 'L-320', 'vendas.xlsx')
+        res, cur = _manual([it], ja_no_snapshot={('P7', 'L-0320', LOJA)})
+        maps = [p for s, p in cur.executados
+                if s.startswith('INSERT INTO dim_sku_mapeamento')]
+        self.assertEqual(maps, [('L-320', 'L-0320')])
+        self.assertEqual(res['mapeados'], 1)
+
+    def test_venda_que_nao_esta_no_snapshot_insere_como_sempre(self):
+        res, cur = _manual([item(8, 'L-0320', 'L-0320', 'vendas.xlsx')])
+        self.assertTrue(any('INSERT INTO fact_vendas_snapshot' in s for s in cur.sqls()))
+        self.assertEqual(res['ja_existia'], 0)
+
+    def test_lote_com_uma_que_ja_existe_e_uma_nova(self):
+        res, cur = _manual(
+            [item(7, 'L-0320', 'L-0320', 'a.xlsx'), item(8, 'L-0320', 'L-0320', 'b.xlsx')],
+            ja_no_snapshot={('P7', 'L-0320', LOJA)})
+        inserts = [s for s in cur.sqls() if 'INSERT INTO fact_vendas_snapshot' in s]
+        self.assertEqual(len(inserts), 1)
+        self.assertEqual((res['sucesso'], res['ja_existia']), (2, 1))
+
+    # ---- Excluir Selecionadas: a tela le res['mensagem'] (05/10/2026) ----
+
+    def test_excluir_devolve_mensagem_no_sucesso(self):
+        engine = EngineFalso(rowcount=2)
+        res = du.excluir_pendentes_por_ids(engine, [1572, 1573])
+        self.assertEqual(res['excluidos'], 2)
+        self.assertEqual(res['erros'], 0)
+        self.assertIn('2 pendente(s) excluída(s)', res['mensagem'])
+
+    def test_excluir_devolve_mensagem_no_erro(self):
+        class Quebrado:
+            def raw_connection(self):
+                raise RuntimeError('banco fora')
+        with mock.patch.object(du.st, 'error'):
+            res = du.excluir_pendentes_por_ids(Quebrado(), [1])
+        self.assertEqual((res['excluidos'], res['erros']), (0, 1))
+        self.assertIn('Erro ao excluir', res['mensagem'])
+
+    def test_excluir_sem_ids_tambem_devolve_mensagem(self):
+        self.assertIn('mensagem', du.excluir_pendentes_por_ids(EngineFalso(), []))
+
+    def test_a_tela_so_le_chaves_que_excluir_devolve(self):
+        fonte = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                  'central_uploads.py'), encoding='utf-8').read()
+        chaves = set(re.findall(r"res_del\['(\w+)'\]", fonte))
+        self.assertIn('mensagem', chaves)
+        for chave in chaves:
+            self.assertIn(chave, du.excluir_pendentes_por_ids(EngineFalso(rowcount=1), [1]))
+            self.assertIn(chave, du.excluir_pendentes_por_ids(EngineFalso(), []))
 
     def test_sob_a_api_regra_pura(self):
         lojas = {'ML-YanniRJ': pd.Timestamp('2026-09-01').date()}
@@ -419,14 +494,14 @@ class CicloComBanco(unittest.TestCase):
         self.cur.execute("SAVEPOINT s")
         try:
             self.cur.execute(
-                "UPDATE fact_vendas_pendentes SET status = %s WHERE id = 1",
+                "UPDATE pg_temp.fact_vendas_pendentes SET status = %s WHERE id = 1",
                 (du.STATUS_AGUARDANDO,))
         except Exception as e:
             self.fail(f"a CHECK de status do banco recusa '{du.STATUS_AGUARDANDO}': {e}")
 
     def _plantar_pendente(self, id_, pedido, sku, origem, status='Pendente'):
         self.cur.execute(
-            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "INSERT INTO pg_temp.fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
             "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
             "data_processamento) VALUES (%s,%s,%s,%s,'2026-09-10',%s,100,%s,%s, now())",
             (id_, MKT, LOJA, pedido, sku, origem, status))
@@ -448,7 +523,7 @@ class CicloComBanco(unittest.TestCase):
         return self.cur.fetchone()[0]
 
     def _status(self, id_):
-        self.cur.execute("SELECT status FROM fact_vendas_pendentes WHERE id = %s", (id_,))
+        self.cur.execute("SELECT status FROM pg_temp.fact_vendas_pendentes WHERE id = %s", (id_,))
         return self.cur.fetchone()[0]
 
     def test_corrigiu_na_aba_some_da_aba_e_entra_no_snapshot_uma_vez_so(self):
@@ -463,7 +538,7 @@ class CicloComBanco(unittest.TestCase):
 
         # 2) a aba NAO gravou a venda; o mapeamento ficou; a pendente espera
         self.assertEqual(self._n_snapshot('PACK1'), 0)
-        self.cur.execute("SELECT sku_correto FROM dim_sku_mapeamento "
+        self.cur.execute("SELECT sku_correto FROM pg_temp.dim_sku_mapeamento "
                          "WHERE sku_errado = 'SEM-SKU:MLB777'")
         self.assertEqual(self.cur.fetchone()[0], 'L-0320')
         self.assertEqual(self._status(1), 'Aguardando coleta')
@@ -490,7 +565,7 @@ class CicloComBanco(unittest.TestCase):
 
     def test_nao_fecha_por_outro_pedido_nem_por_linha_de_upload(self):
         self._plantar_pendente(1, 'PACK1', 'SEM-SKU:MLB777', 'API', 'Aguardando coleta')
-        self.cur.execute("INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto) "
+        self.cur.execute("INSERT INTO pg_temp.dim_sku_mapeamento (sku_errado, sku_correto) "
                          "VALUES ('SEM-SKU:MLB777', 'L-0320')")
         # mesmo pedido+sku, mas veio do upload: nao prova nada sobre a API
         self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
@@ -515,7 +590,7 @@ class CicloComBanco(unittest.TestCase):
 
     def _loja_na_api(self, loja, desde='2026-09-01'):
         self.cur.execute(
-            "INSERT INTO dim_fonte_dados VALUES ('MERCADO LIVRE', %s, 'vendas', 'api', %s)",
+            "INSERT INTO pg_temp.dim_fonte_dados VALUES ('MERCADO LIVRE', %s, 'vendas', 'api', %s)",
             (loja, desde))
 
     def test_K2_LVI_upload_de_loja_api_espera_e_fecha_pela_api_sem_duplicar(self):
@@ -523,7 +598,7 @@ class CicloComBanco(unittest.TestCase):
         loja e periodo que a API ja' cobre."""
         self._loja_na_api('ML-YanniRJ')
         self.cur.execute(
-            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "INSERT INTO pg_temp.fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
             "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
             "data_processamento) VALUES (1690, %s, 'ML-YanniRJ', '2000015183298999', "
             "'2026-09-23', 'K2-LVI-CANOA0506', 52.42, 'vendas ML YANNI RJ 22 a 23-09.xlsx', "
@@ -563,7 +638,7 @@ class CicloComBanco(unittest.TestCase):
     def test_pendente_de_upload_ainda_Pendente_tambem_fecha_quando_a_api_grava(self):
         self._loja_na_api('ML-YanniRJ')
         self.cur.execute(
-            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "INSERT INTO pg_temp.fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
             "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
             "data_processamento) VALUES (1701, %s, 'ML-YanniRJ', '2000018640143246', "
             "'2026-09-25', 'K2-LVI-CANOA0506', 51.72, 'vendas ML YANNI RJ 24 a 27-09.xlsx', "
@@ -578,13 +653,13 @@ class CicloComBanco(unittest.TestCase):
         self._loja_na_api('ML-YanniRJ')
         # antes do api_desde
         self.cur.execute(
-            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "INSERT INTO pg_temp.fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
             "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
             "data_processamento) VALUES (1, %s, 'ML-YanniRJ', 'A1', '2026-08-31', 'S', 1, "
             "'x.xlsx', 'Pendente', now())", (MKT,))
         # loja que nao e' API
         self.cur.execute(
-            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "INSERT INTO pg_temp.fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
             "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
             "data_processamento) VALUES (2, 'MAGALU', 'Magalu-Nala', 'A2', '2026-09-20', 'S', 1, "
             "'y.csv', 'Pendente', now())")

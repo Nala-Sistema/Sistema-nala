@@ -969,10 +969,13 @@ def excluir_pendentes_por_ids(engine, ids):
     Args:
         ids: lista de IDs (int) a deletar
     
-    Retorna: dict com {excluidos: int, erros: int}
+    Retorna: dict com {excluidos: int, erros: int, mensagem: str}. A tela
+    (central_uploads, "Excluir Selecionadas") le 'mensagem' nos dois caminhos;
+    sem ela dava KeyError depois de a exclusao ja' ter funcionado (05/10/2026).
     """
     if not ids:
-        return {'excluidos': 0, 'erros': 0}
+        return {'excluidos': 0, 'erros': 0,
+                'mensagem': "Nenhuma pendente selecionada."}
     
     try:
         conn = engine.raw_connection()
@@ -986,10 +989,12 @@ def excluir_pendentes_por_ids(engine, ids):
         conn.commit()
         cursor.close()
         conn.close()
-        return {'excluidos': excluidos, 'erros': 0}
+        return {'excluidos': excluidos, 'erros': 0,
+                'mensagem': f"{excluidos} pendente(s) excluída(s)."}
     except Exception as e:
         st.error(f"Erro ao excluir pendentes: {e}")
-        return {'excluidos': 0, 'erros': len(ids)}
+        return {'excluidos': 0, 'erros': len(ids),
+                'mensagem': f"Erro ao excluir {len(ids)} pendente(s): {e}"}
 
 
 def reprocessar_pendentes_manual(engine, ids_e_dados):
@@ -1019,10 +1024,11 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     sucesso, erros, mapeados, sem_config = 0, 0, 0, 0
     ids_processados = []
     ids_aguardando = []
+    ids_ja_existia = []
     lojas_api, falha = _lojas_api_ou_fechar(conn, cursor)
     if falha:
         return {'sucesso': 0, 'erros': 0, 'mapeados': 0, 'sem_config': 0,
-                'aguardando': 0, 'mensagem': falha}
+                'aguardando': 0, 'ja_existia': 0, 'mensagem': falha}
 
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (
@@ -1064,6 +1070,28 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
                     erros += 1
                     continue
                 ids_aguardando.append(id_pendente)
+                sucesso += 1
+                continue
+
+            # A venda JA' esta no snapshot (mesmo pedido + loja + SKU): entrou
+            # por outro caminho depois de a pendente nascer (ex.: L-0429 da
+            # ML-LPT, 12/08, que entrou pelo upload seguinte). Antes o INSERT
+            # batia na chave unica e virava "erro" calado. Agora a pendente fecha
+            # como 'Reprocessado', sem inserir nada, e a tela avisa.
+            cursor.execute(
+                "SELECT 1 FROM fact_vendas_snapshot "
+                "WHERE numero_pedido = %s AND sku = %s AND loja_origem = %s LIMIT 1",
+                (item.get('numero_pedido', ''), sku, item.get('loja_origem', '')))
+            if cursor.fetchone():
+                if sku != sku_original and sku_original:
+                    cursor.execute(f"SAVEPOINT ja_{id_pendente}")
+                    try:
+                        _gravar_mapeamento(cursor, sku_original, sku)
+                        mapeados += 1
+                        cursor.execute(f"RELEASE SAVEPOINT ja_{id_pendente}")
+                    except Exception:
+                        cursor.execute(f"ROLLBACK TO SAVEPOINT ja_{id_pendente}")
+                ids_ja_existia.append(id_pendente)
                 sucesso += 1
                 continue
 
@@ -1181,6 +1209,11 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
             f"UPDATE fact_vendas_pendentes SET status = 'Revisado manualmente' WHERE id IN ({placeholders})",
             ids_processados
         )
+    if ids_ja_existia:
+        cursor.execute(
+            f"UPDATE fact_vendas_pendentes SET status = 'Reprocessado' "
+            f"WHERE id IN ({','.join(['%s'] * len(ids_ja_existia))})",
+            ids_ja_existia)
     _marcar_aguardando_coleta(cursor, ids_aguardando)
 
     conn.commit()
@@ -1188,6 +1221,9 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     conn.close()
 
     msg = f"Reprocessado: {sucesso} sucesso(s), {erros} erro(s), {mapeados} mapeamento(s) salvo(s)."
+    if ids_ja_existia:
+        msg += (f" {len(ids_ja_existia)} já estava(m) nas vendas (pendente fechada, "
+                f"nada foi inserido).")
     if ids_aguardando:
         msg += (f" {len(ids_aguardando)} venda(s) da API aguardam a próxima coleta"
                 f" (ela entra no snapshot sozinha).")
@@ -1200,6 +1236,7 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
         'mapeados': mapeados,
         'sem_config': sem_config,
         'aguardando': len(ids_aguardando),
+        'ja_existia': len(ids_ja_existia),
         'mensagem': msg
     }
 
