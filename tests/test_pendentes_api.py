@@ -233,6 +233,24 @@ class SemBanco(unittest.TestCase):
         erro_na_tela.assert_called_once()
         self.assertNotIn('banco fora', erro_na_tela.call_args[0][0])   # sem erro cru
 
+    def test_todo_status_que_o_codigo_grava_esta_no_SQL_da_constraint(self):
+        """05/10/2026: 'Aguardando coleta' nao estava na CHECK de producao e o
+        botao Reprocessar quebrou. Todo status que a aba ou a conciliacao grava
+        tem de constar do SQL que recria a constraint."""
+        sql = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                'sql', 'pendentes_status_aguardando.sql'),
+                   encoding='utf-8').read()
+        gravados = {du.STATUS_AGUARDANDO, 'Pendente', 'Reprocessado',
+                    'Revisado manualmente'}
+        for status in gravados:
+            self.assertIn(f"'{status}'", sql, status)
+        # e o codigo so' grava estes quatro: nenhum outro literal de status novo
+        # em UPDATE de fact_vendas_pendentes sem passar por aqui
+        fonte = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                  'database_utils.py'), encoding='utf-8').read()
+        for achado in re.findall(r"SET status = '([^']+)'", fonte):
+            self.assertIn(achado, gravados)
+
     def test_sob_a_api_regra_pura(self):
         lojas = {'ML-YanniRJ': pd.Timestamp('2026-09-01').date()}
         f = du._sob_a_api
@@ -355,9 +373,23 @@ class CicloComBanco(unittest.TestCase):
         cls.conn.rollback()
         cls.conn.close()
 
+    def _copiar_checks(self, tabela):
+        """Copia da tabela REAL (pg_constraint) as CHECK constraints para a TEMP
+        de mesmo nome. Sem isto a TEMP aceita qualquer status e o teste passa
+        enquanto producao recusa (05/10/2026: 'Aguardando coleta')."""
+        self.cur.execute(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = %s::regclass AND contype = 'c'", (f'public.{tabela}',))
+        for nome, definicao in self.cur.fetchall():
+            self.cur.execute(
+                f'ALTER TABLE pg_temp.{tabela} ADD CONSTRAINT "{nome}" {definicao}')
+
     def setUp(self):
         self.cur = self.conn.cursor()
         self.cur.execute(_DDL)
+        for tabela in ('fact_vendas_pendentes', 'fact_vendas_snapshot',
+                       'dim_fonte_dados'):
+            self._copiar_checks(tabela)
         self.cur.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(ARRAY['fact_vendas_pendentes', 'fact_vendas_snapshot',
@@ -379,6 +411,18 @@ class CicloComBanco(unittest.TestCase):
     def tearDown(self):
         self.cur.close()
         self.conn.rollback()
+
+    def test_a_constraint_REAL_de_status_aceita_o_status_que_o_codigo_grava(self):
+        """Falha enquanto sql/pendentes_status_aguardando.sql nao rodar no banco
+        que o teste usa: a TEMP leva a CHECK de producao."""
+        self._plantar_pendente(1, 'PACK1', 'SEM-SKU:MLB777', 'API')
+        self.cur.execute("SAVEPOINT s")
+        try:
+            self.cur.execute(
+                "UPDATE fact_vendas_pendentes SET status = %s WHERE id = 1",
+                (du.STATUS_AGUARDANDO,))
+        except Exception as e:
+            self.fail(f"a CHECK de status do banco recusa '{du.STATUS_AGUARDANDO}': {e}")
 
     def _plantar_pendente(self, id_, pedido, sku, origem, status='Pendente'):
         self.cur.execute(
