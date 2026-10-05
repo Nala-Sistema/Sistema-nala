@@ -591,6 +591,27 @@ def _carregar_lojas_api(cursor):
             for loja, desde in cursor.fetchall()}
 
 
+MSG_SEM_LOJAS_API = ("Não foi possível confirmar quais lojas vendem pela API "
+                     "(consulta a dim_fonte_dados falhou). Nada foi reprocessado: "
+                     "tente de novo em instantes.")
+
+
+def _lojas_api_ou_fechar(conn, cursor):
+    """(lojas_api, None) ou (None, mensagem). Se a consulta falhar, desfaz,
+    FECHA a conexao (R2 do auditor: ela vazava) e mostra mensagem amigavel; quem
+    chama devolve sem inserir nada."""
+    try:
+        return _carregar_lojas_api(cursor), None
+    except Exception:
+        for fechar in (conn.rollback, cursor.close, conn.close):
+            try:
+                fechar()
+            except Exception:
+                pass
+        st.error(f"❌ {MSG_SEM_LOJAS_API}")
+        return None, MSG_SEM_LOJAS_API
+
+
 def _sob_a_api(arquivo_origem, loja, data_venda, lojas_api):
     """True se a venda ja' e' da API: origem 'API', ou loja com fonte='api' e
     data_venda >= api_desde. Data ilegivel em loja API conta como sob a API
@@ -706,7 +727,10 @@ def reprocessar_pendentes_por_sku(engine, sku):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
     """
     ids_aguardando = []
-    lojas_api = _carregar_lojas_api(cursor)
+    lojas_api, falha = _lojas_api_ou_fechar(conn, cursor)
+    if falha:
+        return {'sucesso': 0, 'erros': 0, 'sem_config': 0, 'aguardando': 0,
+                'mensagem': falha}
     for _, row in df_pendentes.iterrows():
         # Pendente sob a API: o snapshot e' do coletor (ver ORIGEM_API acima).
         # O SKU ja' esta cadastrado; a proxima coleta rele o pedido.
@@ -995,7 +1019,10 @@ def reprocessar_pendentes_manual(engine, ids_e_dados):
     sucesso, erros, mapeados, sem_config = 0, 0, 0, 0
     ids_processados = []
     ids_aguardando = []
-    lojas_api = _carregar_lojas_api(cursor)
+    lojas_api, falha = _lojas_api_ou_fechar(conn, cursor)
+    if falha:
+        return {'sucesso': 0, 'erros': 0, 'mapeados': 0, 'sem_config': 0,
+                'aguardando': 0, 'mensagem': falha}
 
     sql_ins = """
         INSERT INTO fact_vendas_snapshot (

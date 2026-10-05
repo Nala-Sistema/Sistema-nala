@@ -193,6 +193,46 @@ class SemBanco(unittest.TestCase):
                             for s in engine.conn.cur.sqls()))
         self.assertEqual(res['aguardando'], 0)
 
+    def test_falha_ao_ler_lojas_api_fecha_a_conexao_e_nao_insere(self):
+        """R2 do auditor: a excecao vazava a conexao e a tela mostrava erro cru."""
+        class CursorQuebrado(CursorGravador):
+            def execute(self, sql, params=None):
+                super().execute(sql, params)
+                if 'dim_fonte_dados' in sql:
+                    raise RuntimeError('banco fora')
+
+        class ConnQuebrada(ConexaoFalsa):
+            def __init__(self):
+                super().__init__()
+                self.cur = CursorQuebrado()
+                self.fechada = False
+                self.desfeita = False
+
+            def close(self):
+                self.fechada = True
+
+            def rollback(self):
+                self.desfeita = True
+
+        class EngineQuebrado:
+            def __init__(self):
+                self.conn = ConnQuebrada()
+
+            def raw_connection(self):
+                return self.conn
+
+        engine = EngineQuebrado()
+        with mock.patch.object(du, 'buscar_skus_validos', lambda e: {'L-0320'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {'L-0320': 20.0}),              mock.patch.object(du.st, 'error') as erro_na_tela:
+            res = du.reprocessar_pendentes_manual(
+                engine, [item(1, 'L-0320', 'L-0320', 'x.xlsx')])
+        self.assertTrue(engine.conn.fechada)
+        self.assertTrue(engine.conn.desfeita)
+        self.assertEqual((res['sucesso'], res['aguardando']), (0, 0))
+        self.assertIn('Nada foi reprocessado', res['mensagem'])
+        self.assertFalse(any('INSERT INTO' in s for s in engine.conn.cur.sqls()))
+        erro_na_tela.assert_called_once()
+        self.assertNotIn('banco fora', erro_na_tela.call_args[0][0])   # sem erro cru
+
     def test_sob_a_api_regra_pura(self):
         lojas = {'ML-YanniRJ': pd.Timestamp('2026-09-01').date()}
         f = du._sob_a_api
@@ -351,16 +391,16 @@ class CicloComBanco(unittest.TestCase):
         """O que sincronizar_snapshot faz: apaga as linhas 'API' da loja na
         janela e reinsere o que o espelho mostra agora (SKU ja' corrigido)."""
         self.cur.execute(
-            "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s AND "
+            "DELETE FROM pg_temp.fact_vendas_snapshot WHERE marketplace_origem = %s AND "
             "loja_origem = %s AND arquivo_origem = 'API' AND data_venda >= '2026-09-01'",
             (MKT, LOJA))
         self.cur.execute(
-            "INSERT INTO fact_vendas_snapshot VALUES (%s,%s,%s,'2026-09-10',%s,1,'API')",
+            "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s,%s,%s,'2026-09-10',%s,1,'API')",
             (MKT, LOJA, pedido, sku_certo))
 
     def _n_snapshot(self, pedido):
         self.cur.execute(
-            "SELECT count(*) FROM fact_vendas_snapshot WHERE numero_pedido = %s", (pedido,))
+            "SELECT count(*) FROM pg_temp.fact_vendas_snapshot WHERE numero_pedido = %s", (pedido,))
         return self.cur.fetchone()[0]
 
     def _status(self, id_):
@@ -409,13 +449,13 @@ class CicloComBanco(unittest.TestCase):
         self.cur.execute("INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto) "
                          "VALUES ('SEM-SKU:MLB777', 'L-0320')")
         # mesmo pedido+sku, mas veio do upload: nao prova nada sobre a API
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'PACK1','2026-09-10','L-0320',1,'vendas.xlsx')", (MKT, LOJA))
         # pedido diferente, da API
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'OUTRO','2026-09-10','L-0320',1,'API')", (MKT, LOJA))
         # mesmo pedido, SKU diferente do mapeado
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'PACK1','2026-09-10','OUTRO-SKU',1,'API')", (MKT, LOJA))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
         self.assertEqual(self._status(1), 'Aguardando coleta')
@@ -461,13 +501,15 @@ class CicloComBanco(unittest.TestCase):
 
         # a coleta (origem API, mesma chave) grava a venda: UMA linha, mesmo
         # depois de duas noites
-        self.cur.execute("DELETE FROM fact_vendas_snapshot")
+        # pg_temp. explicito (R1 do auditor): se a TEMP cair num rollback no meio,
+        # um DELETE sem schema iria na tabela REAL.
+        self.cur.execute("DELETE FROM pg_temp.fact_vendas_snapshot WHERE loja_origem = 'ML-YanniRJ'")
         for _ in range(2):
             self.cur.execute(
-                "DELETE FROM fact_vendas_snapshot WHERE loja_origem = 'ML-YanniRJ' "
+                "DELETE FROM pg_temp.fact_vendas_snapshot WHERE loja_origem = 'ML-YanniRJ' "
                 "AND arquivo_origem = 'API'")
             self.cur.execute(
-                "INSERT INTO fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
+                "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
                 "'2000015183298999', '2026-09-23', 'K2-LVI-CANOA0506', 1, 'API')", (MKT,))
         self.assertEqual(self._n_snapshot('2000015183298999'), 1)
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 1)
@@ -483,7 +525,7 @@ class CicloComBanco(unittest.TestCase):
             "'2026-09-25', 'K2-LVI-CANOA0506', 51.72, 'vendas ML YANNI RJ 24 a 27-09.xlsx', "
             "'Pendente', now())", (MKT,))
         self.cur.execute(
-            "INSERT INTO fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
+            "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
             "'2000018640143246', '2026-09-25', 'K2-LVI-CANOA0506', 1, 'API')", (MKT,))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 1)
         self.assertEqual(self._status(1701), 'Reprocessado')
@@ -505,13 +547,13 @@ class CicloComBanco(unittest.TestCase):
         for ped, loja, dv in (('A1', 'ML-YanniRJ', '2026-08-31'),
                               ('A2', 'Magalu-Nala', '2026-09-20')):
             self.cur.execute(
-                "INSERT INTO fact_vendas_snapshot VALUES (%s, %s, %s, %s, 'S', 1, 'API')",
+                "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, %s, %s, %s, 'S', 1, 'API')",
                 (MKT, loja, ped, dv))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
 
     def test_pendente_de_upload_nunca_e_tocada_pela_conciliacao(self):
         self._plantar_pendente(1, 'P9', 'L-0320', 'vendas.xlsx')
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'P9','2026-09-10','L-0320',1,'API')", (MKT, LOJA))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
         self.assertEqual(self._status(1), 'Pendente')
