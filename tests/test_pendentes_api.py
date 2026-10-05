@@ -43,12 +43,17 @@ MKT = 'MERCADO LIVRE'
 class CursorGravador:
     """Cursor falso: guarda (sql, params) na ordem em que foram executados."""
 
-    def __init__(self):
+    def __init__(self, lojas_api=None):
         self.executados = []
         self.rowcount = 0
+        self._lojas_api = lojas_api or {}
 
     def execute(self, sql, params=None):
         self.executados.append((' '.join(sql.split()), params))
+
+    def fetchall(self):
+        # unica leitura do cursor: as lojas cuja venda vem da API
+        return [(l, pd.Timestamp(d)) for l, d in self._lojas_api.items()]
 
     def close(self):
         pass
@@ -58,8 +63,8 @@ class CursorGravador:
 
 
 class ConexaoFalsa:
-    def __init__(self):
-        self.cur = CursorGravador()
+    def __init__(self, lojas_api=None):
+        self.cur = CursorGravador(lojas_api)
         self.commits = 0
 
     def cursor(self):
@@ -76,8 +81,8 @@ class ConexaoFalsa:
 
 
 class EngineFalso:
-    def __init__(self):
-        self.conn = ConexaoFalsa()
+    def __init__(self, lojas_api=None):
+        self.conn = ConexaoFalsa(lojas_api)
 
     def raw_connection(self):
         return self.conn
@@ -94,8 +99,8 @@ def item(id_, sku, sku_original, origem):
         'logistica': None}
 
 
-def _manual(itens):
-    engine = EngineFalso()
+def _manual(itens, lojas_api=None):
+    engine = EngineFalso(lojas_api)
     with mock.patch.object(du, 'buscar_skus_validos', lambda e: {'L-0320'}), \
          mock.patch.object(du, 'buscar_custos_skus', lambda e: {'L-0320': 20.0}):
         res = du.reprocessar_pendentes_manual(engine, itens)
@@ -142,6 +147,103 @@ class SemBanco(unittest.TestCase):
         self.assertFalse(any(s.startswith('INSERT INTO dim_sku_mapeamento')
                              for s in cur.sqls()))
 
+    # ---- 05/10/2026: pendente de UPLOAD cuja venda a API ja' cobre ----
+    # Caso real: K2-LVI-CANOA0506 no ML-YanniRJ (3 pendentes de upload de
+    # 23-28/09). Reprocessar pela via de upload poria a venda no snapshot com
+    # origem de upload E depois de novo pela API.
+    API_YANNI = {'ML-YanniRJ': '2026-09-01'}
+
+    def _upload_yanni(self, id_, data, loja='ML-YanniRJ'):
+        return item(id_, 'K2-LVI-CANOA0506', 'K2-LVI-CANOA0506',
+                    'vendas ML YANNI RJ 22 a 23-09.xlsx') | {
+            'loja_origem': loja, 'data_venda': pd.Timestamp(data)}
+
+    def test_upload_de_loja_api_dentro_do_periodo_api_NAO_insere_e_espera(self):
+        engine_itens = [self._upload_yanni(1, '2026-09-23')]
+        with mock.patch.object(du, 'buscar_skus_validos',
+                               lambda e: {'K2-LVI-CANOA0506'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {}):
+            engine = EngineFalso(self.API_YANNI)
+            res = du.reprocessar_pendentes_manual(engine, engine_itens)
+        sqls = engine.conn.cur.sqls()
+        self.assertFalse(any('INSERT INTO fact_vendas_snapshot' in s for s in sqls))
+        self.assertEqual(res['aguardando'], 1)
+        marcas = [p for s, p in engine.conn.cur.executados
+                  if s.startswith('UPDATE fact_vendas_pendentes SET status = %s')]
+        self.assertEqual(marcas, [['Aguardando coleta', 1]])
+        # nem o 'Revisado manualmente' do caminho de upload
+        self.assertFalse(any("'Revisado manualmente'" in s for s in sqls))
+
+    def test_upload_anterior_ao_api_desde_segue_como_sempre(self):
+        engine = EngineFalso(self.API_YANNI)
+        with mock.patch.object(du, 'buscar_skus_validos',
+                               lambda e: {'K2-LVI-CANOA0506'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {}):
+            res = du.reprocessar_pendentes_manual(
+                engine, [self._upload_yanni(2, '2026-08-31')])
+        self.assertTrue(any('INSERT INTO fact_vendas_snapshot' in s
+                            for s in engine.conn.cur.sqls()))
+        self.assertEqual(res['aguardando'], 0)
+
+    def test_upload_de_loja_que_nao_e_api_segue_como_sempre(self):
+        engine = EngineFalso(self.API_YANNI)       # so' o Yanni e' API
+        with mock.patch.object(du, 'buscar_skus_validos',
+                               lambda e: {'K2-LVI-CANOA0506'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {}):
+            res = du.reprocessar_pendentes_manual(
+                engine, [self._upload_yanni(3, '2026-09-23', loja='Magalu-Nala')])
+        self.assertTrue(any('INSERT INTO fact_vendas_snapshot' in s
+                            for s in engine.conn.cur.sqls()))
+        self.assertEqual(res['aguardando'], 0)
+
+    def test_falha_ao_ler_lojas_api_fecha_a_conexao_e_nao_insere(self):
+        """R2 do auditor: a excecao vazava a conexao e a tela mostrava erro cru."""
+        class CursorQuebrado(CursorGravador):
+            def execute(self, sql, params=None):
+                super().execute(sql, params)
+                if 'dim_fonte_dados' in sql:
+                    raise RuntimeError('banco fora')
+
+        class ConnQuebrada(ConexaoFalsa):
+            def __init__(self):
+                super().__init__()
+                self.cur = CursorQuebrado()
+                self.fechada = False
+                self.desfeita = False
+
+            def close(self):
+                self.fechada = True
+
+            def rollback(self):
+                self.desfeita = True
+
+        class EngineQuebrado:
+            def __init__(self):
+                self.conn = ConnQuebrada()
+
+            def raw_connection(self):
+                return self.conn
+
+        engine = EngineQuebrado()
+        with mock.patch.object(du, 'buscar_skus_validos', lambda e: {'L-0320'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {'L-0320': 20.0}),              mock.patch.object(du.st, 'error') as erro_na_tela:
+            res = du.reprocessar_pendentes_manual(
+                engine, [item(1, 'L-0320', 'L-0320', 'x.xlsx')])
+        self.assertTrue(engine.conn.fechada)
+        self.assertTrue(engine.conn.desfeita)
+        self.assertEqual((res['sucesso'], res['aguardando']), (0, 0))
+        self.assertIn('Nada foi reprocessado', res['mensagem'])
+        self.assertFalse(any('INSERT INTO' in s for s in engine.conn.cur.sqls()))
+        erro_na_tela.assert_called_once()
+        self.assertNotIn('banco fora', erro_na_tela.call_args[0][0])   # sem erro cru
+
+    def test_sob_a_api_regra_pura(self):
+        lojas = {'ML-YanniRJ': pd.Timestamp('2026-09-01').date()}
+        f = du._sob_a_api
+        self.assertTrue(f('API', 'Qualquer', pd.Timestamp('2026-01-01'), {}))
+        self.assertTrue(f('x.xlsx', 'ML-YanniRJ', pd.Timestamp('2026-09-01'), lojas))
+        self.assertFalse(f('x.xlsx', 'ML-YanniRJ', pd.Timestamp('2026-08-31'), lojas))
+        self.assertFalse(f('x.xlsx', 'Magalu-Nala', pd.Timestamp('2026-09-23'), lojas))
+        # data ilegivel em loja API: na duvida, nao grava no snapshot
+        self.assertTrue(f('x.xlsx', 'ML-YanniRJ', pd.NaT, lojas))
+        self.assertFalse(f('x.xlsx', 'Magalu-Nala', pd.NaT, lojas))
+
     def test_pendente_de_upload_segue_como_sempre(self):
         res, cur = _manual([item(2, 'L-0320', 'L-320', 'vendas_setembro.xlsx')])
         self.assertTrue(any('INSERT INTO fact_vendas_snapshot' in s
@@ -184,6 +286,9 @@ class SemBanco(unittest.TestCase):
         self.assertIn("s.arquivo_origem = 'API'", sql)
         self.assertIn('dim_sku_mapeamento', sql)
         self.assertIn("p.arquivo_origem = 'API'", sql)
+        # e a pendente de UPLOAD de loja/periodo que ja' esta na API
+        self.assertIn("f.fonte = 'api'", sql)
+        self.assertIn('p.data_venda >= f.api_desde', sql)
         self.assertNotIn('%', sql)
 
 
@@ -205,6 +310,10 @@ CREATE TEMP TABLE fact_vendas_snapshot (
 CREATE TEMP TABLE dim_sku_mapeamento (
     sku_errado varchar PRIMARY KEY, sku_correto varchar,
     data_criacao timestamp DEFAULT now()
+) ON COMMIT DROP;
+CREATE TEMP TABLE dim_fonte_dados (
+    marketplace varchar, loja varchar, assunto varchar, fonte varchar,
+    api_desde date
 ) ON COMMIT DROP;
 """
 
@@ -252,7 +361,7 @@ class CicloComBanco(unittest.TestCase):
         self.cur.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(ARRAY['fact_vendas_pendentes', 'fact_vendas_snapshot',
-                              'dim_sku_mapeamento']) AS t(nome)
+                              'dim_sku_mapeamento', 'dim_fonte_dados']) AS t(nome)
             JOIN pg_class c ON c.oid = t.nome::regclass
         """)
         self.assertTrue(self.cur.fetchone()[0], 'tabela não resolveu para pg_temp')
@@ -282,16 +391,16 @@ class CicloComBanco(unittest.TestCase):
         """O que sincronizar_snapshot faz: apaga as linhas 'API' da loja na
         janela e reinsere o que o espelho mostra agora (SKU ja' corrigido)."""
         self.cur.execute(
-            "DELETE FROM fact_vendas_snapshot WHERE marketplace_origem = %s AND "
+            "DELETE FROM pg_temp.fact_vendas_snapshot WHERE marketplace_origem = %s AND "
             "loja_origem = %s AND arquivo_origem = 'API' AND data_venda >= '2026-09-01'",
             (MKT, LOJA))
         self.cur.execute(
-            "INSERT INTO fact_vendas_snapshot VALUES (%s,%s,%s,'2026-09-10',%s,1,'API')",
+            "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s,%s,%s,'2026-09-10',%s,1,'API')",
             (MKT, LOJA, pedido, sku_certo))
 
     def _n_snapshot(self, pedido):
         self.cur.execute(
-            "SELECT count(*) FROM fact_vendas_snapshot WHERE numero_pedido = %s", (pedido,))
+            "SELECT count(*) FROM pg_temp.fact_vendas_snapshot WHERE numero_pedido = %s", (pedido,))
         return self.cur.fetchone()[0]
 
     def _status(self, id_):
@@ -340,13 +449,13 @@ class CicloComBanco(unittest.TestCase):
         self.cur.execute("INSERT INTO dim_sku_mapeamento (sku_errado, sku_correto) "
                          "VALUES ('SEM-SKU:MLB777', 'L-0320')")
         # mesmo pedido+sku, mas veio do upload: nao prova nada sobre a API
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'PACK1','2026-09-10','L-0320',1,'vendas.xlsx')", (MKT, LOJA))
         # pedido diferente, da API
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'OUTRO','2026-09-10','L-0320',1,'API')", (MKT, LOJA))
         # mesmo pedido, SKU diferente do mapeado
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'PACK1','2026-09-10','OUTRO-SKU',1,'API')", (MKT, LOJA))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
         self.assertEqual(self._status(1), 'Aguardando coleta')
@@ -360,9 +469,91 @@ class CicloComBanco(unittest.TestCase):
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 1)
         self.assertEqual(self._status(1), 'Reprocessado')
 
+    def _loja_na_api(self, loja, desde='2026-09-01'):
+        self.cur.execute(
+            "INSERT INTO dim_fonte_dados VALUES ('MERCADO LIVRE', %s, 'vendas', 'api', %s)",
+            (loja, desde))
+
+    def test_K2_LVI_upload_de_loja_api_espera_e_fecha_pela_api_sem_duplicar(self):
+        """O caso real de 05/10/2026: pendente de UPLOAD (ML-YanniRJ, 23/09) em
+        loja e periodo que a API ja' cobre."""
+        self._loja_na_api('ML-YanniRJ')
+        self.cur.execute(
+            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
+            "data_processamento) VALUES (1690, %s, 'ML-YanniRJ', '2000015183298999', "
+            "'2026-09-23', 'K2-LVI-CANOA0506', 52.42, 'vendas ML YANNI RJ 22 a 23-09.xlsx', "
+            "'Pendente', now())", (MKT,))
+        # sem a API ter gravado nada, a conciliacao nao fecha
+        self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
+
+        # a aba NAO grava no snapshot (nem com origem de upload)
+        with mock.patch.object(du, 'buscar_skus_validos',
+                               lambda e: {'K2-LVI-CANOA0506'}),              mock.patch.object(du, 'buscar_custos_skus', lambda e: {}):
+            res = du.reprocessar_pendentes_manual(self.engine, [
+                item(1690, 'K2-LVI-CANOA0506', 'K2-LVI-CANOA0506',
+                     'vendas ML YANNI RJ 22 a 23-09.xlsx') | {
+                    'loja_origem': 'ML-YanniRJ', 'numero_pedido': '2000015183298999',
+                    'data_venda': pd.Timestamp('2026-09-23')}])
+        self.assertEqual(res['aguardando'], 1)
+        self.assertEqual(self._n_snapshot('2000015183298999'), 0)
+        self.assertEqual(self._status(1690), 'Aguardando coleta')
+
+        # a coleta (origem API, mesma chave) grava a venda: UMA linha, mesmo
+        # depois de duas noites
+        # pg_temp. explicito (R1 do auditor): se a TEMP cair num rollback no meio,
+        # um DELETE sem schema iria na tabela REAL.
+        self.cur.execute("DELETE FROM pg_temp.fact_vendas_snapshot WHERE loja_origem = 'ML-YanniRJ'")
+        for _ in range(2):
+            self.cur.execute(
+                "DELETE FROM pg_temp.fact_vendas_snapshot WHERE loja_origem = 'ML-YanniRJ' "
+                "AND arquivo_origem = 'API'")
+            self.cur.execute(
+                "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
+                "'2000015183298999', '2026-09-23', 'K2-LVI-CANOA0506', 1, 'API')", (MKT,))
+        self.assertEqual(self._n_snapshot('2000015183298999'), 1)
+        self.assertEqual(du.conciliar_pendentes_api(self.engine), 1)
+        self.assertEqual(self._status(1690), 'Reprocessado')
+        self.assertEqual(len(du.buscar_aguardando_coleta(self.engine)), 0)
+
+    def test_pendente_de_upload_ainda_Pendente_tambem_fecha_quando_a_api_grava(self):
+        self._loja_na_api('ML-YanniRJ')
+        self.cur.execute(
+            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
+            "data_processamento) VALUES (1701, %s, 'ML-YanniRJ', '2000018640143246', "
+            "'2026-09-25', 'K2-LVI-CANOA0506', 51.72, 'vendas ML YANNI RJ 24 a 27-09.xlsx', "
+            "'Pendente', now())", (MKT,))
+        self.cur.execute(
+            "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, 'ML-YanniRJ', "
+            "'2000018640143246', '2026-09-25', 'K2-LVI-CANOA0506', 1, 'API')", (MKT,))
+        self.assertEqual(du.conciliar_pendentes_api(self.engine), 1)
+        self.assertEqual(self._status(1701), 'Reprocessado')
+
+    def test_upload_de_loja_fora_da_api_ou_antes_do_api_desde_nao_fecha_pela_api(self):
+        self._loja_na_api('ML-YanniRJ')
+        # antes do api_desde
+        self.cur.execute(
+            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
+            "data_processamento) VALUES (1, %s, 'ML-YanniRJ', 'A1', '2026-08-31', 'S', 1, "
+            "'x.xlsx', 'Pendente', now())", (MKT,))
+        # loja que nao e' API
+        self.cur.execute(
+            "INSERT INTO fact_vendas_pendentes (id, marketplace_origem, loja_origem, "
+            "numero_pedido, data_venda, sku, valor_venda_efetivo, arquivo_origem, status, "
+            "data_processamento) VALUES (2, 'MAGALU', 'Magalu-Nala', 'A2', '2026-09-20', 'S', 1, "
+            "'y.csv', 'Pendente', now())")
+        for ped, loja, dv in (('A1', 'ML-YanniRJ', '2026-08-31'),
+                              ('A2', 'Magalu-Nala', '2026-09-20')):
+            self.cur.execute(
+                "INSERT INTO pg_temp.fact_vendas_snapshot VALUES (%s, %s, %s, %s, 'S', 1, 'API')",
+                (MKT, loja, ped, dv))
+        self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
+
     def test_pendente_de_upload_nunca_e_tocada_pela_conciliacao(self):
         self._plantar_pendente(1, 'P9', 'L-0320', 'vendas.xlsx')
-        self.cur.execute("INSERT INTO fact_vendas_snapshot VALUES "
+        self.cur.execute("INSERT INTO pg_temp.fact_vendas_snapshot VALUES "
                          "(%s,%s,'P9','2026-09-10','L-0320',1,'API')", (MKT, LOJA))
         self.assertEqual(du.conciliar_pendentes_api(self.engine), 0)
         self.assertEqual(self._status(1), 'Pendente')
