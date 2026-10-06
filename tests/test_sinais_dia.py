@@ -976,7 +976,87 @@ class FullGalpao(unittest.TestCase):
                       s[0]['numero'])
 
 
+class RupturaEGalpaoZero(unittest.TestCase):
+    def test_galpao_zero_com_full_diz_que_para_de_vender(self):
+        # caso real: ML-LPT MLBU3753467095 (Full > 0, galpão 0)
+        ponte = [(LPT, 'MLB1', 'MLBU3753467095', 'A', True)]
+        foto = [(LPT, 'MLBU3753467095', date(2026, 10, 4), 6, 0, 0, 0)]
+        _a, por_sku = sd.agregar_vendas([_vend(LPT, 'MLB1', 'A', qtd_ritmo=21, qtd_30=60)])
+        s = sd.sinais_full(foto, ponte, por_sku, {}, sd.janelas(HOJE))
+        self.assertIn('galpão 0: quando o Full acabar, para de vender', s[0]['numero'])
+        self.assertNotIn('vende muito menos', s[0]['numero'])
+
+    def test_ruptura_das_duas_origens_vira_uma_linha_por_anuncio(self):
+        ponte = [(NALA, 'MLB7', 'E1', 'X-AZUL', True), (NALA, 'MLB7', 'E2', 'X-ROSA', True)]
+        foto = [(NALA, 'E1', date(2026, 10, 4), 0, 0, 0, 0),
+                (NALA, 'E2', date(2026, 10, 4), 0, 0, 0, 0)]
+        dados = {'vendas': [_vend(NALA, 'MLB7', 'X-AZUL', rec_sem=100, rec_base=2400, qtd_ritmo=7,
+                                  qtd_30=30, rec_30=700),
+                            _vend(NALA, 'MLB7', 'X-ROSA', rec_sem=50, rec_base=1600, qtd_ritmo=7,
+                                  qtd_30=30, rec_30=500)],
+                 'ads': [(NALA, 'MLB7', 10, 300, 0, 0, 0, 0, 0, 0, 0)], 'config': [],
+                 'ponte': ponte, 'foto': foto, 'estoque_semana': []}
+        s, erros = sd.montar_sinais(dados, HOJE)
+        self.assertEqual(erros, {})
+        rup = [x for x in s if x['regra'] == 'full_ruptura']
+        self.assertEqual(len(rup), 1)                       # foto (2 variações) + semana
+        r = rup[0]
+        self.assertEqual(r['objeto'], 'MLB7')                # o anúncio, nas duas origens
+        self.assertTrue(r['numero'].startswith('RUPTURA — Full e galpão zerados'))
+        self.assertIn('(+1 variação(ões) do anúncio)', r['numero'])
+        self.assertIn('na semana: estoque (Full ou galpão) em só 0 de 7', r['numero'])
+        self.assertEqual(r['em_jogo'], 1200)                 # 700 + 500 (> queda da semana)
+        self.assertEqual(r['medida'], 1200)
+        self.assertEqual(set(r['skus']), {'X-AZUL', 'X-ROSA'})
+        self.assertFalse([x for x in s if x['regra'] == 'vendas_queda'])  # explicada
+
+    def test_um_ciente_cala_a_ruptura_venha_de_onde_vier(self):
+        ruptura_semana = sd._sinal(NALA, 'FULL', 'MLB7', [], 'Ruptura: x', 's', 100,
+                                   regra='full_ruptura', objeto='MLB7', medida=100)
+        ruptura_hoje = sd._sinal(NALA, 'FULL', 'MLB7', [], 'RUPTURA — y', 's', 100,
+                                 regra='full_ruptura', objeto='MLB7', medida=100)
+        ciente = [(1, NALA, 'full_ruptura', 'MLB7', 'falta_fornecedor', None,
+                   date(2026, 10, 12), 100, '', 'larissa', datetime(2026, 10, 5, 9))]
+        for x in (ruptura_semana, ruptura_hoje):
+            ativos, sil = sd.aplicar_cientes([x], ciente, HOJE)
+            self.assertEqual((ativos, len(sil)), ([], 1))
+
+
 class UploadAtrasado(unittest.TestCase):
+    def test_suspende_so_acima_de_7_dias(self):
+        self.assertFalse(sd.upload_suspenso(date(2026, 9, 27), HOJE))   # 7 dias antes de ontem
+        self.assertTrue(sd.upload_suspenso(date(2026, 9, 26), HOJE))
+
+    def test_relê_a_litstore_com_janelas_ate_o_ultimo_upload(self):
+        frescor = [('Vendas', S_YANNI, None),
+                   ('Último dia de venda (upload)', S_YANNI, datetime(2026, 10, 1))]
+        chamadas = []
+
+        def ler(conn, sql, p):
+            chamadas.append(p)
+            return [_vend(S_YANNI, 'SKU:L-0500', 'L-0500', rec_sem=100, rec_base=4000)]
+        antigo = sd._sinal(S_YANNI, 'VENDAS', 'SKU:L-0500', [], 'Queda falsa', 's', 1,
+                           regra='vendas_queda', objeto='SKU:L-0500')
+        outro = sd._sinal(S_LPT, 'VENDAS', '2249', [], 'x', 's', 1, regra='vendas_queda')
+        with mock.patch.object(sd, '_ler', side_effect=ler):
+            sinais, ate = sd.reler_vendas_upload(None, {'frescor': frescor}, [antigo, outro],
+                                                 HOJE, [S_YANNI, S_LPT], sd.SHOPEE)
+        self.assertEqual(ate, {S_YANNI: date(2026, 10, 1)})
+        self.assertEqual(chamadas[0]['fim'], date(2026, 10, 1))   # janela até o último upload
+        self.assertEqual(chamadas[0]['lojas'], [S_YANNI])
+        self.assertNotIn(antigo, sinais)
+        self.assertIn(outro, sinais)                          # outra loja: intacta
+        nova = [x for x in sinais if x['loja'] == S_YANNI][0]
+        self.assertEqual(nova['periodo'], '25/09–01/10 × 28/08–24/09')
+
+    def test_upload_muito_atrasado_nao_e_relido(self):
+        frescor = [('Último dia de venda (upload)', S_YANNI, datetime(2026, 9, 20))]
+        with mock.patch.object(sd, '_ler') as ler:
+            _s, ate = sd.reler_vendas_upload(None, {'frescor': frescor}, [], HOJE, [S_YANNI],
+                                             sd.SHOPEE)
+        ler.assert_not_called()
+        self.assertEqual(ate, {})
+
     def test_litstore_com_ultima_venda_antes_de_ontem(self):
         linhas = [('Vendas', S_LPT, datetime(2026, 10, 5, 4, 20)),
                   ('Vendas', S_YANNI, None),
@@ -1438,6 +1518,24 @@ class ComBanco(unittest.TestCase):
         self.assertEqual(sd.lojas_carga_pendente(dados['frescor'], lojas, HOJE), set())
         self.assertEqual(sd.lojas_upload_atrasado(dados['frescor'], lojas, HOJE),
                          {S_YANNI: date(2026, 9, 12)})
+
+    def test_litstore_relida_ate_o_ultimo_upload_pelas_sql(self):
+        c, SH = self.cur, 'SHOPEE'
+        c.executemany("INSERT INTO fact_vendas_snapshot VALUES "
+                      "(%s,%s,%s,%s,%s,%s,%s,%s,%s,'2026-10-02 10:00','upload Yanni.xlsx')",
+                      [(SH, S_YANNI, f'B{i}', date(2026, 9, 5), 'L-0500', 'L-0500', 1, 200, 5)
+                       for i in range(12)]
+                      + [(SH, S_YANNI, 'U1', date(2026, 9, 30), 'L-0500', 'L-0500', 1, 50, 1)])
+        dados, erros = sd.ler_tudo(self.c, HOJE, [S_YANNI], sd.SHOPEE)
+        self.assertEqual(erros, {})
+        self.assertEqual(sd.lojas_upload_atrasado(dados['frescor'], [S_YANNI], HOJE),
+                         {S_YANNI: date(2026, 9, 30)})
+        sinais, ate = sd.reler_vendas_upload(self.c, dados, [], HOJE, [S_YANNI], sd.SHOPEE)
+        self.assertEqual(ate, {S_YANNI: date(2026, 9, 30)})
+        q = [x for x in sinais if x['regra'] == 'vendas_queda']
+        self.assertEqual(len(q), 1)
+        j = sd.janelas(date(2026, 10, 1))                    # janelas do último upload
+        self.assertIn(f"semana {j['sem_ini']:%d/%m}–{j['fim']:%d/%m}", q[0]['numero'])
 
     def test_lojas_ml_e_restricao_pela_sql(self):
         lojas = [r[0] for r in sd._ler(self.c, sd.SQL_LOJAS_ML, {'marketplace': sd.MARKETPLACE})]

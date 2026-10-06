@@ -113,9 +113,8 @@ ABA SHOPEE (06/10/2026; contrato com a [DADOS SHOPEE])
     única do ML. Nota: rating_star é a média da VIDA do anúncio; o sinal usa
     a nota só das avaliações NOVAS da janela, (nota_D × aval_D − nota_D30 ×
     aval_D30) ÷ (aval_D − aval_D30), com mínimo MIN_AVAL_NOVAS.
-  - Carga pendente: só lojas com venda pela API. Loja de upload (Litstore)
-    com a última venda antes de ontem: "upload atrasado", e as regras de venda
-    ficam suspensas (upload atrasado geraria queda falsa).
+  - Carga pendente: só lojas com venda pela API. Loja de upload: ver abaixo
+    (janelas até o último dia com upload).
   - FULL × GALPÃO (regra do Thiago, 06/10, IGUAL no ML e na Shopee): quando
     o Full acaba, o anúncio continua vendendo pelo galpão (envio próprio),
     mas vende MUITO MENOS (perde selo, prazo, posição). Full E galpão zerados
@@ -132,7 +131,17 @@ ABA SHOPEE (06/10/2026; contrato com a [DADOS SHOPEE])
         o texto mostra também os dias com Full.
     Galpão nunca é somado (o UpSeller repete o mesmo galpão em todo anúncio do
     SKU; no ML o galpão de kit vem dividido): só "tem / não tem" e o número do
-    próprio estoque. Galpão desconhecido (NULL) não vira ruptura.
+    próprio estoque. Galpão desconhecido (NULL) não vira ruptura. Com galpão 0 e
+    Full > 0 o texto diz que, quando o Full acabar, para de vender.
+  - RUPTURA tem DUAS origens (a foto de hoje com Full e galpão zerados, e a
+    semana com estoque em poucos dias + venda caindo): as duas usam o MESMO
+    objeto, o ANÚNCIO (MLB / item_id), e viram UMA linha por anúncio (variações
+    do mesmo anúncio somam o R$ em jogo; a foto de hoje vem primeiro e a semana
+    entra no texto). Um Ciente cala a ruptura do anúncio, venha de onde vier.
+  - Loja só de upload (Litstore, upload a cada poucos dias): as janelas de
+    venda terminam no ÚLTIMO dia com upload ("dados até dd/mm (upload)"), em
+    vez de suspender; só suspende se o último upload tiver mais de
+    UPLOAD_MAX_DIAS dias.
   - Nota (R3): rating_star 0 com avaliações > 0 é dado inválido (não vira
     nota negativa). comment_count conta avaliações COM comentário: a nota das
     "novas" é uma aproximação.
@@ -232,6 +241,9 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
 # Regras que comparam janelas de VENDA: suspensas na loja com carga pendente.
 REGRAS_DE_VENDA = ('vendas_queda', 'vendas_alta', 'ads_espiral', 'full_ruptura', 'ads_custo',
                    'full_cobertura', 'visitas_queda', 'visitas_alta')
+
+# Loja só de upload: janelas até o último dia com upload; suspende acima disto
+UPLOAD_MAX_DIAS = 7
 
 # Excel: limites do arquivo que sobe (auditor 06/10, R1)
 EXCEL_MAX_BYTES = 2 * 1024 * 1024
@@ -831,8 +843,13 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j, mkt=MARKETPLACE):
         full, transf, recebidas = int(full), int(transf), int(recebidas)
         galpao = None if galpao is None else int(galpao)
         txt_transf = f"; {transf} em transferência" if transf else ''
-        txt_galpao = ('' if galpao is None else
-                      f"; galpão {galpao} un. (sem Full vende muito menos: queda forte esperada)")
+        if galpao is None:
+            txt_galpao = ''
+        elif galpao == 0:
+            txt_galpao = "; galpão 0: quando o Full acabar, para de vender"
+        else:
+            txt_galpao = (f"; galpão {galpao} un. (sem Full vende muito menos: queda forte "
+                          "esperada)")
         periodo = f"foto {_d(data)} · venda {_d(j['ritmo_ini'])}–{_d(j['fim'])}"
         if full == 0 and galpao == 0 and (dia > 0 or ads_ontem > 0):
             # Full E galpão zerados: para de vender
@@ -842,7 +859,7 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j, mkt=MARKETPLACE):
                 + (f" (ads ligado: gasto ontem {_brl(ads_ontem)})" if ads_ontem > 0 else ''),
                 ("Pausar o ads até repor e repor o estoque já" if ads_ontem > 0
                  else "Repor o estoque já"),
-                rec_30, urgente=True, regra='full_ruptura', objeto=eid, medida=rec_30,
+                rec_30, urgente=True, regra='full_ruptura', objeto=anuncio, medida=rec_30,
                 periodo=periodo))
         elif full == 0 and ads_ontem > 0:
             # galpão > 0 (ou desconhecido): ainda vende, então NÃO pausar
@@ -1009,7 +1026,8 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
                     + f"; venda {_pct(a['rec_sem'] / rec_base_sem - 1)} e ads cortado — a "
                     "causa é estoque",
                     "Repor estoque antes de mexer no ads", queda, urgente=True,
-                    regra='full_ruptura', medida=queda, periodo=_periodo_semanas(j)))
+                    regra='full_ruptura', objeto=anuncio, medida=queda,
+                    periodo=_periodo_semanas(j)))
     return out
 
 
@@ -1230,6 +1248,8 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
             sinais += _bloco('visitas', erros, [], sinais_visitas, dados['visitas'],
                              por_anuncio, j)
 
+    sinais = unir_rupturas(sinais)
+
     # Espiral/ruptura explicam a queda: o sinal genérico de VENDAS do mesmo
     # anúncio sai, para não ocupar duas linhas das 10.
     explicados = {(s['loja'], s['anuncio']) for s in sinais
@@ -1238,6 +1258,49 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
               if not (s['regra'] == 'vendas_queda'
                       and (s['loja'], s['anuncio']) in explicados)]
     return sinais, erros
+
+
+def unir_rupturas(sinais):
+    """Uma linha de RUPTURA por anúncio (objeto = anúncio nas duas origens).
+    A da foto de hoje (Full e galpão zerados) vem primeiro; variações do mesmo
+    anúncio somam o R$ em jogo; a ruptura da semana entra no texto. A medida
+    (base da piora do Ciente) passa a ser o R$ em jogo da linha unida."""
+    grupos, ordem = {}, []
+    for x in sinais:
+        if x['regra'] != 'full_ruptura':
+            ordem.append(x)
+            continue
+        chave = (x['loja'], x['objeto'])
+        if chave not in grupos:
+            grupos[chave] = []
+            ordem.append(chave)
+        grupos[chave].append(x)
+    out = []
+    for item in ordem:
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        g = grupos[item]
+        if len(g) == 1:
+            out.append(g[0])
+            continue
+        hoje = [x for x in g if x['numero'].startswith('RUPTURA')]
+        semana = [x for x in g if not x['numero'].startswith('RUPTURA')]
+        base = dict(hoje[0] if hoje else semana[0])
+        em_jogo = sum(x['em_jogo'] for x in hoje) if hoje else 0.0
+        em_jogo = max([em_jogo] + [x['em_jogo'] for x in semana])
+        skus = set()
+        for x in g:
+            skus |= set(x['skus'])
+        txt = base['numero']
+        if len(hoje) > 1:
+            txt += f" (+{len(hoje) - 1} variação(ões) do anúncio)"
+        if hoje and semana:
+            txt += "; na semana: " + semana[0]['numero'].split(': ', 1)[-1]
+        base.update({'numero': txt, 'em_jogo': em_jogo, 'medida': em_jogo,
+                     'skus': tuple(sorted(skus)), 'urgente': True})
+        out.append(base)
+    return out
 
 
 def piorou(regra, agora, antes):
@@ -1618,13 +1681,37 @@ def lojas_carga_pendente(linhas_frescor, lojas, hoje):
 
 def lojas_upload_atrasado(linhas_frescor, lojas, hoje):
     """{loja: última data de venda} das lojas SÓ de upload (sem venda pela API
-    no período) cuja última venda é de antes de ontem: upload atrasado faria
-    a semana parecer queda."""
+    no período) cuja última venda é de antes de ontem. Até UPLOAD_MAX_DIAS a
+    loja é comparada com janelas até essa data (reler_vendas_upload); acima,
+    as regras de venda são suspensas."""
     api = {l for f, l, u in linhas_frescor if f == 'Vendas' and u is not None}
     ult = {l: pd.Timestamp(u).date() for f, l, u in linhas_frescor
            if f == 'Último dia de venda (upload)' and u is not None}
     ontem = hoje - timedelta(days=1)
     return {l: ult[l] for l in lojas if l not in api and l in ult and ult[l] < ontem}
+
+
+def upload_suspenso(ultimo, hoje):
+    """Último upload com mais de UPLOAD_MAX_DIAS dias de atraso (contra ontem)."""
+    return (hoje - timedelta(days=1) - ultimo).days > UPLOAD_MAX_DIAS
+
+
+def reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt):
+    """Para cada loja só de upload atrasada (até UPLOAD_MAX_DIAS): troca os
+    sinais de VENDA dela pelos calculados com janelas que terminam no último
+    dia com upload. Devolve (sinais, {loja: último dia})."""
+    ate = {}
+    for loja, ultimo in lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items():
+        if upload_suspenso(ultimo, hoje):
+            continue
+        hoje_l = ultimo + timedelta(days=1)
+        vendas = _ler(conn, fontes(mkt)['vendas'], params(hoje_l, [loja], mkt))
+        por_an, _ = agregar_vendas(vendas)
+        novos = sinais_vendas(por_an, janelas(hoje_l))
+        sinais = [x for x in sinais
+                  if not (x['loja'] == loja and x['regra'] in REGRAS_DE_VENDA)] + novos
+        ate[loja] = ultimo
+    return sinais, ate
 
 
 def suspender_venda_pendente(sinais, pendentes):
@@ -1808,6 +1895,11 @@ def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE):
             except Exception:  # noqa: BLE001
                 pass
         sinais, erros_bloco = montar_sinais(dados, hoje, mkt)
+        upload_ate = {}
+        try:
+            sinais, upload_ate = reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt)
+        except Exception as e:  # noqa: BLE001
+            erros_bloco['vendas'] = e
         try:
             nomes = ep.ler_nomes(conn, {x for sn in sinais for x in sn['skus']})
         except Exception:  # noqa: BLE001
@@ -1817,6 +1909,7 @@ def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE):
     return {'dados': dados, 'erros': {k: str(v) for k, v in erros.items()},
             'erros_bloco': {k: str(v) for k, v in erros_bloco.items()},
             'parciais': parciais, 'sinais': sinais, 'nomes': nomes,
+            'upload_ate': upload_ate,
             'lido_em': datetime.now(BRT), 'segundos': time.perf_counter() - t0}
 
 
@@ -1931,7 +2024,9 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
     pendentes = {l: 'carga' for l in lojas_carga_pendente(dados.get('frescor') or [], lojas,
                                                          hoje)}
     pendentes.update({l: f"upload:{d:%d/%m}" for l, d in
-                      lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items()})
+                      lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items()
+                      if upload_suspenso(d, hoje)})
+    upload_ate = pacote.get('upload_ate') or {}
     sinais = suspender_venda_pendente(sinais, pendentes)
     ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
                                  sinais, cientes_linhas or [], hoje)
@@ -1979,7 +2074,8 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
                 'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
                 'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
                 'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
-                'lido_em': pacote['lido_em'], 'pendentes': pendentes, 'mkt': mkt}
+                'lido_em': pacote['lido_em'], 'pendentes': pendentes, 'mkt': mkt,
+                'upload_ate': upload_ate}
 
     try:
         _render_excel(st, ativos, silenciados, nomes, base_ctx)
@@ -2188,15 +2284,23 @@ def _render_loja(st, loja, ativos, ctx):
                    "ficam suspensos até a carga entrar (clique em \"Atualizar dados\").")
     elif pendente:
         st.warning(f"⏳ Upload atrasado: a última venda desta loja (upload) é de "
-                   f"{motivo_pend.split(':', 1)[1]}. Os sinais de venda ficam suspensos até "
-                   "o upload de vendas chegar até ontem.")
+                   f"{motivo_pend.split(':', 1)[1]}, há mais de {UPLOAD_MAX_DIAS} dias. Os "
+                   "sinais de venda ficam suspensos até um upload mais novo.")
+    ate_upload = (ctx.get('upload_ate') or {}).get(loja)
+    if ate_upload is not None:
+        st.caption(f"📤 Dados até {ate_upload:%d/%m} (upload): os sinais de venda comparam a "
+                   "semana que termina nessa data.")
     if 'resumo' in erros:
         st.error("Resumo indisponível agora.")
     else:
         try:
-            _render_resumo(st, loja, resumo[loja], j['ontem'], pendente,
-                           'upload atrasado' if pendente and motivo_pend != 'carga'
-                           else 'carga pendente')
+            if ate_upload is not None:
+                _render_resumo(st, loja, resumo[loja], j['ontem'], True,
+                               f"upload até {ate_upload:%d/%m}")
+            else:
+                _render_resumo(st, loja, resumo[loja], j['ontem'], pendente,
+                               'upload atrasado' if pendente and motivo_pend != 'carga'
+                               else 'carga pendente')
         except Exception:  # noqa: BLE001
             st.error("Resumo indisponível agora.")
 
