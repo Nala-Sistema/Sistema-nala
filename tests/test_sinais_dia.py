@@ -13,6 +13,10 @@ Duas partes:
     o ciclo gravar -> substituir -> reativar numa TEMP criada com o DDL LIDO de
     sql/sinais_ciente.sql (a tabela ainda não existe em produção; depois de
     aplicada, um teste confere que as CHECK reais são as do arquivo).
+  - v1.2: Período em cada sinal, "?" no lugar de "parcial", leitura com
+    rollback só no erro e em memória só quando completa, quadro de tempos só
+    para ADMIN, Excel de ida e volta (gera, lê, prévia com cada recusa,
+    grava pela mesma gravar_cientes; DIRETOR baixa e não sobe).
   - Com banco (NALA_TEST_DB_URL, usuário de permissão mínima): EXECUTA as SQL
     de verdade em tabelas TEMPORÁRIAS com os nomes das reais, com as CHECK
     COPIADAS da tabela real (lição de 05/10: a TEMP sem CHECK aceitava o que
@@ -22,6 +26,7 @@ Duas partes:
 Rodar:  python -m pytest tests/test_sinais_dia.py
 """
 
+import io
 import os
 import re
 import sys
@@ -39,6 +44,16 @@ HOJE = date(2026, 10, 5)
 LPT, NALA, RJ, SP = 'ML-LPT', 'ML-Nala', 'ML-YanniRJ', 'ML-YanniSP'
 
 
+def _colunas(n):
+    return [mock.MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+
+
+def _gravar(conn, sinais, motivo, nota, ate, usuario, hoje, lojas):
+    """Atalho dos testes antigos: o mesmo motivo/nota/data para todos."""
+    return sd.gravar_cientes(conn, [(x, motivo, nota, ate) for x in sinais], usuario, hoje,
+                             lojas)
+
+
 def _vend(loja, anuncio, sku, rec_sem=0, rec_base=0, qtd_ritmo=0, qtd_30=0,
           rec_30=0, margem_30=None):
     return (loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30)
@@ -53,15 +68,15 @@ def _ads(gasto_sem=0, gasto_base=0, gasto_ontem=0, gasto_recente=0, dias_com_gas
 
 
 class Janelas(unittest.TestCase):
-    def test_d1_e_d2_fora_e_semanas_inteiras_sem_sobrepor(self):
+    def test_janelas_terminam_em_d1_semanas_inteiras_sem_sobrepor(self):
         j = sd.janelas(HOJE)
-        self.assertEqual(j['fim'], date(2026, 10, 2))          # D-3
-        self.assertEqual(j['sem_ini'], date(2026, 9, 26))      # D-9
-        self.assertEqual(j['base_fim'], date(2026, 9, 25))     # D-10
-        self.assertEqual(j['base_ini'], date(2026, 8, 29))     # D-37
+        self.assertEqual(j['fim'], date(2026, 10, 4))          # D-1 (medido: D-1 não muda)
+        self.assertEqual(j['sem_ini'], date(2026, 9, 28))      # D-7
+        self.assertEqual(j['base_fim'], date(2026, 9, 27))     # D-8
+        self.assertEqual(j['base_ini'], date(2026, 8, 31))     # D-35
         self.assertEqual((j['base_fim'] - j['base_ini']).days + 1, 28)
-        self.assertEqual(j['ritmo_ini'], date(2026, 9, 26))
-        self.assertEqual(j['piso_ini'], date(2026, 9, 3))
+        self.assertEqual(j['ritmo_ini'], date(2026, 9, 28))
+        self.assertEqual(j['piso_ini'], date(2026, 9, 5))
         self.assertEqual(j['mesmo_dia'], [date(2026, 9, 27), date(2026, 9, 20),
                                           date(2026, 9, 13), date(2026, 9, 6)])
         self.assertTrue(all(d.weekday() == j['ontem'].weekday() for d in j['mesmo_dia']))
@@ -259,7 +274,7 @@ class VendasEOrdem(unittest.TestCase):
         s = sd.sinais_vendas(por_an, sd.janelas(HOJE))
         self.assertEqual(sorted(x['anuncio'] for x in s), ['MLB1', 'MLB2'])
         q = next(x for x in s if x['anuncio'] == 'MLB1')
-        self.assertIn('semana 26/09–02/10', q['numero'])
+        self.assertIn('semana 28/09–04/10', q['numero'])
         self.assertAlmostEqual(q['em_jogo'], 600)
 
     def test_ruptura_tira_a_queda_generica_do_mesmo_anuncio(self):
@@ -334,7 +349,7 @@ class Permissao(unittest.TestCase):
                  'foto': [], 'ponte': [], 'resumo': [], 'metas': [], 'frescor': [],
                  'visitas': None}
         st = mock.MagicMock()
-        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        st.columns.side_effect = _colunas
         engine = mock.MagicMock()
         tabela_real = sd.tabela_sinais
 
@@ -345,6 +360,7 @@ class Permissao(unittest.TestCase):
         with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
              mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
              mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd, 'ler_cientes', return_value=None), \
              mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
              mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
              mock.patch.object(sd, 'sinais_vendas', side_effect=[KeyError('x')]):
@@ -354,10 +370,11 @@ class Permissao(unittest.TestCase):
         self.assertEqual(st.success.call_count, 2)      # as duas lojas seguem: "Nenhum sinal"
 
         st = mock.MagicMock()
-        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        st.columns.side_effect = _colunas
         with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
              mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
              mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd, 'ler_cientes', return_value=None), \
              mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
              mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
              mock.patch.object(sd, 'tabela_sinais', side_effect=tabela_que_quebra_na_lpt):
@@ -509,11 +526,11 @@ class Ciente(unittest.TestCase):
         conn = mock.Mock()
         s = [self._full(6)]
         with self.assertRaises(ValueError):
-            sd.gravar_cientes(conn, s, 'outro', '', HOJE, 'larissa', HOJE, [LPT])
+            _gravar(conn, s, 'outro', '', HOJE, 'larissa', HOJE, [LPT])
         with self.assertRaises(PermissionError):
-            sd.gravar_cientes(conn, s, 'proposital', '', HOJE, 'larissa', HOJE, [NALA])
+            _gravar(conn, s, 'proposital', '', HOJE, 'larissa', HOJE, [NALA])
         with self.assertRaises(ValueError):
-            sd.gravar_cientes(conn, s, 'proposital', '', HOJE, '', HOJE, [LPT])
+            _gravar(conn, s, 'proposital', '', HOJE, '', HOJE, [LPT])
         conn.cursor.assert_not_called()
 
     def test_listas_do_codigo_iguais_as_check_do_sql(self):
@@ -537,13 +554,15 @@ class Ciente(unittest.TestCase):
         dados = {'vendas': [_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000),
                             _vend(LPT, 'MLB2', 'B', rec_sem=0, rec_base=8000)],
                  'resumo': [], 'metas': [], 'frescor': [], 'visitas': None,
-                 'ciente': cientes}
+                 }
         st = mock.MagicMock()
-        st.columns.side_effect = lambda n: [mock.MagicMock() for _ in range(n)]
+        st.columns.side_effect = _colunas
         st.data_editor.side_effect = lambda df, **kw: df
+        st.file_uploader.return_value = None
         with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
              mock.patch.object(sd, '_ler', return_value=[(LPT,)]), \
              mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
+             mock.patch.object(sd, 'ler_cientes', return_value=cientes), \
              mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
              mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
              mock.patch.object(permissoes, '_get_role', return_value=perfil):
@@ -585,14 +604,311 @@ class Ciente(unittest.TestCase):
         self.assertEqual(list(df.columns[:1]), ['Ciente'])
         self.assertTrue(any('Silenciados (1)' in str(c.args[0])
                             for c in st.expander.call_args_list))
+        st.file_uploader.assert_called()                    # gestora sobe Excel
         st = self._render('DIRETOR', silenciado)
         st.data_editor.assert_not_called()
+        st.download_button.assert_called()                  # diretor baixa...
+        st.file_uploader.assert_not_called()                # ...e não sobe
         self.assertEqual(st.dataframe.call_count, 2)        # sinais + silenciados
 
     def test_sem_tabela_a_tela_e_a_v1(self):
         st = self._render('GESTOR', None)
         st.data_editor.assert_not_called()
         self.assertEqual(list(st.dataframe.call_args_list[0].args[0]['Anúncio']), ['MLB2', 'MLB1'])
+
+
+# ============================================================
+# v1.2 — sem banco
+# ============================================================
+
+class _ConnConta:
+    def __init__(self, falha=False):
+        self.rollbacks, self.falha = 0, falha
+
+    def cursor(self):
+        c = mock.Mock()
+        if self.falha:
+            c.execute.side_effect = RuntimeError('x')
+        c.fetchall.return_value = [(1,)]
+        return c
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class V12(unittest.TestCase):
+    def test_ler_tudo_fecha_a_transacao_no_fim(self):
+        c = _ConnConta()
+        with mock.patch.object(sd, '_ler', return_value=[(False,)]):
+            sd.ler_tudo(c, HOJE, [LPT])
+        self.assertEqual(c.rollbacks, 1)                    # solta os locks de leitura
+
+    def test_memoria_por_lojas_do_usuario(self):
+        """Teste do auditor (06/10): a chave da memória são as lojas visíveis;
+        nenhum gestor recebe a leitura de outro perfil; incompleta não fica."""
+        chamadas = []
+
+        def falso(_engine, hoje, lojas):
+            chamadas.append(tuple(lojas))
+            return {'dados': {}, 'erros': {}, 'erros_bloco': {}, 'parciais': [],
+                    'sinais': [{'loja': l} for l in lojas], 'nomes': {},
+                    'lido_em': datetime.now(sd.BRT), 'segundos': 0}
+
+        sd._MEMORIA.clear()
+        try:
+            with mock.patch.object(sd, '_ler_pacote', side_effect=falso):
+                f = sd._memoria('pacote')
+                f.clear()
+                hoje = date(2026, 10, 6)
+                f(object(), hoje, (LPT, NALA, RJ, SP))
+                gestor = f(object(), hoje, (NALA,))
+                f(object(), hoje, (NALA,))                  # mesma loja: memória
+                outro = f(object(), hoje, (LPT,))
+            self.assertEqual(len(chamadas), 3)
+            self.assertEqual({x['loja'] for x in gestor['sinais']}, {NALA})
+            self.assertEqual({x['loja'] for x in outro['sinais']}, {LPT})
+
+            def incompleto(_engine, hoje, lojas):
+                r = falso(_engine, hoje, lojas)
+                r['erros'] = {'ads': 'x'}
+                return r
+            with mock.patch.object(sd, '_ler_pacote', side_effect=incompleto):
+                for _ in range(2):
+                    with self.assertRaises(sd._LeituraIncompleta):
+                        f(object(), hoje, (RJ,))
+            self.assertEqual(chamadas[-2:], [(RJ,), (RJ,)])  # releu: não ficou na memória
+        finally:
+            sd.limpar_memoria()
+            sd._MEMORIA.clear()
+
+    def test_ler_so_desfaz_a_transacao_no_erro(self):
+        c = _ConnConta()
+        self.assertEqual(sd._ler(c, 'SELECT 1', {}), [(1,)])
+        self.assertEqual(c.rollbacks, 0)                    # sem ida e volta à toa
+        c = _ConnConta(falha=True)
+        with self.assertRaises(RuntimeError):
+            sd._ler(c, 'SELECT 1', {})
+        self.assertEqual(c.rollbacks, 1)                    # erro não derruba as próximas
+
+    def test_leitura_incompleta_nao_vai_para_a_memoria(self):
+        pacote = {'erros': {'ads': 'x'}, 'erros_bloco': {}}
+        with mock.patch.object(sd, '_ler_pacote', return_value=pacote):
+            with self.assertRaises(sd._LeituraIncompleta) as e:
+                sd._ler_pacote_completo(None, HOJE, (LPT,))
+        self.assertIs(e.exception.pacote, pacote)
+        ok = {'erros': {}, 'erros_bloco': {}}
+        with mock.patch.object(sd, '_ler_pacote', return_value=ok):
+            self.assertIs(sd._ler_pacote_completo(None, HOJE, (LPT,)), ok)
+
+    def test_fora_do_streamlit_le_direto_sem_memoria(self):
+        with mock.patch.object(sd, '_ler_pacote', return_value={'x': 1}) as ler:
+            self.assertEqual(sd.obter_pacote(None, HOJE, [LPT]), ({'x': 1}, False))
+            sd.obter_pacote(None, HOJE, [LPT])
+        self.assertEqual(ler.call_count, 2)
+
+    def test_todo_sinal_tem_periodo(self):
+        dados = {'vendas': [_vend(NALA, 'MLB7', 'X', rec_sem=150, rec_base=3200),
+                            _vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000, qtd_ritmo=21,
+                                  qtd_30=65)],
+                 'ads': [(NALA, 'MLB7', 10, 300, 5, 31, 3, 0, 80, 10, 200)],
+                 'estoque_semana': [], 'config': [
+                     (LPT, 'MLB5 Pote', 'MLB5 Pote', date(2026, 10, 4), HOJE, 14, 10, 12, 12)],
+                 'ponte': [(LPT, 'MLB1', 'E1', 'A', True)],
+                 'foto': [(LPT, 'E1', date(2026, 10, 4), 6, 2, 3)],
+                 'experiencia': [(LPT, 'MLB1', HOJE, 30, 'Ruim', 100, 'Boa')]}
+        s, _ = sd.montar_sinais(dados, HOJE)
+        self.assertGreaterEqual(len({x['regra'] for x in s}), 6)
+        for x in s:
+            self.assertTrue(x['periodo'], x['regra'])
+        por = {x['regra']: x['periodo'] for x in s}
+        self.assertEqual(por['vendas_queda'], '28/09–04/10 × 31/08–27/09')
+        self.assertEqual(por['full_cobertura'], 'foto 04/10 · venda 28/09–04/10')
+        self.assertEqual(por['full_envio'], 'foto 04/10')
+        self.assertEqual(por['ads_config'], 'foto 04/10 → 05/10')
+        self.assertEqual(por['ads_sem_venda'], '02/10–04/10')
+        self.assertEqual(por['exp_anuncio'], 'nota 28/09 → 05/10')
+        self.assertIn('Período', sd.tabela_sinais(s, {}).columns)
+
+    def test_tempos_so_para_admin(self):
+        import permissoes
+        for perfil, ve in (('ADMIN', True), ('GESTOR', False), ('DIRETOR', False)):
+            st = mock.MagicMock()
+            with mock.patch.object(permissoes, '_get_role', return_value=perfil):
+                sd._render_tempos(st, [('Total', 1.0)], {'segundos': 0.5}, False)
+            self.assertEqual(st.expander.called, ve, perfil)
+
+
+class CargaPendente(unittest.TestCase):
+    def test_loja_sem_a_carga_de_hoje_fica_pendente(self):
+        linhas = [('Vendas', LPT, datetime(2026, 10, 5, 6, 4)),
+                  ('Vendas', NALA, datetime(2026, 10, 4, 6, 7)),
+                  ('Estoque', RJ, datetime(2026, 10, 4, 4, 0))]
+        self.assertEqual(sd.lojas_carga_pendente(linhas, [LPT, NALA, RJ], HOJE), {NALA})
+
+    def test_suspende_so_os_sinais_de_venda_da_loja_pendente(self):
+        sinais = [sd._sinal(NALA, 'VENDAS', 'MLB1', [], 'x', 's', 1, regra='vendas_queda'),
+                  sd._sinal(NALA, 'ADS', 'MLB1', [], 'x', 's', 1, regra='ads_sem_venda'),
+                  sd._sinal(NALA, 'EXP', 'MLB1', [], 'x', 's', 1, regra='exp_anuncio'),
+                  sd._sinal(LPT, 'VENDAS', 'MLB2', [], 'x', 's', 1, regra='vendas_queda')]
+        r = sd.suspender_venda_pendente(sinais, {NALA})
+        self.assertEqual([(x['loja'], x['regra']) for x in r],
+                         [(NALA, 'ads_sem_venda'), (NALA, 'exp_anuncio'), (LPT, 'vendas_queda')])
+
+    def test_resumo_mostra_carga_pendente_sem_comparar(self):
+        st = mock.MagicMock()
+        cols = [mock.MagicMock(), mock.MagicMock(), mock.MagicMock()]
+        st.columns.return_value = cols
+        r = sd.resumo_lojas([(NALA, 50, 16000, 12000)], [], [NALA], HOJE)[NALA]
+        sd._render_resumo(st, NALA, r, date(2026, 10, 4), pendente=True)
+        args, kw = cols[0].metric.call_args
+        self.assertEqual(args[1], 'carga pendente')
+        self.assertEqual(len(args), 2)                      # sem delta de comparação
+
+
+class ResumoTexto(unittest.TestCase):
+    def test_rotulos_sem_parcial_e_ajuda_do_dia_fechado(self):
+        st = mock.MagicMock()
+        cols = [mock.MagicMock(), mock.MagicMock(), mock.MagicMock()]
+        st.columns.return_value = cols
+        r = sd.resumo_lojas([(LPT, 3000, 16000, 12000)], [], [LPT], HOJE)[LPT]
+        sd._render_resumo(st, LPT, r, date(2026, 10, 4))
+        for col in cols[:2]:
+            args, kw = col.metric.call_args
+            self.assertNotIn('parcial', args[0].lower())
+            self.assertIn('boleto/Pix', kw['help'])
+            self.assertIn('cancelamentos', kw['help'])
+        self.assertIn('Dia fechado', cols[0].metric.call_args.kwargs['help'])
+
+
+class Excel(unittest.TestCase):
+    def _sinais(self):
+        return [sd._sinal(LPT, 'FULL', 'MLB1', ['K-L-0421-A'], '3 dias de Full', 's', 2000,
+                          regra='full_cobertura', objeto='E1', medida=6, periodo='foto 04/10'),
+                sd._sinal(LPT, 'VENDAS', 'MLB2', ['L-0320'], 'Queda', 's', 600,
+                          regra='vendas_queda', medida=-0.6, periodo='x'),
+                sd._sinal(NALA, 'ADS', 'MLB3', ['L-0303'], 'Sem venda', 's', 30,
+                          regra='ads_sem_venda', medida=30, periodo='y')]
+
+    def _preencher(self, conteudo, valores):
+        """valores: {linha_excel: {coluna: valor}}"""
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(conteudo))
+        ws = wb['Sinais']
+        cab = [c.value for c in ws[1]]
+        for linha, cols in valores.items():
+            for nome, v in cols.items():
+                ws.cell(row=linha, column=cab.index(nome) + 1, value=v)
+        bio = io.BytesIO()
+        wb.save(bio)
+        return bio.getvalue()
+
+    def test_arquivo_traz_a_chave_travada_e_colunas_livres(self):
+        from openpyxl import load_workbook
+        sinais = self._sinais()
+        wb = load_workbook(io.BytesIO(sd.excel_sinais(sinais, {'L-0320': 'Lixeira'}, HOJE)))
+        ws = wb['Sinais']
+        cab = [c.value for c in ws[1]]
+        self.assertEqual(tuple(cab), sd.COLUNAS_EXCEL)
+        self.assertEqual([ws.cell(row=r, column=3).value for r in (2, 3, 4)],
+                         ['E1', 'MLB2', 'MLB3'])
+        self.assertTrue(ws.protection.sheet)
+        self.assertTrue(ws.cell(row=2, column=cab.index('Objeto') + 1).protection.locked)
+        for nome in sd.EDITAVEIS_EXCEL:
+            self.assertFalse(ws.cell(row=2, column=cab.index(nome) + 1).protection.locked)
+        listas = [dv.formula1 for dv in ws.data_validations.dataValidation]
+        self.assertIn('"Ciente"', listas)
+        self.assertTrue(any('Falta no fornecedor' in f for f in listas))
+        self.assertIn('Instruções', wb.sheetnames)
+
+    def test_ida_e_volta_com_previa_e_cada_recusa(self):
+        sinais = self._sinais()
+        hoje = HOJE
+        arq = sd.excel_sinais(sinais, {}, hoje)
+        arq = self._preencher(arq, {
+            2: {'Status': 'Ciente', 'Motivo': 'Falta no fornecedor', 'Nota': 'abraçadeira',
+                'Silenciar até': datetime(2026, 10, 20)},
+            3: {'Status': 'ciente', 'Motivo': 'outro'},                     # sem nota
+            4: {'Status': 'Ciente', 'Motivo': 'proposital'},                # loja fora
+        })
+        # linhas extras: sinal que não existe mais, repetida, status errado, datas ruins
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(arq))
+        ws = wb['Sinais']
+        ws.append([LPT, 'full_cobertura', 'E999'] + [None] * 8 + ['Ciente', 'Já em andamento', None, None])
+        ws.append([LPT, 'full_cobertura', 'E1'] + [None] * 8 + ['Ciente', 'Já em andamento', None, None])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + ['ok', None, None, None])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + ['Ciente', 'Já em andamento', None, '31/02/2026'])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + [None, 'Outro', 'ignorada', None])
+        bio = io.BytesIO()
+        wb.save(bio)
+        linhas = sd.ler_excel(bio.getvalue())
+        itens, previa = sd.previa_excel(linhas, sinais, [LPT], hoje)
+        res = dict(zip(previa['Linha'], previa['Resultado']))
+        self.assertEqual(res[2], '✅ ok')
+        self.assertIn('pede uma nota', res[3])
+        self.assertIn('loja fora do seu perfil', res[4])
+        self.assertIn('não existe mais hoje', res[5])
+        self.assertIn('repetido no arquivo (já na linha 2)', res[6])
+        self.assertIn('Status deve ser "Ciente"', res[7])
+        self.assertIn('repetido', res[8])                    # MLB2 já veio na linha 3
+        self.assertNotIn(9, res)                             # sem Status: ignorada
+        self.assertEqual(len(itens), 1)
+        sinal, motivo, nota, ate = itens[0]
+        self.assertIs(sinal, sinais[0])                      # medida/texto do cálculo de hoje
+        self.assertEqual((motivo, nota, ate), ('falta_fornecedor', 'abraçadeira', date(2026, 10, 20)))
+
+    def test_datas_e_motivo_por_codigo(self):
+        sinais = self._sinais()[:2]
+        arq = self._preencher(sd.excel_sinais(sinais, {}, HOJE), {
+            2: {'Status': 'Ciente', 'Motivo': 'em_andamento'},              # data vazia
+            3: {'Status': 'Ciente', 'Motivo': 'Decisão proposital', 'Silenciar até': '2026-12-25'}})
+        itens, previa = sd.previa_excel(sd.ler_excel(arq), sinais, [LPT], HOJE)
+        res = dict(zip(previa['Linha'], previa['Resultado']))
+        self.assertEqual(itens[0][1:], ('em_andamento', '', HOJE + timedelta(days=7)))
+        self.assertIn('no máximo 60 dias', res[3])
+        arq = self._preencher(sd.excel_sinais(sinais, {}, HOJE), {
+            2: {'Status': 'Ciente', 'Motivo': 'Decisão proposital', 'Silenciar até': '04/10/2026'},
+            3: {'Status': 'Ciente', 'Motivo': 'Decisão proposital', 'Silenciar até': 'amanhã'}})
+        itens, previa = sd.previa_excel(sd.ler_excel(arq), sinais, [LPT], HOJE)
+        res = dict(zip(previa['Linha'], previa['Resultado']))
+        self.assertIn('passado', res[2])
+        self.assertIn('ilegível', res[3])
+        self.assertEqual(itens, [])
+
+    def test_limites_do_arquivo(self):
+        with self.assertRaises(ValueError) as e:
+            sd.ler_excel(b'x' * (sd.EXCEL_MAX_BYTES + 1))
+        self.assertIn('limite', str(e.exception))
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Sinais'
+        ws.append(list(sd.COLUNAS_EXCEL))
+        with mock.patch.object(sd, 'EXCEL_MAX_LINHAS', 3):
+            for i in range(4):
+                ws.append([LPT, 'vendas_queda', f'MLB{i}'])
+            bio = io.BytesIO()
+            wb.save(bio)
+            with self.assertRaises(ValueError) as e:
+                sd.ler_excel(bio.getvalue())
+        self.assertIn('mais de 3 linhas', str(e.exception))
+
+    def test_arquivo_sem_as_colunas(self):
+        from openpyxl import Workbook
+        wb = Workbook()
+        wb.active.append(['Loja', 'Regra'])
+        bio = io.BytesIO()
+        wb.save(bio)
+        with self.assertRaises(ValueError):
+            sd.ler_excel(bio.getvalue())
+
+    def test_gravar_valida_cada_linha_antes_de_tocar_no_banco(self):
+        conn = mock.Mock()
+        s1, s2 = self._sinais()[:2]
+        with self.assertRaises(ValueError):
+            sd.gravar_cientes(conn, [(s1, 'proposital', '', HOJE), (s2, 'outro', '', HOJE)],
+                              'larissa', HOJE, [LPT])
+        conn.cursor.assert_not_called()
 
 
 # ============================================================
@@ -685,6 +1001,11 @@ class ComBanco(unittest.TestCase):
         return len(checks)
 
     def setUp(self):
+        # o cenário (datas) foi montado com as janelas da v1, que terminavam em
+        # D-3; a SQL não depende do deslocamento, então ele fica fixo aqui
+        p = mock.patch.object(sd, 'DIAS_ATRASO_API', 2)
+        p.start()
+        self.addCleanup(p.stop)
         c = self.cur = self.conn.cursor()
         for ddl in _DDL:
             c.execute(ddl)
@@ -767,7 +1088,7 @@ class ComBanco(unittest.TestCase):
         dados, erros = sd.ler_tudo(self.c, HOJE, [LPT, NALA])
         self.assertEqual(erros, {})
         self.assertEqual(dados['visitas'], [])               # TEMP vazia, nunca a real
-        self.assertEqual(dados['ciente'], [])                # TEMP vazia, nunca a real
+        self.assertEqual(sd.ler_cientes(self.c, [LPT, NALA]), [])   # TEMP vazia, nunca a real
         s, erros_bloco = sd.montar_sinais(dados, HOJE)
         self.assertEqual(erros_bloco, {})
         por = {(x['loja'], x['tipo'], x['numero'].split(':')[0].split(' ')[0]): x for x in s}
@@ -855,7 +1176,7 @@ class CienteComBanco(unittest.TestCase):
 
     def test_grava_le_e_silencia(self):
         hoje = datetime.now(sd.BRT).date()
-        n = sd.gravar_cientes(_Conexao(self.conn), [self._s(), self._s('E2')], 'outro',
+        n = _gravar(_Conexao(self.conn), [self._s(), self._s('E2')], 'outro',
                               'abraçadeira em falta', hoje + timedelta(days=7), 'larissa',
                               hoje, [LPT])
         self.assertEqual(n, 2)
@@ -873,7 +1194,7 @@ class CienteComBanco(unittest.TestCase):
     def test_novo_ciente_substitui_o_aberto(self):
         hoje = datetime.now(sd.BRT).date()
         for motivo in ('em_andamento', 'proposital'):
-            sd.gravar_cientes(_Conexao(self.conn), [self._s()], motivo, '', hoje, 'larissa',
+            _gravar(_Conexao(self.conn), [self._s()], motivo, '', hoje, 'larissa',
                               hoje, [LPT])
         self.cur.execute("SELECT motivo, como_encerrou, encerrado_por FROM sinal_ciente ORDER BY id")
         self.assertEqual(self.cur.fetchall(), [('em_andamento', 'substituido', 'larissa'),
@@ -917,14 +1238,25 @@ class CienteComBanco(unittest.TestCase):
         hoje = datetime.now(sd.BRT).date()
         ruim = self._s('E2', regra='regra_que_nao_existe')
         with self.assertRaises(Exception):
-            sd.gravar_cientes(_Conexao(self.conn, savepoint=True), [self._s(), ruim],
+            _gravar(_Conexao(self.conn, savepoint=True), [self._s(), ruim],
                               'proposital', '', hoje, 'larissa', hoje, [LPT])
         self.cur.execute('SELECT count(*) FROM sinal_ciente')
         self.assertEqual(self.cur.fetchone()[0], 0)
 
+    def test_cada_linha_com_seu_motivo_numa_transacao(self):
+        hoje = datetime.now(sd.BRT).date()
+        n = sd.gravar_cientes(_Conexao(self.conn), [
+            (self._s('E1'), 'falta_fornecedor', 'abraçadeira', hoje + timedelta(days=30)),
+            (self._s('E2'), 'outro', 'teste A/B', hoje)], 'larissa', hoje, [LPT])
+        self.assertEqual(n, 2)
+        self.cur.execute("SELECT objeto, motivo, nota, silenciar_ate - CURRENT_DATE "
+                         "FROM sinal_ciente ORDER BY objeto")
+        self.assertEqual(self.cur.fetchall(), [('E1', 'falta_fornecedor', 'abraçadeira', 30),
+                                               ('E2', 'outro', 'teste A/B', 0)])
+
     def test_reativar_so_nas_lojas_do_usuario(self):
         hoje = datetime.now(sd.BRT).date()
-        sd.gravar_cientes(_Conexao(self.conn), [self._s()], 'proposital', '', hoje,
+        _gravar(_Conexao(self.conn), [self._s()], 'proposital', '', hoje,
                           'larissa', hoje, [LPT])
         id_ = self._abertos()[0][0]
         self.assertEqual(sd.reativar_ciente(_Conexao(self.conn), id_, 'patricia', [NALA]), 0)
@@ -935,7 +1267,7 @@ class CienteComBanco(unittest.TestCase):
 
     def test_ler_tudo_le_os_cientes_quando_a_tabela_existe(self):
         hoje = datetime.now(sd.BRT).date()
-        sd.gravar_cientes(_Conexao(self.conn), [self._s(), self._s(loja=NALA)], 'proposital',
+        _gravar(_Conexao(self.conn), [self._s(), self._s(loja=NALA)], 'proposital',
                           '', hoje, 'larissa', hoje, [LPT, NALA])
         c = _Conexao(self.conn)
         self.assertTrue(sd._ler(c, sd.SQL_EXISTE_CIENTE, {})[0][0])  # ler_tudo usa isto
