@@ -71,6 +71,24 @@ CIENTE (v1.1, plano aprovado pelo Thiago em 05/10/2026)
     CONTROLADORIA, COMPRAS; GESTOR só nas lojas dele). DIRETOR só vê.
   - Antes do SQL aplicado (sql/sinais_ciente.sql), a tela funciona como a v1.
 
+v1.2 (06/10/2026)
+  - Velocidade: o banco fica em São Paulo e o app no Streamlit Cloud; cada
+    ida e volta custa ~130 ms e a v1 fazia ~39 por carga, a cada clique. Agora:
+    a leitura do dia (tudo menos os cientes) fica em memória por
+    TTL_LEITURA_S, com botão "Atualizar dados"; leitura incompleta (alguma
+    fonte com erro) NÃO vai para a memória; os cientes são relidos a cada
+    carga; rollback só no erro; cada loja é um st.fragment (marcar uma caixa
+    não recarrega as outras); quadro "⏱ tempos desta carga" só para ADMIN.
+  - "Venda de ontem" e "Mês até ontem" sem selo "parcial" (dia fechado), com
+    "?" explicando o que ainda muda. A exclusão de D-1/D-2 nas comparações de
+    VENDAS fica até a v1.3 medir (pedido pago depois pode entrar com data de
+    ontem).
+  - Coluna "Período" em cada sinal (janela analisada ou foto usada).
+  - Excel de ida e volta: baixar os sinais com a chave e Status/Motivo/Nota/
+    Até vazios; subir preenchido com PRÉVIA; grava só as linhas ok, numa
+    transação, pela MESMA gravar_cientes do formulário. Medida e texto do
+    sinal vêm do cálculo de hoje, nunca do arquivo. DIRETOR baixa, não sobe.
+
 RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
   - R1: o mesmo SKU em DOIS estoques do mesmo anúncio conta a venda nos dois
     (a venda não diz de qual variação saiu). O alarme fica pessimista (cada
@@ -87,7 +105,9 @@ RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
 """
 
 import hashlib
+import io
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -141,6 +161,7 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'visitas_queda': 'Visitas caíram', 'visitas_alta': 'Visitas subiram'}
 
 MAX_SINAIS_POR_LOJA = 10
+TTL_LEITURA_S = 600              # leitura do dia em memória por 10 min
 HORA_COLETA_COMPLETA = 10        # depois das 10h (Brasília) o dado do dia já devia ter chegado
 DIAS_LEITURA_FRESCOR = 10
 
@@ -416,13 +437,18 @@ def params(hoje, lojas):
 # ============================================================
 
 def _ler(conn, sql, p):
+    """Uma consulta. Rollback SÓ no erro (a transação abortada não pode
+    derrubar as leituras seguintes); no sucesso não gasta a ida e volta: a
+    conexão volta ao pool com rollback no close."""
     cur = conn.cursor()
     try:
         cur.execute(sql, p)
         return cur.fetchall()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cur.close()
-        conn.rollback()
 
 
 FONTES = {
@@ -439,9 +465,17 @@ FONTES = {
 }
 
 
+def ler_cientes(conn, lojas):
+    """Cientes abertos das lojas; None se a tabela não existe. Erro sobe."""
+    if not _ler(conn, SQL_EXISTE_CIENTE, {})[0][0]:
+        return None
+    return _ler(conn, SQL_CIENTES_ABERTOS, {'marketplace': MARKETPLACE, 'lojas': list(lojas)})
+
+
 def ler_tudo(conn, hoje, lojas):
-    """{fonte: linhas} e {fonte: exceção}. Visitas e ciente só se a view /
-    tabela existir (None = ainda não existe)."""
+    """{fonte: linhas} e {fonte: exceção}: a leitura do DIA (vai para a
+    memória). Visitas só se a view existir (None = ainda não existe). Os
+    cientes NÃO entram aqui: mudam a cada clique (ler_cientes)."""
     p = params(hoje, lojas)
     dados, erros = {}, {}
     for nome, sql in FONTES.items():
@@ -454,13 +488,6 @@ def ler_tudo(conn, hoje, lojas):
         dados['mapa'] = dict(_ler(conn, ep.SQL_MAPEAMENTO, {}))
     except Exception as e:  # noqa: BLE001
         erros['composicao'] = e
-    try:
-        if _ler(conn, SQL_EXISTE_CIENTE, {})[0][0]:
-            dados['ciente'] = _ler(conn, SQL_CIENTES_ABERTOS, p)
-        else:
-            dados['ciente'] = None          # SQL da v1.1 ainda não aplicado
-    except Exception as e:  # noqa: BLE001
-        erros['ciente'] = e
     try:
         if _ler(conn, SQL_EXISTE_VISITAS, {})[0][0]:
             dados['visitas'] = _ler(conn, SQL_VISITAS, p)
@@ -539,8 +566,16 @@ def agregar_vendas(vendas):
     return an, por_sku
 
 
+def _d(x):
+    return f"{pd.Timestamp(x):%d/%m}"
+
+
+def _periodo_semanas(j):
+    return f"{_d(j['sem_ini'])}–{_d(j['fim'])} × {_d(j['base_ini'])}–{_d(j['base_fim'])}"
+
+
 def _sinal(loja, tipo, anuncio, skus, numero, sugestao, em_jogo, urgente=False,
-           familia='', regra='', objeto=None, medida=None):
+           familia='', regra='', objeto=None, medida=None, periodo=''):
     """regra + loja + objeto = a chave do Ciente; medida = o número que diz se
     o sinal piorou depois do ciente (ver piorou())."""
     return {'loja': loja, 'tipo': tipo, 'anuncio': anuncio or '',
@@ -548,7 +583,8 @@ def _sinal(loja, tipo, anuncio, skus, numero, sugestao, em_jogo, urgente=False,
             'sugestao': sugestao, 'em_jogo': float(em_jogo or 0),
             'urgente': urgente, 'familia': familia, 'regra': regra,
             'objeto': objeto if objeto is not None else (anuncio or ''),
-            'medida': None if medida is None else float(medida), 'voltou': ''}
+            'medida': None if medida is None else float(medida), 'voltou': '',
+            'periodo': periodo}
 
 
 def _rel(a):
@@ -569,14 +605,16 @@ def sinais_vendas(por_anuncio, j):
                 f"Queda: semana {periodo} {_brl(sem)} × média {_brl(base_sem)}/sem "
                 f"({_pct(sem / base_sem - 1)})",
                 "Ver Full/estoque, preço, posição e se o ads foi mexido",
-                base_sem - sem, regra='vendas_queda', medida=sem / base_sem - 1))
+                base_sem - sem, regra='vendas_queda', medida=sem / base_sem - 1,
+                periodo=_periodo_semanas(j)))
         elif sem > ALTA_VENDA * base_sem:
             out.append(_sinal(
                 loja, 'VENDAS', anuncio, a['skus'],
                 f"Alta: semana {periodo} {_brl(sem)} × média {_brl(base_sem)}/sem "
                 f"({_pct(sem / base_sem - 1)})",
                 "Garantir Full para o novo ritmo; campanha não travar no orçamento",
-                sem - base_sem, regra='vendas_alta', medida=sem / base_sem - 1))
+                sem - base_sem, regra='vendas_alta', medida=sem / base_sem - 1,
+                periodo=_periodo_semanas(j)))
     return out
 
 
@@ -633,7 +671,8 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
                 f"anúncio, todas as variações"
                 + (f"; {transf} em transferência" if transf else '') + ")",
                 "Baixar/pausar o ads até o Full voltar", max(rec_30, ads_ontem),
-                urgente=True, regra='full_zerado_ads', objeto=eid, medida=ads_ontem))
+                urgente=True, regra='full_zerado_ads', objeto=eid, medida=ads_ontem,
+                periodo=f"foto {_d(data)} · ads {_d(j['ontem'])}"))
         elif dia > 0:
             dias = (full + transf) / dia
             if dias < FULL_ATENCAO_DIAS:
@@ -644,14 +683,16 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
                     f"{_dec(dia)}/dia; 7d {_dec(qtd_ritmo / JANELA_RITMO_FULL)}/dia, "
                     f"30d {_dec(qtd_30 / JANELA_PISO_FULL)}/dia)",
                     "Enviar ao Full agora" if urg else "Programar envio ao Full",
-                    rec_30, urgente=urg, regra='full_cobertura', objeto=eid, medida=full))
+                    rec_30, urgente=urg, regra='full_cobertura', objeto=eid, medida=full,
+                    periodo=f"foto {_d(data)} · venda {_d(j['ritmo_ini'])}–{_d(j['fim'])}"))
         if recebidas > 0:
             out.append(_sinal(
                 loja, 'FULL', anuncio, e['skus'],
                 f"Envio entrou no Full em {pd.Timestamp(data):%d/%m}: +{recebidas} un. "
                 f"(Full agora {full})",
                 "Conferir se o ads/preço voltou ao normal", rec_30, regra='full_envio',
-                objeto=f"{eid}@{pd.Timestamp(data):%Y-%m-%d}", medida=recebidas))
+                objeto=f"{eid}@{pd.Timestamp(data):%Y-%m-%d}", medida=recebidas,
+                periodo=f"foto {_d(data)}"))
     return out
 
 
@@ -687,7 +728,8 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
             loja, 'ADS', anuncio or camp, a.get('skus'),
             "Mudou ontem: " + '; '.join(partes) + f" (foto de {pd.Timestamp(d_antes):%d/%m} → hoje)",
             "Acompanhar venda e TACOS nos próximos 3 dias", a.get('rec_30', 0.0),
-            regra='ads_config', objeto=objeto_campanha(anuncio, camp, d_agora)))
+            regra='ads_config', objeto=objeto_campanha(anuncio, camp, d_agora),
+            periodo=f"foto {_d(d_antes)} → {_d(d_agora)}"))
 
     semana = 7
     for (loja, anuncio), d in ads.items():
@@ -702,7 +744,8 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
                 f"{DIAS_GASTO_SEM_VENDA} dias com gasto e zero venda de ads "
                 f"({_brl(_f(d.get('gasto_recente')))})",
                 "Rever ROAS objetivo ou pausar a campanha", _f(d.get('gasto_recente')),
-                regra='ads_sem_venda', medida=_f(d.get('gasto_recente'))))
+                regra='ads_sem_venda', medida=_f(d.get('gasto_recente')),
+                periodo=f"{_d(j['recente_ini'])}–{_d(j['ontem'])}"))
 
         # custo por venda acima da margem por unidade (só SKU único)
         unid, gasto, cliques = _f(d.get('unid_ads_30')), _f(d.get('gasto_30')), _f(d.get('cliques_30'))
@@ -720,7 +763,8 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
                 out.append(_sinal(loja, 'ADS', anuncio, a['skus'], txt,
                                   "Subir ROAS objetivo (cada venda de ads dá prejuízo)",
                                   (custo_un - margem_un) * unid, regra='ads_custo',
-                                  medida=custo_un - margem_un))
+                                  medida=custo_un - margem_un,
+                                  periodo=f"{_d(j['piso_ini'])}–{_d(j['fim'])}"))
 
         # espiral: gasto cortado E venda caindo — só com estoque a semana toda
         gasto_base_sem = _f(d.get('gasto_base')) / SEMANAS_BASE
@@ -740,14 +784,14 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
                     + (f"; TACOS {tacos_sem * 100:.1f}% (era {tacos_base * 100:.1f}%)".replace('.', ',')
                        if tacos_sem is not None and tacos_base is not None else ''),
                     "Com estoque a semana toda: devolver o investimento aos poucos (+20–30%/ciclo)",
-                    queda, regra='ads_espiral', medida=queda))
+                    queda, regra='ads_espiral', medida=queda, periodo=_periodo_semanas(j)))
             else:
                 out.append(_sinal(
                     loja, 'FULL', anuncio, a['skus'],
                     f"Ruptura: estoque em só {dias} de 7 dias da semana; venda "
                     f"{_pct(a['rec_sem'] / rec_base_sem - 1)} e ads cortado — a causa é estoque",
                     "Repor estoque antes de mexer no ads", queda, urgente=True,
-                    regra='full_ruptura', medida=queda))
+                    regra='full_ruptura', medida=queda, periodo=_periodo_semanas(j)))
     return out
 
 
@@ -764,7 +808,13 @@ def familias(ponte, comp):
 def sinais_experiencia(saude, ponte, comp, por_anuncio):
     """saude: [(loja, anuncio, data, valor, texto, valor_ref, texto_ref)]."""
     fam = familias(ponte, comp)
-    nota = {(l, a): (v, t, vr, tr) for l, a, _d, v, t, vr, tr in saude}
+    nota = {(l, a): (v, t, vr, tr) for l, a, _dt, v, t, vr, tr in saude}
+    data_nota = {(l, a): dt for l, a, dt, _v, _t, _vr, _tr in saude}
+
+    def periodo(k):
+        dt = data_nota.get(k)
+        return (f"nota {_d(pd.Timestamp(dt) - timedelta(days=DIAS_REF_EXPERIENCIA))} → {_d(dt)}"
+                if dt is not None else '')
 
     def piorou(k):
         v, _t, vr, _tr = nota[k]
@@ -806,7 +856,7 @@ def sinais_experiencia(saude, ponte, comp, por_anuncio):
                 f"{DIAS_REF_EXPERIENCIA} dias: {de_para}",
                 "Ver o que muda entre os anúncios (kit, embalagem, reclamação, prazo)",
                 em_jogo, familia=texto_familia(loja, peca), regra='exp_familia',
-                objeto=f"peça:{peca}", medida=len(pioraram)))
+                objeto=f"peça:{peca}", medida=len(pioraram), periodo=periodo(pioraram[0])))
     for k in sorted(nota):
         if k in cobertos or not piorou(k):
             continue
@@ -820,7 +870,7 @@ def sinais_experiencia(saude, ponte, comp, por_anuncio):
             f"em {DIAS_REF_EXPERIENCIA} dias",
             "Abrir o anúncio no ML e ver a ação principal sugerida",
             a.get('rec_30', 0.0), familia=' | '.join(x for x in textos if x),
-            regra='exp_anuncio', medida=float(v)))
+            regra='exp_anuncio', medida=float(v), periodo=periodo(k)))
     return out
 
 
@@ -845,7 +895,8 @@ def sinais_visitas(visitas, por_anuncio, j):
         out.append(_sinal(
             loja, 'VISITAS', anuncio, a['skus'],
             f"{txt}: semana {sem:.0f} × média {base_sem:.0f}/sem ({_pct(sem / base_sem - 1)})",
-            sug, a['rec_base'] / SEMANAS_BASE, regra=regra, medida=sem / base_sem - 1))
+            sug, a['rec_base'] / SEMANAS_BASE, regra=regra, medida=sem / base_sem - 1,
+            periodo=_periodo_semanas(j)))
     return out
 
 
@@ -995,23 +1046,28 @@ def validar_ciente(motivo, nota, ate, hoje):
     return erros
 
 
-def gravar_cientes(conn, sinais, motivo, nota, ate, usuario, hoje, lojas_permitidas):
-    """Grava o ciente de cada sinal numa transação só. Ciente aberto na mesma
-    chave é encerrado ('substituido') antes. Devolve quantos gravou."""
-    erros = validar_ciente(motivo, nota, ate, hoje)
+def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas):
+    """A ÚNICA gravação de ciente (formulário da tela e Excel).
+    itens = [(sinal, motivo, nota, ate)]: cada um com o seu motivo/nota/data.
+    Valida tudo antes de tocar no banco; grava numa transação só (ciente
+    aberto na mesma chave é encerrado como 'substituido'). Medida e texto vêm
+    do SINAL (cálculo de hoje), nunca de quem chama. Devolve quantos gravou."""
+    erros = []
     if not (usuario or '').strip():
         erros.append("Usuário não identificado.")
-    longos = [s['objeto'] for s in sinais if len(s['objeto']) > 120]
-    if longos:
-        erros.append(f"Chave do sinal longa demais: {longos[0][:40]}…")
+    for s, motivo, nota, ate in itens:
+        for e in validar_ciente(motivo, nota, ate, hoje):
+            erros.append(f"{s['loja']} · {s['objeto']}: {e}")
+        if len(s['objeto']) > 120:
+            erros.append(f"Chave do sinal longa demais: {s['objeto'][:40]}…")
     if erros:
         raise ValueError(' '.join(erros))
-    fora = sorted({s['loja'] for s in sinais if s['loja'] not in lojas_permitidas})
+    fora = sorted({s['loja'] for s, *_r in itens if s['loja'] not in lojas_permitidas})
     if fora:
         raise PermissionError(f"Sem permissão nas lojas: {', '.join(fora)}")
     cur = conn.cursor()
     try:
-        for s in sinais:
+        for s, motivo, nota, ate in itens:
             p = {'marketplace': MARKETPLACE, 'loja': s['loja'], 'regra': s['regra'],
                  'objeto': s['objeto'], 'motivo': motivo,
                  'nota': (nota or '').strip() or None, 'silenciar_ate': ate,
@@ -1024,7 +1080,181 @@ def gravar_cientes(conn, sinais, motivo, nota, ate, usuario, hoje, lojas_permiti
         raise
     finally:
         cur.close()
-    return len(sinais)
+    return len(itens)
+
+
+# ============================================================
+# EXCEL DE IDA E VOLTA (v1.2)
+# ============================================================
+
+COLUNAS_EXCEL = ('Loja', 'Regra', 'Objeto', 'Tipo', 'O que é', 'SKU', 'Produto', 'Anúncio',
+                 'O que disparou', 'Período', 'R$ em jogo',
+                 'Status', 'Motivo', 'Nota', 'Silenciar até')
+EDITAVEIS_EXCEL = ('Status', 'Motivo', 'Nota', 'Silenciar até')
+OBRIGATORIAS_EXCEL = ('Loja', 'Regra', 'Objeto') + EDITAVEIS_EXCEL
+
+
+def excel_sinais(sinais, nomes, hoje):
+    """xlsx com os sinais: a chave (Loja, Regra, Objeto) e os dados do sinal
+    travados; Status/Motivo/Nota/Silenciar até livres, com lista suspensa."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Protection
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Sinais'
+    ws.append(list(COLUNAS_EXCEL))
+    for sn in sinais:
+        produto = ' / '.join(nomes.get(x) or '(sem cadastro)' for x in sn['skus'])
+        ws.append([sn['loja'], sn['regra'], sn['objeto'], sn['tipo'],
+                   REGRAS.get(sn['regra'], sn['regra']), ', '.join(sn['skus']), produto,
+                   sn['anuncio'], sn['numero'], sn.get('periodo', ''),
+                   round(sn['em_jogo'], 2), None, None, None, None])
+    ultima = max(len(sinais) + 1, 2)
+    col = {c: get_column_letter(i + 1) for i, c in enumerate(COLUNAS_EXCEL)}
+    dv_status = DataValidation(type='list', formula1='"Ciente"', allow_blank=True)
+    dv_motivo = DataValidation(type='list', formula1='"' + ','.join(MOTIVOS.values()) + '"',
+                               allow_blank=True)
+    ws.add_data_validation(dv_status)
+    ws.add_data_validation(dv_motivo)
+    dv_status.add(f"{col['Status']}2:{col['Status']}{ultima}")
+    dv_motivo.add(f"{col['Motivo']}2:{col['Motivo']}{ultima}")
+    livre = PatternFill('solid', fgColor='FFF2CC')
+    for nome in EDITAVEIS_EXCEL:
+        for r in range(2, ultima + 1):
+            c = ws[f"{col[nome]}{r}"]
+            c.protection = Protection(locked=False)
+            c.fill = livre
+            if nome == 'Silenciar até':
+                c.number_format = 'DD/MM/YYYY'
+    for r in range(2, ultima + 1):
+        ws[f"{col['R$ em jogo']}{r}"].number_format = '#,##0.00'
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    larguras = {'Loja': 12, 'Regra': 16, 'Objeto': 22, 'Tipo': 12, 'O que é': 22, 'SKU': 16,
+                'Produto': 30, 'Anúncio': 16, 'O que disparou': 60, 'Período': 24,
+                'R$ em jogo': 12, 'Status': 10, 'Motivo': 22, 'Nota': 30, 'Silenciar até': 14}
+    for nome, w in larguras.items():
+        ws.column_dimensions[col[nome]].width = w
+    ws.freeze_panes = 'A2'
+    ws.protection.sheet = True
+    ws.protection.formatColumns = False
+    ws.protection.autoFilter = False
+    ws.auto_filter.ref = f"A1:{col['Silenciar até']}{ultima}"
+
+    ins = wb.create_sheet('Instruções')
+    for linha in (
+            [f"Sinais do Dia — Mercado Livre — gerado em {hoje:%d/%m/%Y}"], [],
+            ["Preencha só as colunas amarelas (Status, Motivo, Nota, Silenciar até)."],
+            ['Status: "Ciente" para responder ao sinal; vazio = linha ignorada.'],
+            ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota.'],
+            [f"Silenciar até: dd/mm/aaaa, de hoje até {DIAS_SILENCIO_MAX} dias; vazio = "
+             f"{DIAS_SILENCIO_PADRAO} dias."],
+            ["Não mude Loja, Regra e Objeto: são a chave do sinal."],
+            ["Ao subir, a tela mostra uma PRÉVIA e grava só as linhas ok. Sinal que não "
+             "existe mais hoje é recusado."]):
+        ins.append(linha)
+    ins.column_dimensions['A'].width = 100
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def ler_excel(conteudo):
+    """[{coluna: valor, '_linha': n}] das linhas não vazias da aba Sinais."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
+    ws = wb['Sinais'] if 'Sinais' in wb.sheetnames else wb.active
+    linhas = list(ws.iter_rows(values_only=True))
+    if not linhas:
+        raise ValueError("Planilha vazia.")
+    cab = [str(c).strip() if c is not None else '' for c in linhas[0]]
+    faltam = [c for c in OBRIGATORIAS_EXCEL if c not in cab]
+    if faltam:
+        raise ValueError("Faltam as colunas: " + ', '.join(faltam))
+    out = []
+    for n, r in enumerate(linhas[1:], start=2):
+        if all(v is None or str(v).strip() == '' for v in r):
+            continue
+        d = dict(zip(cab, r))
+        d['_linha'] = n
+        out.append(d)
+    return out
+
+
+def _motivo_excel(v):
+    t = str(v or '').strip().lower()
+    for cod, rot in MOTIVOS.items():
+        if t in (cod, rot.lower()):
+            return cod
+    return None
+
+
+def _data_excel(v, hoje):
+    if v is None or str(v).strip() == '':
+        return hoje + timedelta(days=DIAS_SILENCIO_PADRAO)
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    t = str(v).strip()
+    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d/%m/%y'):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(t)
+
+
+def previa_excel(linhas, sinais_hoje, lojas_permitidas, hoje):
+    """(itens para gravar_cientes, DataFrame da prévia). Só linhas com Status.
+    O sinal (medida, texto) vem de `sinais_hoje`, nunca do arquivo."""
+    por_chave = {(x['loja'], x['regra'], x['objeto']): x for x in sinais_hoje}
+    itens, previa, vistas = [], [], {}
+    for d in linhas:
+        loja, regra, objeto = (str(d.get(k) or '').strip() for k in ('Loja', 'Regra', 'Objeto'))
+        status = str(d.get('Status') or '').strip()
+        if not status:
+            continue
+        base = {'Linha': d['_linha'], 'Loja': loja, 'Regra': REGRAS.get(regra, regra),
+                'Objeto': objeto, 'Motivo': '', 'Até': ''}
+
+        def recusa(motivo_recusa):
+            previa.append({**base, 'Resultado': '❌ ' + motivo_recusa})
+
+        if status.lower() != 'ciente':
+            recusa('Status deve ser "Ciente" (ou vazio para ignorar a linha)')
+            continue
+        if loja not in lojas_permitidas:
+            recusa('loja fora do seu perfil')
+            continue
+        chave = (loja, regra, objeto)
+        if chave in vistas:
+            recusa(f'sinal repetido no arquivo (já na linha {vistas[chave]})')
+            continue
+        vistas[chave] = d['_linha']
+        sinal = por_chave.get(chave)
+        if sinal is None:
+            recusa('o sinal não existe mais hoje')
+            continue
+        motivo = _motivo_excel(d.get('Motivo'))
+        try:
+            ate = _data_excel(d.get('Silenciar até'), hoje)
+        except ValueError:
+            recusa('"Silenciar até" ilegível (use dd/mm/aaaa)')
+            continue
+        nota = str(d.get('Nota') or '').strip()
+        erros = validar_ciente(motivo, nota, ate, hoje)
+        if erros:
+            recusa(' '.join(erros))
+            continue
+        itens.append((sinal, motivo, nota, ate))
+        previa.append({**base, 'Motivo': MOTIVOS[motivo], 'Até': f"{ate:%d/%m/%Y}",
+                       'Resultado': '✅ ok'})
+    return itens, pd.DataFrame(previa, columns=['Linha', 'Loja', 'Regra', 'Objeto', 'Motivo',
+                                                'Até', 'Resultado'])
 
 
 def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas):
@@ -1148,6 +1378,7 @@ def tabela_sinais(sinais, nomes):
         'Produto': [produto(s['skus']) for s in sinais],
         'Anúncio': [s['anuncio'] for s in sinais],
         'O que disparou': [s['numero'] for s in sinais],
+        'Período': [s.get('periodo', '') for s in sinais],
         'Sugestão': [s['sugestao'] for s in sinais],
         'R$ em jogo': [_brl(s['em_jogo']) for s in sinais],
         'Família (mesma peça, mesma loja)': [s['familia'] for s in sinais],
@@ -1184,14 +1415,18 @@ def tabela_silenciados(silenciados, cientes_loja, hoje, nomes, ativos=()):
     return pd.DataFrame(linhas)
 
 
+AJUDA_DIA_FECHADO = ("Pode subir com pagamentos aprovados depois (boleto/Pix) e cair "
+                     "com cancelamentos e devoluções.")
+
+
 def _render_resumo(st, loja, r, ontem):
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"Venda de ontem ({ontem:%d/%m}) · parcial", _brl(r['ontem']),
+    c1.metric(f"Venda de ontem ({ontem:%d/%m})", _brl(r['ontem']),
               None if r['var_ontem'] is None else _pct(r['var_ontem']) + " vs mesmo dia da semana",
-              help=f"Comparada com a média dos {SEMANAS_BASE} mesmos dias da semana "
-                   f"anteriores ({_brl(r['media_mesmo_dia'])}). Parcial: a API ainda "
-                   "completa D-1 e D-2.")
-    c2.metric("Mês até ontem · parcial", _brl(r['mes']))
+              help=f"Dia fechado. {AJUDA_DIA_FECHADO} Comparada com a média dos "
+                   f"{SEMANAS_BASE} mesmos dias da semana anteriores "
+                   f"({_brl(r['media_mesmo_dia'])}).")
+    c2.metric("Mês até ontem", _brl(r['mes']), help=f"Dias fechados. {AJUDA_DIA_FECHADO}")
     if r['meta']:
         c3.metric("Meta do mês", _brl(r['meta']),
                   f"{r['pct_meta'] * 100:.0f}% atingido · esperado linear "
@@ -1200,7 +1435,117 @@ def _render_resumo(st, loja, r, ontem):
         c3.metric("Meta do mês", "não cadastrada", help="Cadastrar na aba Performance.")
 
 
+def _no_streamlit():
+    """True só rodando dentro do Streamlit (nos testes: sem memória, sem fragmento)."""
+    try:
+        from streamlit.runtime import exists
+        return exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _LeituraIncompleta(Exception):
+    """Leitura com alguma fonte em erro: devolvida, mas NÃO guardada em memória."""
+
+    def __init__(self, pacote):
+        super().__init__('leitura incompleta')
+        self.pacote = pacote
+
+
+def _ler_lojas_ml(_engine):
+    conn = _engine.raw_connection()
+    try:
+        return [r[0] for r in _ler(conn, SQL_LOJAS_ML, {'marketplace': MARKETPLACE})]
+    finally:
+        conn.close()
+
+
+def _ler_pacote(_engine, hoje, lojas):
+    """A leitura do DIA (tudo menos os cientes) + os sinais montados."""
+    t0 = time.perf_counter()
+    conn = _engine.raw_connection()
+    try:
+        dados, erros = ler_tudo(conn, hoje, list(lojas))
+        parciais = []
+        try:
+            parciais = [x for x in ep.fotos_parciais(ep.ler_contagens(conn)) if x[0] in lojas]
+        except Exception:  # noqa: BLE001
+            pass
+        sinais, erros_bloco = montar_sinais(dados, hoje)
+        try:
+            nomes = ep.ler_nomes(conn, {x for sn in sinais for x in sn['skus']})
+        except Exception:  # noqa: BLE001
+            nomes = {}
+    finally:
+        conn.close()
+    return {'dados': dados, 'erros': {k: str(v) for k, v in erros.items()},
+            'erros_bloco': {k: str(v) for k, v in erros_bloco.items()},
+            'parciais': parciais, 'sinais': sinais, 'nomes': nomes,
+            'lido_em': datetime.now(BRT), 'segundos': time.perf_counter() - t0}
+
+
+def _ler_pacote_completo(_engine, hoje, lojas):
+    pacote = _ler_pacote(_engine, hoje, lojas)
+    if pacote['erros'] or pacote['erros_bloco']:
+        raise _LeituraIncompleta(pacote)
+    return pacote
+
+
+def _lojas_para_memoria(_engine):
+    return _ler_lojas_ml(_engine)
+
+
+def _pacote_para_memoria(_engine, hoje, lojas):
+    return _ler_pacote_completo(_engine, hoje, lojas)
+
+
+_MEMORIA = {}
+
+
+def _memoria(nome):
+    """st.cache_data criado uma vez por função (chave: hoje + lojas; o engine
+    não entra na chave)."""
+    f = _MEMORIA.get(nome)
+    if f is None:
+        import streamlit
+        alvo = {'lojas': _lojas_para_memoria, 'pacote': _pacote_para_memoria}[nome]
+        f = streamlit.cache_data(ttl=TTL_LEITURA_S, show_spinner=False, max_entries=64)(alvo)
+        _MEMORIA[nome] = f
+    return f
+
+
+def limpar_memoria():
+    for f in _MEMORIA.values():
+        f.clear()
+
+
+def obter_lojas_ml(engine):
+    return _memoria('lojas')(engine) if _no_streamlit() else _ler_lojas_ml(engine)
+
+
+def obter_pacote(engine, hoje, lojas):
+    """(pacote, veio_da_memoria)."""
+    if not _no_streamlit():
+        return _ler_pacote(engine, hoje, tuple(lojas)), False
+    antes = datetime.now(BRT)
+    try:
+        pacote = _memoria('pacote')(engine, hoje, tuple(lojas))
+    except _LeituraIncompleta as e:
+        return e.pacote, False
+    return pacote, pacote['lido_em'] < antes
+
+
+def _como_fragmento(f):
+    """Cada loja num st.fragment: marcar uma caixa recarrega só aquela loja."""
+    if _no_streamlit():
+        import streamlit
+        return streamlit.fragment(f)
+    return f
+
+
 def _render_mercado_livre(st, engine):
+    t_ini = time.perf_counter()
+    tempos = []
     agora = datetime.now(BRT)
     hoje = agora.date()
 
@@ -1209,41 +1554,52 @@ def _render_mercado_livre(st, engine):
         st.caption("Nenhuma loja atribuída ao seu perfil.")
         return
 
-    conn = engine.raw_connection()
+    t = time.perf_counter()
     try:
-        try:
-            lojas_ml = [r[0] for r in _ler(conn, SQL_LOJAS_ML, {'marketplace': MARKETPLACE})]
-        except Exception:  # noqa: BLE001
-            st.error("Não consegui ler a lista de lojas agora. Tente de novo em instantes.")
-            return
-        lojas = lojas_visiveis(lojas_ml, restricao)
-        if not lojas:
-            st.caption("Nenhuma loja do Mercado Livre atribuída ao seu perfil.")
-            return
+        lojas_ml = obter_lojas_ml(engine)
+    except Exception:  # noqa: BLE001
+        st.error("Não consegui ler a lista de lojas agora. Tente de novo em instantes.")
+        return
+    tempos.append(('Lista de lojas', time.perf_counter() - t))
+    lojas = lojas_visiveis(lojas_ml, restricao)
+    if not lojas:
+        st.caption("Nenhuma loja do Mercado Livre atribuída ao seu perfil.")
+        return
 
-        dados, erros = ler_tudo(conn, hoje, lojas)
-        parciais = []
+    t = time.perf_counter()
+    pacote, da_memoria = obter_pacote(engine, hoje, lojas)
+    tempos.append(('Leitura do dia ' + (f"(da memória, lida às {pacote['lido_em']:%H:%M})"
+                                        if da_memoria else "(do banco)"),
+                   time.perf_counter() - t))
+    dados, erros, erros_bloco = pacote['dados'], pacote['erros'], dict(pacote['erros_bloco'])
+    sinais, nomes, parciais = pacote['sinais'], pacote['nomes'], pacote['parciais']
+
+    t = time.perf_counter()
+    cientes_linhas, erro_ciente = None, False
+    try:
+        conn = engine.raw_connection()
         try:
-            parciais = [p for p in ep.fotos_parciais(ep.ler_contagens(conn)) if p[0] in lojas]
-        except Exception:  # noqa: BLE001
-            pass
-        sinais, erros_bloco = montar_sinais(dados, hoje)
-        ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
-                                     sinais, dados.get('ciente') or [], hoje)
-        skus = {s for x in sinais for s in x['skus']}
-        try:
-            nomes = ep.ler_nomes(conn, skus)
-        except Exception:  # noqa: BLE001
-            nomes = {}
-    finally:
-        conn.close()
+            cientes_linhas = ler_cientes(conn, lojas)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        erro_ciente = True
+        erros = {**erros, 'ciente': 'erro'}
+    tempos.append(('Cientes (relidos a cada carga)', time.perf_counter() - t))
+    ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
+                                 sinais, cientes_linhas or [], hoje)
 
     j = janelas(hoje)
-    st.caption(
-        f"Dado de {j['ontem']:%d/%m} (ontem). Sinais de venda comparam a semana "
-        f"{j['sem_ini']:%d/%m}–{j['fim']:%d/%m} com a média semanal de "
-        f"{j['base_ini']:%d/%m}–{j['base_fim']:%d/%m}: os 2 últimos dias ficam fora porque a "
-        "venda da API ainda entra depois.")
+    c_txt, c_bt = st.columns([5, 1])
+    c_txt.caption(
+        f"Dado de {j['ontem']:%d/%m} (ontem, dia fechado). Os sinais de venda comparam a "
+        f"semana {j['sem_ini']:%d/%m}–{j['fim']:%d/%m} com a média semanal de "
+        f"{j['base_ini']:%d/%m}–{j['base_fim']:%d/%m}: D-1 e D-2 ficam fora porque pedido "
+        "pago depois (boleto/Pix) ainda pode entrar com a data deles. "
+        f"Leitura de {pacote['lido_em']:%H:%M}.")
+    if c_bt.button("🔄 Atualizar dados", key="sin_atualizar"):
+        limpar_memoria()
+        st.rerun()
     if erros:
         st.error("Não consegui ler agora: " + ', '.join(ROTULO_FONTE.get(k, k) for k in erros)
                  + ". Os sinais dessas fontes ficaram de fora; o resto está abaixo.")
@@ -1252,30 +1608,122 @@ def _render_mercado_livre(st, engine):
                  "agora; os outros blocos estão abaixo.")
     if dados.get('visitas') is None and 'visitas' not in erros:
         st.info("👀 Visitas: coleta de visitas em construção.")
-    com_ciente = (dados.get('ciente') is not None and 'ciente' not in erros
-                  and 'ciente' not in erros_bloco)
+    com_ciente = cientes_linhas is not None and not erro_ciente and 'ciente' not in erros_bloco
     pode = com_ciente and pode_dar_ciente()
-    if dados.get('ciente') is None and 'ciente' not in erros and pode_dar_ciente():
+    if cientes_linhas is None and not erro_ciente and pode_dar_ciente():
         st.caption("Ciente: aguardando a tabela sinal_ciente (SQL da v1.1 ainda não aplicado).")
-    cientes = [dict(zip(CIENTE_COLS, r)) for r in dados.get('ciente') or []]
+    cientes = [dict(zip(CIENTE_COLS, r)) for r in cientes_linhas or []]
 
     frescor = avaliar_frescor(dados.get('frescor') or [], lojas, agora)
     resumo = resumo_lojas(dados.get('resumo') or [], dados.get('metas') or [], lojas, hoje)
     datas_foto = {r[0]: r[2] for r in dados.get('foto') or []}
     atrasadas = set(ep.lojas_atrasadas(datas_foto, hoje, agora))
+    base_ctx = {'frescor': frescor, 'atrasadas': atrasadas, 'datas_foto': datas_foto,
+                'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
+                'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
+                'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
+                'lido_em': pacote['lido_em']}
 
+    try:
+        _render_excel(st, ativos, silenciados, nomes, base_ctx)
+    except Exception:  # noqa: BLE001
+        st.error("Excel indisponível agora; os sinais abaixo seguem valendo.")
+
+    t = time.perf_counter()
+    fragmento = _como_fragmento(_render_loja_seguro)
     for loja in lojas:
         st.markdown("---")
         st.subheader(loja)
-        ctx = {'frescor': frescor, 'atrasadas': atrasadas, 'datas_foto': datas_foto,
-               'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
-               'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
-               'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
-               'cientes': [c for c in cientes if c['loja'] == loja]}
+        fragmento(st, loja, ativos, {**base_ctx,
+                                     'cientes': [c for c in cientes if c['loja'] == loja]})
+    tempos.append(('Tela (4 lojas)' if len(lojas) == 4 else f'Tela ({len(lojas)} lojas)',
+                   time.perf_counter() - t))
+    tempos.append(('Total desta carga', time.perf_counter() - t_ini))
+    _render_tempos(st, tempos, pacote, da_memoria)
+
+
+def _render_tempos(st, tempos, pacote, da_memoria):
+    from permissoes import _get_role
+    if _get_role() != 'ADMIN':
+        return
+    with st.expander("⏱ tempos desta carga (só ADMIN)"):
+        linhas = [{'Etapa': e, 'Segundos': f"{x:.2f}"} for e, x in tempos]
+        if not da_memoria:
+            linhas.append({'Etapa': '  (a leitura do banco em si)',
+                           'Segundos': f"{pacote['segundos']:.2f}"})
+        st.dataframe(pd.DataFrame(linhas), hide_index=True, use_container_width=True)
+        st.caption("Marcar uma caixa recarrega só a loja (fragmento): não passa por aqui.")
+
+
+def _excel_em_cache(ativos, nomes, ctx):
+    """Bytes do Excel guardados na sessão até a leitura ou os cientes mudarem
+    (gerar a cada clique deixaria a tela lenta de novo)."""
+    import streamlit
+    versao = streamlit.session_state.get('sin_versao', 0)
+    chave = (ctx['lido_em'].isoformat(), versao, tuple(ctx['lojas']), len(ativos))
+    guardado = streamlit.session_state.get('sin_xlsx')
+    if not guardado or guardado[0] != chave:
+        ordem = sorted(ativos, key=lambda x: (x['loja'], -x['em_jogo']))
+        guardado = (chave, excel_sinais(ordem, nomes, ctx['hoje']))
+        streamlit.session_state['sin_xlsx'] = guardado
+    return guardado[1]
+
+
+def _render_excel(st, ativos, silenciados, nomes, ctx):
+    import streamlit
+    hoje = ctx['hoje']
+    versao = streamlit.session_state.get('sin_versao', 0)
+    with st.expander("📥 Excel: baixar os sinais e subir cientes"):
+        st.download_button(
+            "Baixar Excel dos sinais", data=_excel_em_cache(ativos, nomes, ctx),
+            file_name=f"sinais_ML_{hoje:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="sin_xlsx_baixar")
+        if not ctx['pode']:
+            st.caption("Seu perfil pode baixar, mas não subir cientes.")
+            return
+        arq = st.file_uploader("Subir o Excel preenchido (Status, Motivo, Nota, Silenciar até)",
+                               type=['xlsx'], key=f"sin_xlsx_subir_{versao}")
+        if arq is None:
+            return
         try:
-            _render_loja(st, loja, ativos, ctx)
-        except Exception:  # noqa: BLE001 — uma loja quebrada não esconde as outras
-            st.error(f"{loja}: não consegui mostrar esta loja agora; as outras seguem.")
+            linhas = ler_excel(arq.getvalue())
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Não consegui ler o arquivo: {e}")
+            return
+        itens, previa = previa_excel(linhas, ativos + silenciados, ctx['lojas'], hoje)
+        if previa.empty:
+            st.info('Nenhuma linha com Status "Ciente" no arquivo.')
+            return
+        st.markdown("**Prévia** (nada foi gravado ainda)")
+        st.dataframe(previa, hide_index=True, use_container_width=True)
+        recusadas = len(previa) - len(itens)
+        if not itens:
+            st.warning("Nenhuma linha ok para gravar.")
+            return
+        rotulo = f"Gravar {len(itens)} ciente(s)"
+        if recusadas:
+            rotulo += f" — as {recusadas} recusada(s) ficam de fora"
+        if st.button(rotulo, key=f"sin_xlsx_gravar_{versao}"):
+            usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
+            conn = ctx['engine'].raw_connection()
+            try:
+                n = gravar_cientes(conn, itens, usuario, hoje, ctx['lojas'])
+            except Exception:  # noqa: BLE001
+                st.error("Não consegui gravar agora; nada foi gravado. Tente de novo.")
+                return
+            finally:
+                conn.close()
+            streamlit.session_state['sin_versao'] = versao + 1
+            st.success(f"Ciente registrado em {n} sinal(is).")
+            st.rerun()
+
+
+def _render_loja_seguro(st, loja, ativos, ctx):
+    try:
+        _render_loja(st, loja, ativos, ctx)
+    except Exception:  # noqa: BLE001 — uma loja quebrada não esconde as outras
+        st.error(f"{loja}: não consegui mostrar esta loja agora; as outras seguem.")
 
 
 def _editor(st, sinais, nomes, chave, pode):
@@ -1311,7 +1759,8 @@ def _render_form_ciente(st, loja, marcados, ctx):
     usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
     conn = ctx['engine'].raw_connection()
     try:
-        n = gravar_cientes(conn, marcados, motivo, nota, ate, usuario, hoje, ctx['lojas'])
+        n = gravar_cientes(conn, [(x, motivo, nota, ate) for x in marcados], usuario, hoje,
+                           ctx['lojas'])
     except Exception:  # noqa: BLE001
         st.error("Não consegui registrar o ciente agora; nada foi gravado. Tente de novo.")
         return
