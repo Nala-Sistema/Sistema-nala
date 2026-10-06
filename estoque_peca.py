@@ -1,12 +1,33 @@
 """
-COBERTURA DE ESTOQUE EM PEÇA — ML (frente [KITS], 2ª entrega, 01/10/2026)
+COBERTURA DE ESTOQUE EM PEÇA — ML + Shopee (frente [KITS], 2ª entrega, 01/10/2026;
+Full da Shopee: frente [DADOS SHOPEE], parte (b), 06/10/2026)
 
-Aba "📦 Cobertura em peça (ML)" de Análise de Produtos. Substitui a aba
-antiga, que lia dim_estoque (upload do UpSeller, parado desde 17/05).
+Aba "📦 Cobertura em peça (ML + Shopee)" de Análise de Produtos. Substitui a
+aba antiga, que lia dim_estoque (upload do UpSeller, parado desde 17/05).
 
-FONTE ÚNICA: estoque só da API do Mercado Livre (fact_estoque_diario +
-ponte dim_estoque_anuncio), composição de dim_kit_composicao, venda de
-fact_vendas_snapshot. Só leitura, sem chamada à API.
+FONTE ÚNICA: estoque da API do Mercado Livre e da foto diária da Shopee
+(fact_estoque_diario + ponte dim_estoque_anuncio, por marketplace),
+composição de dim_kit_composicao, venda de fact_vendas_snapshot. Só leitura,
+sem chamada à API.
+
+SHOPEE (decisões do Mestre B1–B3, 06/10/2026)
+  - Full da Shopee SOMA com o do ML: é outro armazém físico. Entra em peça
+    pela mesma composição, em coluna própria ("Full Shopee (peças)") e na
+    cobertura TOTAL. O estoque_id da Shopee é por variação de cada anúncio
+    (item:model), então somar por estoque_id não dobra nada.
+  - "Cobertura só Full ML" continua Full ML ÷ venda: somar o Full de um
+    marketplace com a venda do outro mistura canais. A cobertura do Full
+    Shopee em dias é da frente "Cobertura do Full da Shopee".
+  - Galpão: é o MESMO galpão físico (UpSeller) nos dois. Vale o do ML; a
+    Shopee só AVISA quando publica diferente (mesma regra de ruído). Quando o
+    ML não tem anúncio da própria peça, usa-se o galpão da Shopee, marcado
+    "pela Shopee" (vem antes do piso pelo kit, que é estimativa); com
+    anúncios Shopee publicando números diferentes, usa-se o MAIOR e avisa,
+    como entre as lojas do ML (ressalva R1 do auditor à parte (b)). Galpão de
+    anúncio de KIT da Shopee é ignorado (vem dividido).
+  - Regra do Full (Thiago, 06/10/2026, ML e Shopee iguais): Full zerado ainda
+    vende pelo galpão, mas MUITO menos — é urgente; Full + galpão zerados =
+    para de vender. A cobertura total desta tela soma os dois.
 
 REGRAS (plano aprovado pelo Mestre em 01/10/2026, medido no banco)
   - Foto: o último dia de CADA loja. Estoque que não aparece nele saiu do ML
@@ -24,8 +45,8 @@ REGRAS (plano aprovado pelo Mestre em 01/10/2026, medido no banco)
     "≥ N pelo kit" = galpão do anúncio de um kit de UMA peça só × qtd,
     sempre marcado como estimativa; a cobertura dela sai marcada "mínimo".
   - Venda em peça = venda do kit × qtd + venda da peça sozinha, em TODOS os
-    marketplaces (o galpão abastece todos). Full da Shopee/Amazon ainda não
-    entra no estoque: a cobertura sai conservadora (dito na tela).
+    marketplaces (o galpão abastece todos). Full da Amazon ainda não entra
+    no estoque: a cobertura sai conservadora (dito na tela).
   - Kit sem composição (pendente) entra como ele mesmo, com aviso.
   - Nunca soma unidades de produtos diferentes. R$ em jogo = receita de 30
     dias dos SKUs (kits e a própria peça) que param se a peça acabar; o
@@ -58,6 +79,7 @@ from decimal import Decimal, ROUND_HALF_EVEN
 import pandas as pd
 
 MARKETPLACE = 'MERCADO LIVRE'
+MARKETPLACE_SHOPEE = 'SHOPEE'
 LOJA_PREP_CENTER = 'ML-YanniSP'
 PRAZO_REPOSICAO_PADRAO = 14
 
@@ -195,6 +217,18 @@ def ler(conn, hoje):
         conn.rollback()
 
 
+def ler_estoque_shopee(conn):
+    """Última foto de cada loja Shopee, no mesmo formato de `ler` (o mesmo
+    SQL_ESTOQUE com outro marketplace). Só leitura."""
+    cur = conn.cursor()
+    try:
+        cur.execute(SQL_ESTOQUE, {'marketplace': MARKETPLACE_SHOPEE})
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.rollback()
+
+
 def ler_composicao(conn):
     """(composicao, kits_pendentes, mapa) para a conta em peça. Só leitura."""
     cur = conn.cursor()
@@ -326,11 +360,12 @@ def tabela_por_peca(venda, limite=None, valores=None):
     return df.head(limite) if limite else df
 
 
-def ler_contagens(conn):
-    """[(loja, n_ultimo, ultimo, n_anterior, anterior)]. Só leitura."""
+def ler_contagens(conn, marketplace=MARKETPLACE):
+    """[(loja, n_ultimo, ultimo, n_anterior, anterior)]. Só leitura.
+    Padrão ML: o Sinais do Dia chama sem o marketplace."""
     cur = conn.cursor()
     try:
-        cur.execute(SQL_CONTAGEM_DIAS, {'marketplace': MARKETPLACE})
+        cur.execute(SQL_CONTAGEM_DIAS, {'marketplace': marketplace})
         return cur.fetchall()
     finally:
         cur.close()
@@ -419,9 +454,11 @@ def venda_em_peca(vendas_qtd, comp, sem_comp=()):
 
 
 def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
-           prazo=PRAZO_REPOSICAO_PADRAO):
+           prazo=PRAZO_REPOSICAO_PADRAO, estoque_shopee=()):
     """
-    estoque: [(loja, estoque_id, sku, data, full, transferencia, galpao)]
+    estoque: [(loja, estoque_id, sku, data, full, transferencia, galpao)] — ML
+    estoque_shopee: o mesmo formato, da Shopee (Full soma; galpão só confere
+      ou preenche a peça que o ML não publica — ver cabeçalho)
     vendas: [(sku, qtd_7d, qtd_30d, receita_30d)]
     composicao: [(kit, peca, qtd)]
 
@@ -441,7 +478,8 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
 
     def _p(peca):
         return p.setdefault(peca, {
-            'full': 0, 'transf': 0, 'galpao_lojas': {}, 'prep': None,
+            'full': 0, 'full_shopee': 0, 'galpao_shopee': set(),
+            'transf': 0, 'galpao_lojas': {}, 'prep': None,
             'qtd_7d': 0.0, 'qtd_30d': 0.0, 'skus_dependentes': set(),
             'kits': set(), 'vem_de_kit_sem_comp': False})
 
@@ -451,10 +489,13 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
     # SKU do anúncio passa pela mesma correção das vendas (um salto só), e só
     # DEPOIS o estoque é contado uma vez: um anúncio com o SKU errado e outro
     # com o certo no mesmo estoque_id viram uma linha, não duas (Full dobrado).
-    unicos = {}
-    for l, e, s, d, f, t, g in estoque:
-        unicos.setdefault((l, e, mapa.get(s, s)), (l, e, mapa.get(s, s), d, f, t, g))
-    estoque = list(unicos.values())
+    def _unicos(linhas):
+        unicos = {}
+        for l, e, s, d, f, t, g in linhas:
+            unicos.setdefault((l, e, mapa.get(s, s)), (l, e, mapa.get(s, s), d, f, t, g))
+        return list(unicos.values())
+    estoque = _unicos(estoque)
+    estoque_shopee = _unicos(estoque_shopee)
     for loja, _eid, sku, data, full, transf, galpao in estoque:
         datas_loja[loja] = data
         for peca, q in _pecas_de(sku):
@@ -475,6 +516,18 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
         else:
             reg['galpao_lojas'].setdefault(loja, set()).add(int(galpao))
 
+    # Shopee: Full soma (outro armazém); galpão só da própria peça, guardado à
+    # parte (o do anúncio de kit vem dividido e é ignorado).
+    for loja, _eid, sku, data, full, _transf, galpao in estoque_shopee:
+        datas_loja[loja] = data
+        for peca, q in _pecas_de(sku):
+            reg = _p(peca)
+            reg['full_shopee'] += int(full or 0) * q
+            if sku in comp:
+                reg['kits'].add(sku)
+        if galpao is not None and sku not in comp:
+            _p(sku)['galpao_shopee'].add(int(galpao))
+
     # ---- venda -----------------------------------------------------------
     receita_sku = {sku: float(rec or 0) for sku, _q7, _q30, rec in vendas}
     v7 = venda_em_peca([(s, q7) for s, q7, _q30, _r in vendas], comp, sem_comp)
@@ -486,7 +539,7 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
         reg['skus_dependentes'] |= v['skus']
         reg['kits'] |= v['kits']
         reg['vem_de_kit_sem_comp'] |= v['kit_sem_composicao']
-    for sku in {r[2] for r in estoque} & sem_comp:
+    for sku in {r[2] for r in list(estoque) + list(estoque_shopee)} & sem_comp:
         _p(sku)['vem_de_kit_sem_comp'] = True
 
     # Piso do galpão: kit de UMA peça só, galpão do kit × qtd (aprovado).
@@ -497,12 +550,23 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
             piso[peca] = max(piso.get(peca, 0), g * q)
 
     # ---- linha por peça --------------------------------------------------
-    linhas, divergentes = [], []
+    linhas, divergentes, divergentes_shopee = [], [], []
     for peca, reg in p.items():
         valores = [v for vs in reg['galpao_lojas'].values() for v in vs]
+        shopee = max(reg['galpao_shopee']) if reg['galpao_shopee'] else None
+        galpao_shopee_diverge = None
         if valores:
             galpao, galpao_tipo = max(valores), 'conhecido'
             if _diverge(valores):
+                divergentes.append(peca)
+            if shopee is not None and _diverge([galpao, shopee]):
+                galpao_shopee_diverge = shopee
+                divergentes_shopee.append((peca, galpao, shopee))
+        elif shopee is not None:
+            # O maior, como entre as lojas do ML (o UpSeller pode publicar com
+            # limite num anúncio/loja), e avisa quando os anúncios divergem.
+            galpao, galpao_tipo = shopee, 'shopee'
+            if _diverge(list(reg['galpao_shopee'])):
                 divergentes.append(peca)
         elif peca in piso:
             galpao, galpao_tipo = piso[peca], 'piso'
@@ -510,15 +574,17 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
             galpao, galpao_tipo = None, 'desconhecido'
         dia_30 = reg['qtd_30d'] / 30.0
         dia_7 = reg['qtd_7d'] / 7.0
-        estoque_total = (galpao or 0) + reg['full'] + (reg['prep'] or 0)
+        estoque_total = (galpao or 0) + reg['full'] + reg['full_shopee'] + (reg['prep'] or 0)
         cobertura = estoque_total / dia_30 if dia_30 > 0 else None
-        minimo = galpao_tipo != 'conhecido'
+        minimo = galpao_tipo not in ('conhecido', 'shopee')
         linhas.append({
             'peca': peca,
             'galpao': galpao,
             'galpao_tipo': galpao_tipo,
             'galpao_diverge': peca in divergentes,
+            'galpao_shopee_diverge': galpao_shopee_diverge,
             'full': reg['full'],
+            'full_shopee': reg['full_shopee'],
             'transferencia': reg['transf'],
             'prep_center': reg['prep'],
             'venda_dia_7d': dia_7,
@@ -538,10 +604,13 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
                                   ascending=[False, False, True]).reset_index(drop=True)
 
     # ---- detalhe: kits que usam cada peça --------------------------------
-    full_kit = {}
+    full_kit, full_kit_shopee = {}, {}
     for _loja, _eid, sku, _d, full, _t, _g in estoque:
         if sku in comp:
             full_kit[sku] = full_kit.get(sku, 0) + int(full)
+    for _loja, _eid, sku, _d, full, _t, _g in estoque_shopee:
+        if sku in comp:
+            full_kit_shopee[sku] = full_kit_shopee.get(sku, 0) + int(full or 0)
     venda_kit = {s: (q30, rec) for s, _q7, q30, rec in vendas}
     kits_por_peca = {}
     for kit, c in comp.items():
@@ -551,7 +620,8 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
             q30, rec = venda_kit.get(kit, (0, 0))
             kits_por_peca.setdefault(peca, []).append({
                 'Kit': kit, 'Qtd da peça no kit': q,
-                'Full do kit (kits)': full_kit.get(kit, 0),
+                'Full ML do kit (kits)': full_kit.get(kit, 0),
+                'Full Shopee do kit (kits)': full_kit_shopee.get(kit, 0),
                 'Galpão publicado do kit': galpao_kit.get(kit),
                 'Kits vendidos 30d': int(q30 or 0),
                 'Receita 30d do kit': float(rec or 0)})
@@ -559,6 +629,7 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
     avisos = {
         'datas_loja': datas_loja,
         'galpao_divergente': sorted(divergentes),
+        'galpao_shopee_divergente': sorted(divergentes_shopee),
         'kits_sem_composicao': sorted(pecas.loc[pecas['kit_sem_composicao'], 'peca'])
         if not pecas.empty else [],
     }
@@ -594,8 +665,15 @@ def _brl(v):
 
 def texto_galpao(linha):
     if linha['galpao_tipo'] == 'conhecido':
-        return _int(linha['galpao']) + (' ⚠ publicado diferente entre lojas'
-                                        if linha['galpao_diverge'] else '')
+        texto = _int(linha['galpao']) + (' ⚠ publicado diferente entre lojas'
+                                         if linha['galpao_diverge'] else '')
+        shopee = linha.get('galpao_shopee_diverge')
+        if shopee is not None and not pd.isna(shopee):
+            texto += f' ⚠ Shopee publica {_int(shopee)}'
+        return texto
+    if linha['galpao_tipo'] == 'shopee':
+        return f"{_int(linha['galpao'])} (pela Shopee)" + (
+            ' ⚠ publicado diferente entre lojas' if linha['galpao_diverge'] else '')
     if linha['galpao_tipo'] == 'piso':
         return f"desconhecido (≥ {_int(linha['galpao'])} pelo kit, estimativa)"
     return 'desconhecido'
@@ -613,13 +691,14 @@ def _tabela_tela(df, nomes):
         'Produto': df['peca'].map(lambda s: nomes.get(s) or '(sem cadastro)'),
         'Galpão': df.apply(texto_galpao, axis=1),
         'Full ML (peças)': df['full'].map(_int),
+        'Full Shopee (peças)': df['full_shopee'].map(_int),
         'Em transferência (fora da cobertura)': df['transferencia'].map(_int),
         'Prep center SP': df['prep_center'].map(lambda v: '—' if pd.isna(v) else _int(v)),
         'Venda/dia 7d': df['venda_dia_7d'].map(lambda v: f'{v:.1f}'),
         'Venda/dia 30d': df['venda_dia_30d'].map(lambda v: f'{v:.1f}'),
         'Cobertura (dias)': [texto_cobertura(d, m) for d, m in
                              zip(df['cobertura_dias'], df['cobertura_minima'])],
-        'Cobertura só Full (dias)': [texto_cobertura(d, False) for d in df['cobertura_full_dias']],
+        'Cobertura só Full ML (dias)': [texto_cobertura(d, False) for d in df['cobertura_full_dias']],
         'R$ em jogo (30d)': df['em_jogo_30d'].map(_brl),
         'Kits que usam': df['qtd_kits'],
         'Aviso': df['kit_sem_composicao'].map(lambda v: 'kit sem composição' if v else ''),
@@ -629,14 +708,16 @@ def _tabela_tela(df, nomes):
 def render(engine):
     import streamlit as st
 
-    st.subheader("📦 Cobertura em peça (ML)")
+    st.subheader("📦 Cobertura em peça (ML + Shopee)")
     st.caption(
-        "Estoque da API do Mercado Livre, em UNIDADES DE PEÇA: o Full de cada kit vira "
-        "peças pela composição. Galpão só do anúncio da própria peça (o do kit vem "
-        "dividido pelo UpSeller). Venda de todos os marketplaces, 30 dias até ontem. "
-        "O Full da Shopee e da Amazon ainda não entra, e o que está EM TRANSFERÊNCIA "
-        "para o Full aparece em coluna própria mas não conta na cobertura: ela é "
-        "conservadora.")
+        "Estoque da API do Mercado Livre e da foto diária da Shopee, em UNIDADES DE "
+        "PEÇA: o Full de cada kit vira peças pela composição. A cobertura soma galpão + "
+        "Full ML + Full Shopee + prep center. Galpão só do anúncio da própria peça (o do "
+        "kit vem dividido pelo UpSeller); vale o do ML, e \"pela Shopee\" quando só a "
+        "Shopee publica a peça. \"Cobertura só Full ML\" é o Full do ML ÷ a venda. Venda "
+        "de todos os marketplaces, 30 dias até ontem. O Full da Amazon ainda não entra, "
+        "e o que está EM TRANSFERÊNCIA para o Full aparece em coluna própria mas não "
+        "conta na cobertura: ela é conservadora.")
 
     from permissoes import ve_todas_lojas
     if not ve_todas_lojas():
@@ -653,10 +734,12 @@ def render(engine):
     conn = engine.raw_connection()
     try:
         estoque, vendas, composicao, pendentes, mapa = ler(conn, hoje)
+        estoque_shopee = ler_estoque_shopee(conn)
         pecas, kits_por_peca, avisos = montar(estoque, vendas, composicao, pendentes,
-                                              mapa, prazo)
+                                              mapa, prazo, estoque_shopee)
         nomes = ler_nomes(conn, set(pecas['peca']) if not pecas.empty else set())
-        parciais = fotos_parciais(ler_contagens(conn))
+        parciais = fotos_parciais(ler_contagens(conn) +
+                                  ler_contagens(conn, MARKETPLACE_SHOPEE))
     finally:
         conn.close()
     if pecas.empty:
@@ -689,7 +772,7 @@ def render(engine):
     m1.metric(f"Peças com cobertura < {prazo} dias", _int(rup.sum()))
     m2.metric("R$ em jogo (30d, SKUs distintos)", _brl(receita_risco))
     m3.metric("Peças com galpão desconhecido",
-              _int((pecas['galpao_tipo'] != 'conhecido').sum()))
+              _int((~pecas['galpao_tipo'].isin(['conhecido', 'shopee'])).sum()))
 
     st.markdown(f"### 🔥 Ruptura iminente (cobertura < {prazo} dias)")
     st.caption("Ordenado pelo R$ em jogo: receita de 30 dias dos SKUs que param se a "
@@ -718,6 +801,11 @@ def render(engine):
     if avisos['galpao_divergente']:
         st.warning("⚠ Galpão publicado diferente entre lojas (usado o maior): "
                    + ', '.join(avisos['galpao_divergente']))
+    if avisos['galpao_shopee_divergente']:
+        st.warning("⚠ Galpão da Shopee diferente do ML (vale o do ML; é o mesmo galpão "
+                   "físico, conferir o UpSeller): "
+                   + '; '.join(f'{peca} ML {_int(ml)} × Shopee {_int(sh)}'
+                               for peca, ml, sh in avisos['galpao_shopee_divergente']))
     if avisos['kits_sem_composicao']:
         st.warning("Kit sem composição (pendente em Gestão de SKUs → 🧩 Kits), contado "
                    "como ele mesmo: " + ', '.join(avisos['kits_sem_composicao']))

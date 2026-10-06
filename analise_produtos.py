@@ -13,7 +13,7 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
         Compara dois períodos contíguos. Mostra top 20 em alta e top 20
         em queda por delta % de quantidade vendida.
 
-  Tab 3 — 📦 Cobertura em peça (ML)  (01/10/2026)
+  Tab 3 — 📦 Cobertura em peça (ML + Shopee)  (01/10/2026; Full da Shopee em 06/10/2026)
         Estoque da API do ML (galpão + Full) e venda de todos os
         marketplaces em UNIDADES DE PEÇA (kit × composição). Ruptura
         iminente ordenada pelo R$ em jogo. Conta em estoque_peca.py.
@@ -1605,7 +1605,7 @@ def main():
     t1, t2, t3, t5, t6, t7 = st.tabs([
         "🏆 Mais Vendidos",
         "📈 Crescimento & Queda",
-        "📦 Cobertura em peça (ML)",
+        "📦 Cobertura em peça (ML + Shopee)",
         "💸 Despesas de Full",
         "🧾 Fechamento de Estoque",
         "🚚 Penalização de frete",

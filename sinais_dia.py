@@ -89,6 +89,66 @@ v1.2 (06/10/2026)
     transação, pela MESMA gravar_cientes do formulário. Medida e texto do
     sinal vêm do cálculo de hoje, nunca do arquivo. DIRETOR baixa, não sobe.
 
+ABA SHOPEE (06/10/2026; contrato com a [DADOS SHOPEE])
+  - Mesma lógica da aba ML, com o marketplace como parâmetro (a regra é
+    escrita uma vez só). Lojas: Shopee Lithouse(Nala) e Shopee-LPT (API) e
+    Shopee Litstore(Yanni) (só upload: resumo + queda/alta de venda POR SKU,
+    com o SKU como objeto do Ciente — o anúncio aparece como "SKU:<sku>").
+  - Venda × anúncio: o codigo_anuncio do snapshot da Shopee é o SKU-pai; o
+    anúncio vem do espelho fact_pedidos_itens_marketplace (id_anuncio_
+    plataforma), casado por (marketplace, loja, numero_pedido, sku) — a chave
+    primária do espelho, então o cruzamento não duplica. O espelho é SÓ a
+    ponte: quantidade, receita e margem vêm do snapshot (medido 06/10: casou
+    100% das unidades da API nas duas lojas).
+  - Ads Shopee: um anúncio por campanha (item_id); a config traz o item_id em
+    detalhe->>'item_id'; ROAS objetivo 0 = lance AUTOMÁTICO. As vendas de ads
+    da Shopee são PEDIDOS, não unidades: o custo por venda de ads é por
+    pedido, comparado com a margem por pedido do anúncio (o texto do sinal
+    diz isso).
+  - Estoque/Full Shopee e espiral: só quando houver estoque Shopee no banco
+    (até lá "em construção"; espiral sem estoque não é julgada).
+  - Views Shopee (vw_views_shopee_30d): visualizações de PÁGINA dos 30 dias
+    fechados que terminam em `data` (= foto − 1). Compara D × D-30 na data
+    EXATA (sem D-30, não acende). Nunca é comparada nem somada com a visita
+    única do ML. Nota: rating_star é a média da VIDA do anúncio; o sinal usa
+    a nota só das avaliações NOVAS da janela, (nota_D × aval_D − nota_D30 ×
+    aval_D30) ÷ (aval_D − aval_D30), com mínimo MIN_AVAL_NOVAS.
+  - Carga pendente: só lojas com venda pela API. Loja de upload: ver abaixo
+    (janelas até o último dia com upload).
+  - FULL × GALPÃO (regra do Thiago, 06/10, IGUAL no ML e na Shopee): quando
+    o Full acaba, o anúncio continua vendendo pelo galpão (envio próprio),
+    mas vende MUITO MENOS (perde selo, prazo, posição). Full E galpão zerados
+    = para de vender. Então:
+      * Full curto/zerado com galpão > 0: continua urgente ("vai vender muito
+        menos — repor o Full já"), mostra o galpão; R$ em jogo = a venda de
+        30 dias com o texto "queda forte esperada" (a parte que depende do
+        Full não dá para medir);
+      * Full E galpão zerados: "RUPTURA — vai parar de vender" (o mais grave;
+        com ads ligado, aí sim "pausar o ads até repor");
+      * Full zerado com ads ligado e galpão > 0: NÃO manda pausar ("o ads está
+        pagando clique com conversão menor — avalie reduzir");
+      * espiral/ruptura olham o estoque TOTAL (dia com Full > 0 OU galpão > 0);
+        o texto mostra também os dias com Full.
+    Galpão nunca é somado (o UpSeller repete o mesmo galpão em todo anúncio do
+    SKU; no ML o galpão de kit vem dividido): só "tem / não tem" e o número do
+    próprio estoque. Galpão desconhecido (NULL) não vira ruptura. Com galpão 0 e
+    Full > 0 o texto diz que, quando o Full acabar, para de vender.
+  - RUPTURA tem DUAS origens (a foto de hoje com Full e galpão zerados, e a
+    semana com estoque em poucos dias + venda caindo): as duas usam o MESMO
+    objeto, o ANÚNCIO (MLB / item_id), e viram UMA linha por anúncio (variações
+    do mesmo anúncio somam o R$ em jogo; a foto de hoje vem primeiro e a semana
+    entra no texto). Um Ciente cala a ruptura do anúncio, venha de onde vier.
+  - Loja só de upload (Litstore, upload a cada poucos dias): as janelas de
+    venda terminam no ÚLTIMO dia com upload ("dados até dd/mm (upload)"), em
+    vez de suspender; só suspende se o último upload tiver mais de
+    UPLOAD_MAX_DIAS dias.
+  - Nota (R3): rating_star 0 com avaliações > 0 é dado inválido (não vira
+    nota negativa). comment_count conta avaliações COM comentário: a nota das
+    "novas" é uma aproximação.
+  - Registrado (R4/R5): pedido com 2 SKUs do mesmo anúncio conta 2 pedidos
+    na margem por pedido (alarme erra para avisar); o mesmo SKU em 2 modelos
+    do mesmo anúncio vê a venda inteira em cada estoque (como a R1 do ML).
+
 RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
   - R1: o mesmo SKU em DOIS estoques do mesmo anúncio conta a venda nos dois
     (a venda não diz de qual variação saiu). O alarme fica pessimista (cada
@@ -115,6 +175,13 @@ import pandas as pd
 import estoque_peca as ep
 
 MARKETPLACE = 'MERCADO LIVRE'
+SHOPEE = 'SHOPEE'
+
+# O que muda entre as abas (o resto da regra é o mesmo)
+MARKETPLACES = {
+    MARKETPLACE: {'aba': 'Mercado Livre', 'sigla': 'ML', 'unidade_ads': 'unidade'},
+    SHOPEE: {'aba': 'Shopee', 'sigla': 'Shopee', 'unidade_ads': 'pedido'},
+}
 
 # ============================================================
 # LIMIARES (calibrar aqui)
@@ -142,6 +209,11 @@ ESPIRAL_QUEDA_VENDA = 0.80       # venda da semana < 80% da média semanal
 MIN_UNID_ADS_CUSTO = 3           # unidades de ads (30d) p/ julgar custo por venda
 
 DIAS_REF_EXPERIENCIA = 7         # nota de hoje × nota de 7 dias atrás
+
+# Shopee: views e nota (calibrar com o [MESTRE ANÁLISES])
+JANELA_VIEWS_SHOPEE = 30         # views_30d de D × views_30d de D-30 (data exata)
+MIN_AVAL_NOVAS = 3               # avaliações novas na janela para julgar a nota
+QUEDA_NOTA_SHOPEE = 0.5          # nota das novas X pontos abaixo da média de D-30
 MIN_ANUNCIOS_FAMILIA = 2         # anúncios da mesma peça que pioraram
 
 # Ciente: quando o silenciado volta antes da data (calibrar aqui)
@@ -163,11 +235,15 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'ads_config': 'ROAS/orçamento mudou', 'ads_sem_venda': 'Ads sem venda',
           'ads_custo': 'Custo de ads > margem', 'ads_espiral': 'Espiral de ads',
           'exp_anuncio': 'Experiência piorou', 'exp_familia': 'Experiência da família',
-          'visitas_queda': 'Visitas caíram', 'visitas_alta': 'Visitas subiram'}
+          'visitas_queda': 'Visitas/visualizações caíram',
+          'visitas_alta': 'Visitas/visualizações subiram'}
 
 # Regras que comparam janelas de VENDA: suspensas na loja com carga pendente.
 REGRAS_DE_VENDA = ('vendas_queda', 'vendas_alta', 'ads_espiral', 'full_ruptura', 'ads_custo',
                    'full_cobertura', 'visitas_queda', 'visitas_alta')
+
+# Loja só de upload: janelas até o último dia com upload; suspende acima disto
+UPLOAD_MAX_DIAS = 7
 
 # Excel: limites do arquivo que sobe (auditor 06/10, R1)
 EXCEL_MAX_BYTES = 2 * 1024 * 1024
@@ -245,13 +321,37 @@ SQL_VENDAS_ANUNCIO = """
            SUM(quantidade) FILTER (WHERE data_venda >= %(ritmo_ini)s)          AS qtd_ritmo,
            SUM(quantidade) FILTER (WHERE data_venda >= %(piso_ini)s)           AS qtd_30,
            SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %(piso_ini)s)  AS rec_30,
-           SUM(margem_total) FILTER (WHERE data_venda >= %(piso_ini)s)         AS margem_30
+           SUM(margem_total) FILTER (WHERE data_venda >= %(piso_ini)s)         AS margem_30,
+           COUNT(DISTINCT numero_pedido) FILTER (WHERE data_venda >= %(piso_ini)s) AS pedidos_30
       FROM fact_vendas_snapshot
      WHERE marketplace_origem = %(marketplace)s
        AND loja_origem = ANY(%(lojas)s)
        AND codigo_anuncio IS NOT NULL
        AND data_venda >= %(ini_vendas)s AND data_venda <= %(fim)s
      GROUP BY loja_origem, codigo_anuncio, sku
+"""
+
+# Shopee: o anúncio vem do espelho (só a ponte; os números são do snapshot).
+# Sem par no espelho (Litstore, que é upload): o anúncio vira "SKU:<sku>".
+SQL_VENDAS_ANUNCIO_SHOPEE = """
+    SELECT f.loja_origem AS loja,
+           COALESCE(i.id_anuncio_plataforma, 'SKU:' || f.sku) AS anuncio, f.sku,
+           SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %(sem_ini)s)   AS rec_sem,
+           SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %(base_ini)s
+                                                AND f.data_venda <= %(base_fim)s) AS rec_base,
+           SUM(f.quantidade) FILTER (WHERE f.data_venda >= %(ritmo_ini)s)          AS qtd_ritmo,
+           SUM(f.quantidade) FILTER (WHERE f.data_venda >= %(piso_ini)s)           AS qtd_30,
+           SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %(piso_ini)s)  AS rec_30,
+           SUM(f.margem_total) FILTER (WHERE f.data_venda >= %(piso_ini)s)         AS margem_30,
+           COUNT(DISTINCT f.numero_pedido) FILTER (WHERE f.data_venda >= %(piso_ini)s) AS pedidos_30
+      FROM fact_vendas_snapshot f
+      LEFT JOIN fact_pedidos_itens_marketplace i
+             ON i.marketplace = f.marketplace_origem AND i.loja = f.loja_origem
+            AND i.numero_pedido = f.numero_pedido AND i.sku = f.sku
+     WHERE f.marketplace_origem = %(marketplace)s
+       AND f.loja_origem = ANY(%(lojas)s)
+       AND f.data_venda >= %(ini_vendas)s AND f.data_venda <= %(fim)s
+     GROUP BY f.loja_origem, COALESCE(i.id_anuncio_plataforma, 'SKU:' || f.sku), f.sku
 """
 
 SQL_PONTE = """
@@ -272,7 +372,8 @@ SQL_ESTOQUE_FOTO = """
     SELECT f.loja, f.estoque_id, f.data,
            COALESCE(f.full_disponivel, 0)       AS full_disponivel,
            COALESCE(f.full_em_transferencia, 0) AS full_em_transferencia,
-           COALESCE(f.unidades_recebidas, 0)    AS unidades_recebidas
+           COALESCE(f.unidades_recebidas, 0)    AS unidades_recebidas,
+           f.galpao_disponivel
       FROM fact_estoque_diario f
       JOIN ult u ON u.loja = f.loja AND u.data = f.data
      WHERE f.marketplace = %(marketplace)s
@@ -312,7 +413,7 @@ SQL_CONFIG_MUDOU = """
     WITH c AS (
         SELECT DISTINCT ON (loja, id_campanha, data_captura::date)
                loja, id_campanha, campanha, data_captura::date AS dia,
-               roas_objetivo, orcamento_diario
+               roas_objetivo, orcamento_diario, detalhe->>'item_id' AS item_id
           FROM fact_ads_campanha_config
          WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
            AND data_captura >= %(ini_curto)s
@@ -322,7 +423,7 @@ SQL_CONFIG_MUDOU = """
           FROM c)
     SELECT a.loja, a.id_campanha, a.campanha, b.dia AS dia_antes, a.dia AS dia_agora,
            b.roas_objetivo AS roas_antes, a.roas_objetivo AS roas_agora,
-           b.orcamento_diario AS orc_antes, a.orcamento_diario AS orc_agora
+           b.orcamento_diario AS orc_antes, a.orcamento_diario AS orc_agora, a.item_id
       FROM r a
       JOIN r b ON b.loja = a.loja AND b.id_campanha = a.id_campanha AND b.k = 2
      WHERE a.k = 1 AND a.dia = %(hoje)s
@@ -352,6 +453,28 @@ SQL_EXPERIENCIA = """
 
 SQL_EXISTE_VISITAS = "SELECT to_regclass('vw_visitas_dia') IS NOT NULL"
 
+SQL_EXISTE_VIEWS_SHOPEE = "SELECT to_regclass('vw_views_shopee_30d') IS NOT NULL"
+
+# Shopee: views de PÁGINA dos 30 dias fechados que terminam em `data`; D (a
+# última foto de cada loja até ontem) × D-30 na data EXATA.
+SQL_VIEWS_SHOPEE = """
+    WITH d AS (
+        SELECT loja, max(data) AS data
+          FROM vw_views_shopee_30d
+         WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
+           AND data >= %(ini_curto)s AND data <= %(ontem)s
+         GROUP BY loja)
+    SELECT a.loja, a.codigo_anuncio, a.data, a.views_30d, a.rating_star, a.comment_count,
+           b.views_30d AS views_ref, b.rating_star AS rating_ref, b.comment_count AS aval_ref
+      FROM vw_views_shopee_30d a
+      JOIN d ON d.loja = a.loja AND d.data = a.data
+      LEFT JOIN vw_views_shopee_30d b
+             ON b.marketplace = a.marketplace AND b.loja = a.loja
+            AND b.codigo_anuncio = a.codigo_anuncio
+            AND b.data = a.data - %(janela_views)s
+     WHERE a.marketplace = %(marketplace)s AND a.data >= %(ini_curto)s
+"""
+
 SQL_VISITAS = """
     SELECT loja, codigo_anuncio AS anuncio,
            SUM(visitas) FILTER (WHERE data >= %(sem_ini)s)                       AS vis_sem,
@@ -364,10 +487,18 @@ SQL_VISITAS = """
 
 # Última chegada de cada fonte, por loja (horário de Brasília, sem fuso).
 SQL_FRESCOR = """
-    SELECT 'Vendas' AS fonte, loja_origem AS loja, max(data_processamento) AS ultima
+    SELECT 'Vendas' AS fonte, loja_origem AS loja,
+           max(data_processamento) FILTER (WHERE arquivo_origem = 'API') AS ultima
       FROM fact_vendas_snapshot
      WHERE marketplace_origem = %(marketplace)s AND loja_origem = ANY(%(lojas)s)
        AND data_venda >= %(ini_curto)s
+     GROUP BY loja_origem
+    UNION ALL
+    SELECT 'Último dia de venda (upload)', loja_origem,
+           max(data_venda)::timestamp
+      FROM fact_vendas_snapshot
+     WHERE marketplace_origem = %(marketplace)s AND loja_origem = ANY(%(lojas)s)
+       AND data_venda >= %(ini_vendas)s AND arquivo_origem IS DISTINCT FROM 'API'
      GROUP BY loja_origem
     UNION ALL
     SELECT 'Estoque', loja, max(data_captura)
@@ -430,17 +561,18 @@ SQL_REATIVAR = """
 
 FONTES_FRESCOR = ('Vendas', 'Estoque', 'Ads', 'Config. de ads', 'Experiência')
 
-TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO, SQL_PONTE,
+TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
+                SQL_VENDAS_ANUNCIO_SHOPEE, SQL_EXISTE_VIEWS_SHOPEE, SQL_VIEWS_SHOPEE, SQL_PONTE,
                 SQL_ESTOQUE_FOTO, SQL_ESTOQUE_SEMANA, SQL_ADS, SQL_CONFIG_MUDOU,
                 SQL_EXPERIENCIA, SQL_EXISTE_VISITAS, SQL_VISITAS, SQL_FRESCOR,
                 SQL_EXISTE_CIENTE, SQL_CIENTES_ABERTOS, SQL_FECHAR_ABERTO,
                 SQL_INSERIR_CIENTE, SQL_REATIVAR)
 
 
-def params(hoje, lojas):
+def params(hoje, lojas, mkt=MARKETPLACE):
     p = janelas(hoje)
-    p.update({'marketplace': MARKETPLACE, 'lojas': list(lojas),
-              'dias_ref': DIAS_REF_EXPERIENCIA,
+    p.update({'marketplace': mkt, 'lojas': list(lojas),
+              'dias_ref': DIAS_REF_EXPERIENCIA, 'janela_views': JANELA_VIEWS_SHOPEE,
               'ano_mes': p['ontem'].strftime('%Y-%m')})
     return p
 
@@ -478,20 +610,30 @@ FONTES = {
 }
 
 
-def ler_cientes(conn, lojas):
+def fontes(mkt):
+    """As consultas do dia de cada marketplace (a Shopee pega o anúncio pelo
+    espelho e ainda não tem a "experiência de compra" do ML)."""
+    f = dict(FONTES)
+    if mkt == SHOPEE:
+        f['vendas'] = SQL_VENDAS_ANUNCIO_SHOPEE
+        f.pop('experiencia')
+    return f
+
+
+def ler_cientes(conn, lojas, mkt=MARKETPLACE):
     """Cientes abertos das lojas; None se a tabela não existe. Erro sobe."""
     if not _ler(conn, SQL_EXISTE_CIENTE, {})[0][0]:
         return None
-    return _ler(conn, SQL_CIENTES_ABERTOS, {'marketplace': MARKETPLACE, 'lojas': list(lojas)})
+    return _ler(conn, SQL_CIENTES_ABERTOS, {'marketplace': mkt, 'lojas': list(lojas)})
 
 
-def ler_tudo(conn, hoje, lojas):
+def ler_tudo(conn, hoje, lojas, mkt=MARKETPLACE):
     """{fonte: linhas} e {fonte: exceção}: a leitura do DIA (vai para a
     memória). Visitas só se a view existir (None = ainda não existe). Os
     cientes NÃO entram aqui: mudam a cada clique (ler_cientes)."""
-    p = params(hoje, lojas)
+    p = params(hoje, lojas, mkt)
     dados, erros = {}, {}
-    for nome, sql in FONTES.items():
+    for nome, sql in fontes(mkt).items():
         try:
             dados[nome] = _ler(conn, sql, p)
         except Exception as e:  # noqa: BLE001 — vira aviso por bloco na tela
@@ -501,9 +643,11 @@ def ler_tudo(conn, hoje, lojas):
         dados['mapa'] = dict(_ler(conn, ep.SQL_MAPEAMENTO, {}))
     except Exception as e:  # noqa: BLE001
         erros['composicao'] = e
+    existe, sql_v = ((SQL_EXISTE_VIEWS_SHOPEE, SQL_VIEWS_SHOPEE) if mkt == SHOPEE
+                     else (SQL_EXISTE_VISITAS, SQL_VISITAS))
     try:
-        if _ler(conn, SQL_EXISTE_VISITAS, {})[0][0]:
-            dados['visitas'] = _ler(conn, SQL_VISITAS, p)
+        if _ler(conn, existe, {})[0][0]:
+            dados['visitas'] = _ler(conn, sql_v, p)
         else:
             dados['visitas'] = None
     except Exception as e:  # noqa: BLE001
@@ -558,17 +702,27 @@ def objeto_campanha(anuncio, campanha, dia):
 
 
 def agregar_vendas(vendas):
-    """[(loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30)]
-    -> (por_anuncio, por_anuncio_sku).
+    """[(loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30
+    [, pedidos_30])] -> (por_anuncio, por_anuncio_sku).
     por_anuncio[(loja, anuncio)]: R$ somados (R$ pode somar), SKUs, e
-    unidades/margem SÓ quando o anúncio vendeu um SKU único."""
+    unidades/margem por unidade SÓ quando o anúncio vendeu um SKU único.
+    margem_30_tot e pedidos_30 servem à margem POR PEDIDO (Shopee): R$ ÷
+    pedidos não soma unidade de produto nenhum. pedidos_30 vem contado por
+    SKU, então um pedido com 2 SKUs do mesmo anúncio conta 2 (margem por
+    pedido um pouco menor: o alarme erra para o lado de avisar)."""
     por_sku = {}
     an = {}
-    for loja, anuncio, sku, rs, rb, qr, q30, r30, m30 in vendas:
+    for linha in vendas:
+        loja, anuncio, sku, rs, rb, qr, q30, r30, m30 = linha[:9]
+        ped30 = linha[9] if len(linha) > 9 else 0
         por_sku[(loja, anuncio, sku)] = {'qtd_ritmo': _f(qr), 'qtd_30': _f(q30),
                                          'rec_30': _f(r30)}
         a = an.setdefault((loja, anuncio), {'rec_sem': 0.0, 'rec_base': 0.0, 'rec_30': 0.0,
-                                            'skus': set(), 'qtd_30': 0.0, 'margem_30': None})
+                                            'skus': set(), 'qtd_30': 0.0, 'margem_30': None,
+                                            'margem_30_tot': None, 'pedidos_30': 0.0})
+        a['pedidos_30'] += _f(ped30)
+        if m30 is not None:
+            a['margem_30_tot'] = (a['margem_30_tot'] or 0.0) + float(m30)
         a['rec_sem'] += _f(rs)
         a['rec_base'] += _f(rb)
         a['rec_30'] += _f(r30)
@@ -655,12 +809,16 @@ def estoques(ponte):
     return out
 
 
-def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
+def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j, mkt=MARKETPLACE):
     """Cobertura do Full POR estoque_id. foto: [(loja, eid, data, full, transf,
-    recebidas)]; ponte já mapeada."""
+    recebidas[, galpao])]; ponte já mapeada. Mesma regra no ML e na Shopee:
+    sem Full o anúncio ainda vende pelo galpão, mas muito menos; Full E galpão
+    zerados = ruptura (para de vender)."""
     est = estoques(ponte)
     out = []
-    for loja, eid, data, full, transf, recebidas in foto:
+    for linha in foto:
+        loja, eid, data, full, transf, recebidas = linha[:6]
+        galpao = linha[6] if len(linha) > 6 else None
         e = est.get((loja, eid))
         if not e or not e['em_full']:
             continue
@@ -683,15 +841,36 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
         ads_ontem = sum(_f(ads_por_anuncio.get((loja, a), {}).get('gasto_ontem'))
                         for a in e['anuncios'])
         full, transf, recebidas = int(full), int(transf), int(recebidas)
-        if full == 0 and ads_ontem > 0:
+        galpao = None if galpao is None else int(galpao)
+        txt_transf = f"; {transf} em transferência" if transf else ''
+        if galpao is None:
+            txt_galpao = ''
+        elif galpao == 0:
+            txt_galpao = "; galpão 0: quando o Full acabar, para de vender"
+        else:
+            txt_galpao = (f"; galpão {galpao} un. (sem Full vende muito menos: queda forte "
+                          "esperada)")
+        periodo = f"foto {_d(data)} · venda {_d(j['ritmo_ini'])}–{_d(j['fim'])}"
+        if full == 0 and galpao == 0 and (dia > 0 or ads_ontem > 0):
+            # Full E galpão zerados: para de vender
             out.append(_sinal(
                 loja, 'FULL', anuncio, e['skus'],
-                f"Full zerado com ads ligado (gasto ontem {_brl(ads_ontem)} = ads do "
-                f"anúncio, todas as variações"
-                + (f"; {transf} em transferência" if transf else '') + ")",
-                "Baixar/pausar o ads até o Full voltar", max(rec_30, ads_ontem),
-                urgente=True, regra='full_zerado_ads', objeto=eid, medida=ads_ontem,
-                periodo=f"foto {_d(data)} · ads {_d(j['ontem'])}"))
+                f"RUPTURA — Full e galpão zerados: vai parar de vender{txt_transf}"
+                + (f" (ads ligado: gasto ontem {_brl(ads_ontem)})" if ads_ontem > 0 else ''),
+                ("Pausar o ads até repor e repor o estoque já" if ads_ontem > 0
+                 else "Repor o estoque já"),
+                rec_30, urgente=True, regra='full_ruptura', objeto=anuncio, medida=rec_30,
+                periodo=periodo))
+        elif full == 0 and ads_ontem > 0:
+            # galpão > 0 (ou desconhecido): ainda vende, então NÃO pausar
+            out.append(_sinal(
+                loja, 'FULL', anuncio, e['skus'],
+                f"Full zerado com ads ligado (gasto ontem {_brl(ads_ontem)} = ads do anúncio, "
+                f"todas as variações){txt_transf}{txt_galpao}",
+                "Repor o Full já; o ads está pagando clique com conversão menor — avalie "
+                "reduzir (não pausar: ainda vende pelo galpão)",
+                max(rec_30, ads_ontem), urgente=True, regra='full_zerado_ads', objeto=eid,
+                medida=ads_ontem, periodo=f"foto {_d(data)} · ads {_d(j['ontem'])}"))
         elif dia > 0:
             dias = (full + transf) / dia
             if dias < FULL_ATENCAO_DIAS:
@@ -700,10 +879,11 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
                     loja, 'FULL', anuncio, e['skus'],
                     f"{dias:.0f} dias de Full ({full} disp. + {transf} em transf. ÷ "
                     f"{_dec(dia)}/dia; 7d {_dec(qtd_ritmo / JANELA_RITMO_FULL)}/dia, "
-                    f"30d {_dec(qtd_30 / JANELA_PISO_FULL)}/dia)",
-                    "Enviar ao Full agora" if urg else "Programar envio ao Full",
+                    f"30d {_dec(qtd_30 / JANELA_PISO_FULL)}/dia){txt_galpao}",
+                    ("Repor o Full já: sem ele vai vender muito menos" if urg
+                     else "Programar envio ao Full"),
                     rec_30, urgente=urg, regra='full_cobertura', objeto=eid, medida=full,
-                    periodo=f"foto {_d(data)} · venda {_d(j['ritmo_ini'])}–{_d(j['fim'])}"))
+                    periodo=periodo))
         if recebidas > 0:
             out.append(_sinal(
                 loja, 'FULL', anuncio, e['skus'],
@@ -715,32 +895,49 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j):
     return out
 
 
-def dias_com_estoque(estoque_semana, ponte):
-    """{(loja, anuncio): nº de dias da semana com estoque}. Anúncio Full:
-    full_disponivel > 0; fora do Full: galpão > 0 (só sim/não, nunca somado)."""
+def dias_com_estoque(estoque_semana, ponte, so_full=False):
+    """{(loja, anuncio): nº de dias da semana com estoque}. Padrão: estoque
+    TOTAL — dia com Full > 0 OU galpão > 0 (o anúncio vende pelos dois; galpão
+    só como sim/não, nunca somado). so_full=True: só os dias com Full > 0 (para
+    o texto). Anúncio fora do Full: só o galpão."""
     por_est = {}
     for loja, anuncio, eid, _sku, em_full in ponte:
         por_est.setdefault((loja, eid), []).append((anuncio, em_full))
     dias = {}
     for loja, eid, data, full, galpao in estoque_semana:
         for anuncio, em_full in por_est.get((loja, eid), ()):
-            tem = (full or 0) > 0 if em_full else (galpao or 0) > 0
+            if so_full:
+                tem = em_full and (full or 0) > 0
+            elif em_full:
+                tem = (full or 0) > 0 or (galpao or 0) > 0
+            else:
+                tem = (galpao or 0) > 0
             if tem:
                 dias.setdefault((loja, anuncio), set()).add(data)
     return {k: len(v) for k, v in dias.items()}
 
 
-def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
+def _roas(v, mkt):
+    """ROAS objetivo 0 na Shopee = lance automático."""
+    if mkt == SHOPEE and _f(v) == 0:
+        return 'automático'
+    return _dec(_f(v))
+
+
+def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
+               mkt=MARKETPLACE, lojas_com_estoque=None, dias_full=None):
     """ads: {(loja, anuncio): dict}; config: linhas de SQL_CONFIG_MUDOU.
-    com_estoque=False (a leitura do estoque da semana falhou): a espiral não é
+    com_estoque=False (a leitura do estoque da semana falhou) ou loja fora de
+    lojas_com_estoque (sem estoque no banco, ex. Shopee hoje): a espiral não é
     julgada, porque sem estoque não dá para separar espiral de ruptura."""
     out = []
-    for loja, idc, camp, d_antes, d_agora, r0, r1, o0, o1 in config:
-        anuncio = anuncio_da_campanha(idc, camp)
+    for loja, idc, camp, d_antes, d_agora, r0, r1, o0, o1, *resto in config:
+        item_id = resto[0] if resto else None
+        anuncio = item_id or anuncio_da_campanha(idc, camp)
         a = por_anuncio.get((loja, anuncio), {})
         partes = []
         if r0 != r1:
-            partes.append(f"ROAS objetivo {_f(r0):.1f} → {_f(r1):.1f}".replace('.', ','))
+            partes.append(f"ROAS objetivo {_roas(r0, mkt)} → {_roas(r1, mkt)}")
         if o0 != o1:
             partes.append(f"orçamento {_brl(_f(o0))} → {_brl(_f(o1))}/dia")
         out.append(_sinal(
@@ -755,6 +952,7 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
         a = por_anuncio.get((loja, anuncio), {'rec_sem': 0.0, 'rec_base': 0.0,
                                                'rec_30': 0.0, 'skus': set(),
                                                'qtd_30': None, 'margem_30': None,
+                                               'margem_30_tot': None, 'pedidos_30': 0.0,
                                                'sku_unico': False})
         # gasto com zero venda de ads há N dias
         if int(d.get('dias_com_gasto') or 0) >= DIAS_GASTO_SEM_VENDA and _f(d.get('unid_recente')) == 0:
@@ -766,19 +964,33 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
                 regra='ads_sem_venda', medida=_f(d.get('gasto_recente')),
                 periodo=f"{_d(j['recente_ini'])}–{_d(j['ontem'])}"))
 
-        # custo por venda acima da margem por unidade (só SKU único)
+        # custo por venda acima da margem: por UNIDADE no ML (só SKU único);
+        # por PEDIDO na Shopee (a Shopee só informa pedidos de ads)
         unid, gasto, cliques = _f(d.get('unid_ads_30')), _f(d.get('gasto_30')), _f(d.get('cliques_30'))
-        if (a.get('sku_unico') and a.get('qtd_30') and a.get('margem_30') is not None
-                and unid >= MIN_UNID_ADS_CUSTO):
+        por_pedido = MARKETPLACES.get(mkt, {}).get('unidade_ads') == 'pedido'
+        if por_pedido:
+            base_ok = a.get('pedidos_30') and a.get('margem_30_tot') is not None
+            margem_un = a['margem_30_tot'] / a['pedidos_30'] if base_ok else None
+        else:
+            base_ok = (a.get('sku_unico') and a.get('qtd_30')
+                       and a.get('margem_30') is not None)
+            margem_un = a['margem_30'] / a['qtd_30'] if base_ok else None
+        if base_ok and unid >= MIN_UNID_ADS_CUSTO:
             custo_un = gasto / unid
-            margem_un = a['margem_30'] / a['qtd_30']
             if custo_un > margem_un:
                 cpc = gasto / cliques if cliques else None
                 conv = unid / cliques if cliques else None
-                txt = (f"Custo por venda de ads {_brl(custo_un)}/un"
-                       + (f" (CPC {_brl(cpc)} ÷ conversão {conv * 100:.1f}%)".replace('.', ',')
-                          if cpc is not None else '')
-                       + f" × margem {_brl(margem_un)}/un (30d)")
+                if por_pedido:
+                    txt = (f"Custo por PEDIDO de ads {_brl(custo_un)}"
+                           + (f" (CPC {_brl(cpc)} ÷ conversão {conv * 100:.1f}% por clique)"
+                              .replace('.', ',') if cpc is not None else '')
+                           + f" × margem por PEDIDO {_brl(margem_un)} (30d). A Shopee "
+                           "informa pedidos de ads, não unidades.")
+                else:
+                    txt = (f"Custo por venda de ads {_brl(custo_un)}/un"
+                           + (f" (CPC {_brl(cpc)} ÷ conversão {conv * 100:.1f}%)".replace('.', ',')
+                              if cpc is not None else '')
+                           + f" × margem {_brl(margem_un)}/un (30d)")
                 out.append(_sinal(loja, 'ADS', anuncio, a['skus'], txt,
                                   "Subir ROAS objetivo (cada venda de ads dá prejuízo)",
                                   (custo_un - margem_un) * unid, regra='ads_custo',
@@ -788,7 +1000,8 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
         # espiral: gasto cortado E venda caindo — só com estoque a semana toda
         gasto_base_sem = _f(d.get('gasto_base')) / SEMANAS_BASE
         rec_base_sem = a['rec_base'] / SEMANAS_BASE
-        if (com_estoque and gasto_base_sem > 0 and _rel(a)
+        if (com_estoque and (lojas_com_estoque is None or loja in lojas_com_estoque)
+                and gasto_base_sem > 0 and _rel(a)
                 and _f(d.get('gasto_sem')) < ESPIRAL_QUEDA_GASTO * gasto_base_sem
                 and a['rec_sem'] < ESPIRAL_QUEDA_VENDA * rec_base_sem):
             tacos_sem = _f(d.get('gasto_sem')) / a['rec_sem'] if a['rec_sem'] else None
@@ -805,12 +1018,16 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True):
                     "Com estoque a semana toda: devolver o investimento aos poucos (+20–30%/ciclo)",
                     queda, regra='ads_espiral', medida=queda, periodo=_periodo_semanas(j)))
             else:
+                com_full = (dias_full or {}).get((loja, anuncio))
                 out.append(_sinal(
                     loja, 'FULL', anuncio, a['skus'],
-                    f"Ruptura: estoque em só {dias} de 7 dias da semana; venda "
-                    f"{_pct(a['rec_sem'] / rec_base_sem - 1)} e ads cortado — a causa é estoque",
+                    f"Ruptura: estoque (Full ou galpão) em só {dias} de 7 dias da semana"
+                    + (f", Full em {com_full}" if com_full is not None else '')
+                    + f"; venda {_pct(a['rec_sem'] / rec_base_sem - 1)} e ads cortado — a "
+                    "causa é estoque",
                     "Repor estoque antes de mexer no ads", queda, urgente=True,
-                    regra='full_ruptura', medida=queda, periodo=_periodo_semanas(j)))
+                    regra='full_ruptura', objeto=anuncio, medida=queda,
+                    periodo=_periodo_semanas(j)))
     return out
 
 
@@ -919,6 +1136,61 @@ def sinais_visitas(visitas, por_anuncio, j):
     return out
 
 
+def nota_das_novas(rating, aval, rating_ref, aval_ref):
+    """(nota média só das avaliações novas da janela, nº de novas). O
+    rating_star da Shopee é a média da VIDA do anúncio: tira-se a parte que já
+    existia em D-30. None quando falta dado ou não houve avaliação nova."""
+    if None in (rating, aval, rating_ref, aval_ref):
+        return None, 0
+    # rating 0 com avaliações > 0 (ou fora de 1..5) é dado inválido, não nota
+    for r, c in ((rating, aval), (rating_ref, aval_ref)):
+        if int(c) > 0 and not 1 <= float(r) <= 5:
+            return None, 0
+    novas = int(aval) - int(aval_ref)
+    if novas <= 0:
+        return None, max(novas, 0)
+    return (float(rating) * int(aval) - float(rating_ref) * int(aval_ref)) / novas, novas
+
+
+def sinais_views_shopee(views, por_anuncio, j):
+    """views: [(loja, item, data, views_30d, rating, aval, views_ref, rating_ref,
+    aval_ref)], ref = a foto de data − 30 (exata). Visualização de PÁGINA, não
+    visitante: nunca comparar com a visita única do ML."""
+    out = []
+    for loja, item, data, v, r, c, v_ref, r_ref, c_ref in views:
+        a = por_anuncio.get((loja, item))
+        dt = pd.Timestamp(data)
+        jan = JANELA_VIEWS_SHOPEE
+        periodo = (f"{_d(dt - timedelta(days=jan - 1))}–{_d(dt)} × "
+                   f"{_d(dt - timedelta(days=2 * jan - 1))}–{_d(dt - timedelta(days=jan))}")
+        if a and _rel(a) and v_ref is not None and _f(v_ref) > 0 and v is not None:
+            var = _f(v) / _f(v_ref) - 1
+            regra = ('visitas_queda' if _f(v) < QUEDA_VENDA * _f(v_ref)
+                     else 'visitas_alta' if _f(v) > ALTA_VENDA * _f(v_ref) else None)
+            if regra:
+                conv = (f"; conversão {a['pedidos_30'] / _f(v) * 100:.1f}% pedidos por "
+                        "visualização".replace('.', ',') if _f(v) > 0 and a.get('pedidos_30')
+                        else '')
+                out.append(_sinal(
+                    loja, 'VISITAS', item, a['skus'],
+                    f"Visualizações de página (30d) {int(_f(v))} × {int(_f(v_ref))} nos 30 dias "
+                    f"anteriores ({_pct(var)}){conv}",
+                    ("Ver posição, preço, ads e se o anúncio foi pausado" if regra == 'visitas_queda'
+                     else "Ver se a conversão acompanha (preço, estoque)"),
+                    a['rec_30'], regra=regra, medida=var, periodo=periodo))
+        nota, novas = nota_das_novas(r, c, r_ref, c_ref)
+        if nota is not None and novas >= MIN_AVAL_NOVAS and nota <= _f(r_ref) - QUEDA_NOTA_SHOPEE:
+            out.append(_sinal(
+                loja, 'EXPERIÊNCIA', item, (a or {}).get('skus') or set(),
+                f"Nota das {novas} avaliações novas em 30d: {_dec(nota)} × média anterior "
+                f"{_dec(_f(r_ref))} (média da vida toda hoje {_dec(_f(r))}; conta avaliações "
+                "com comentário: aproximação)",
+                "Ler as avaliações novas no Seller Center (produto, embalagem, prazo)",
+                (a or {}).get('rec_30', 0.0), regra='exp_anuncio', medida=nota,
+                periodo=periodo))
+    return out
+
+
 def ads_por_anuncio(linhas):
     cols = ('gasto_sem', 'gasto_base', 'gasto_ontem', 'gasto_recente', 'dias_com_gasto',
             'unid_recente', 'gasto_30', 'unid_ads_30', 'cliques_30')
@@ -935,7 +1207,7 @@ def _bloco(nome, erros, padrao, f, *args, **kw):
         return padrao
 
 
-def montar_sinais(dados, hoje):
+def montar_sinais(dados, hoje, mkt=MARKETPLACE):
     """(sinais, erros_por_bloco), a partir do que ler_tudo leu. Fonte que não
     veio (erro de leitura) só deixa de gerar os seus sinais; bloco que quebra
     na conta aparece em erros_por_bloco e os outros seguem."""
@@ -953,18 +1225,30 @@ def montar_sinais(dados, hoje):
     if 'vendas' in dados and 'vendas' not in erros:
         sinais += _bloco('vendas', erros, [], sinais_vendas, por_anuncio, j)
     if 'foto' in dados and 'ponte' in dados and 'vendas' in dados and 'full' not in erros:
-        sinais += _bloco('full', erros, [], sinais_full, dados['foto'], ponte, por_sku, ads, j)
+        sinais += _bloco('full', erros, [], sinais_full, dados['foto'], ponte, por_sku, ads, j,
+                         mkt)
     if ('ads' in dados or 'config' in dados) and 'ads' not in erros:
         dias_est = _bloco('ads', erros, {}, dias_com_estoque,
                           dados.get('estoque_semana') or [], ponte)
+        dias_full = _bloco('ads', erros, {}, dias_com_estoque,
+                           dados.get('estoque_semana') or [], ponte, True)
         sinais += _bloco('ads', erros, [], sinais_ads, ads, dados.get('config') or [],
                          por_anuncio, dias_est, j,
-                         com_estoque='estoque_semana' in dados and 'ponte' in dados)
+                         com_estoque='estoque_semana' in dados and 'ponte' in dados,
+                         mkt=mkt, lojas_com_estoque={r[0] for r in dados.get('foto') or []},
+                         dias_full=dias_full)
     if 'experiencia' in dados and 'experiencia' not in erros:
         sinais += _bloco('experiencia', erros, [], sinais_experiencia,
                          dados['experiencia'], ponte, comp, por_anuncio)
     if dados.get('visitas'):
-        sinais += _bloco('visitas', erros, [], sinais_visitas, dados['visitas'], por_anuncio, j)
+        if mkt == SHOPEE:
+            sinais += _bloco('visitas', erros, [], sinais_views_shopee, dados['visitas'],
+                             por_anuncio, j)
+        else:
+            sinais += _bloco('visitas', erros, [], sinais_visitas, dados['visitas'],
+                             por_anuncio, j)
+
+    sinais = unir_rupturas(sinais)
 
     # Espiral/ruptura explicam a queda: o sinal genérico de VENDAS do mesmo
     # anúncio sai, para não ocupar duas linhas das 10.
@@ -974,6 +1258,49 @@ def montar_sinais(dados, hoje):
               if not (s['regra'] == 'vendas_queda'
                       and (s['loja'], s['anuncio']) in explicados)]
     return sinais, erros
+
+
+def unir_rupturas(sinais):
+    """Uma linha de RUPTURA por anúncio (objeto = anúncio nas duas origens).
+    A da foto de hoje (Full e galpão zerados) vem primeiro; variações do mesmo
+    anúncio somam o R$ em jogo; a ruptura da semana entra no texto. A medida
+    (base da piora do Ciente) passa a ser o R$ em jogo da linha unida."""
+    grupos, ordem = {}, []
+    for x in sinais:
+        if x['regra'] != 'full_ruptura':
+            ordem.append(x)
+            continue
+        chave = (x['loja'], x['objeto'])
+        if chave not in grupos:
+            grupos[chave] = []
+            ordem.append(chave)
+        grupos[chave].append(x)
+    out = []
+    for item in ordem:
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        g = grupos[item]
+        if len(g) == 1:
+            out.append(g[0])
+            continue
+        hoje = [x for x in g if x['numero'].startswith('RUPTURA')]
+        semana = [x for x in g if not x['numero'].startswith('RUPTURA')]
+        base = dict(hoje[0] if hoje else semana[0])
+        em_jogo = sum(x['em_jogo'] for x in hoje) if hoje else 0.0
+        em_jogo = max([em_jogo] + [x['em_jogo'] for x in semana])
+        skus = set()
+        for x in g:
+            skus |= set(x['skus'])
+        txt = base['numero']
+        if len(hoje) > 1:
+            txt += f" (+{len(hoje) - 1} variação(ões) do anúncio)"
+        if hoje and semana:
+            txt += "; na semana: " + semana[0]['numero'].split(': ', 1)[-1]
+        base.update({'numero': txt, 'em_jogo': em_jogo, 'medida': em_jogo,
+                     'skus': tuple(sorted(skus)), 'urgente': True})
+        out.append(base)
+    return out
 
 
 def piorou(regra, agora, antes):
@@ -1065,7 +1392,7 @@ def validar_ciente(motivo, nota, ate, hoje):
     return erros
 
 
-def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas):
+def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE):
     """A ÚNICA gravação de ciente (formulário da tela e Excel).
     itens = [(sinal, motivo, nota, ate)]: cada um com o seu motivo/nota/data.
     Valida tudo antes de tocar no banco; grava numa transação só (ciente
@@ -1087,7 +1414,7 @@ def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas):
     cur = conn.cursor()
     try:
         for s, motivo, nota, ate in itens:
-            p = {'marketplace': MARKETPLACE, 'loja': s['loja'], 'regra': s['regra'],
+            p = {'marketplace': mkt, 'loja': s['loja'], 'regra': s['regra'],
                  'objeto': s['objeto'], 'motivo': motivo,
                  'nota': (nota or '').strip() or None, 'silenciar_ate': ate,
                  'medida': s['medida'], 'texto': s['numero'], 'usuario': usuario}
@@ -1113,7 +1440,7 @@ EDITAVEIS_EXCEL = ('Status', 'Motivo', 'Nota', 'Silenciar até')
 OBRIGATORIAS_EXCEL = ('Loja', 'Regra', 'Objeto') + EDITAVEIS_EXCEL
 
 
-def excel_sinais(sinais, nomes, hoje):
+def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
     """xlsx com os sinais: a chave (Loja, Regra, Objeto) e os dados do sinal
     travados; Status/Motivo/Nota/Silenciar até livres, com lista suspensa."""
     from openpyxl import Workbook
@@ -1165,7 +1492,8 @@ def excel_sinais(sinais, nomes, hoje):
 
     ins = wb.create_sheet('Instruções')
     for linha in (
-            [f"Sinais do Dia — Mercado Livre — gerado em {hoje:%d/%m/%Y}"], [],
+            [f"Sinais do Dia — {MARKETPLACES.get(mkt, {}).get('aba', mkt)} — gerado em "
+             f"{hoje:%d/%m/%Y}"], [],
             ["Preencha só as colunas amarelas (Status, Motivo, Nota, Silenciar até)."],
             ['Status: "Ciente" para responder ao sinal; vazio = linha ignorada.'],
             ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota.'],
@@ -1285,7 +1613,7 @@ def previa_excel(linhas, sinais_hoje, lojas_permitidas, hoje):
                                                 'Até', 'Resultado'])
 
 
-def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas):
+def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas, mkt=MARKETPLACE):
     """Encerra um ciente ('reativado'): o sinal volta a aparecer. Só nas lojas
     do usuário. Devolve quantas linhas mudou (0 ou 1)."""
     if not (usuario or '').strip():
@@ -1293,7 +1621,7 @@ def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas):
     cur = conn.cursor()
     try:
         cur.execute(SQL_REATIVAR, {'id': id_ciente, 'usuario': usuario,
-                                   'marketplace': MARKETPLACE,
+                                   'marketplace': mkt,
                                    'lojas': list(lojas_permitidas)})
         n = cur.rowcount
         conn.commit()
@@ -1349,6 +1677,41 @@ def lojas_carga_pendente(linhas_frescor, lojas, hoje):
     ult = {l: u for f, l, u in linhas_frescor if f == 'Vendas'}
     return {l for l in lojas
             if ult.get(l) is not None and pd.Timestamp(ult[l]).date() < hoje}
+
+
+def lojas_upload_atrasado(linhas_frescor, lojas, hoje):
+    """{loja: última data de venda} das lojas SÓ de upload (sem venda pela API
+    no período) cuja última venda é de antes de ontem. Até UPLOAD_MAX_DIAS a
+    loja é comparada com janelas até essa data (reler_vendas_upload); acima,
+    as regras de venda são suspensas."""
+    api = {l for f, l, u in linhas_frescor if f == 'Vendas' and u is not None}
+    ult = {l: pd.Timestamp(u).date() for f, l, u in linhas_frescor
+           if f == 'Último dia de venda (upload)' and u is not None}
+    ontem = hoje - timedelta(days=1)
+    return {l: ult[l] for l in lojas if l not in api and l in ult and ult[l] < ontem}
+
+
+def upload_suspenso(ultimo, hoje):
+    """Último upload com mais de UPLOAD_MAX_DIAS dias de atraso (contra ontem)."""
+    return (hoje - timedelta(days=1) - ultimo).days > UPLOAD_MAX_DIAS
+
+
+def reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt):
+    """Para cada loja só de upload atrasada (até UPLOAD_MAX_DIAS): troca os
+    sinais de VENDA dela pelos calculados com janelas que terminam no último
+    dia com upload. Devolve (sinais, {loja: último dia})."""
+    ate = {}
+    for loja, ultimo in lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items():
+        if upload_suspenso(ultimo, hoje):
+            continue
+        hoje_l = ultimo + timedelta(days=1)
+        vendas = _ler(conn, fontes(mkt)['vendas'], params(hoje_l, [loja], mkt))
+        por_an, _ = agregar_vendas(vendas)
+        novos = sinais_vendas(por_an, janelas(hoje_l))
+        sinais = [x for x in sinais
+                  if not (x['loja'] == loja and x['regra'] in REGRAS_DE_VENDA)] + novos
+        ate[loja] = ultimo
+    return sinais, ate
 
 
 def suspender_venda_pendente(sinais, pendentes):
@@ -1422,7 +1785,8 @@ def tabela_sinais(sinais, nomes):
                  for s in sinais],
         'SKU': [', '.join(s['skus']) for s in sinais],
         'Produto': [produto(s['skus']) for s in sinais],
-        'Anúncio': [s['anuncio'] for s in sinais],
+        'Anúncio': ['(por SKU)' if s['anuncio'].startswith('SKU:') else s['anuncio']
+                    for s in sinais],
         'O que disparou': [s['numero'] for s in sinais],
         'Período': [s.get('periodo', '') for s in sinais],
         'Sugestão': [s['sugestao'] for s in sinais],
@@ -1465,11 +1829,11 @@ AJUDA_DIA_FECHADO = ("Pode subir com pagamentos aprovados depois (boleto/Pix) e 
                      "com cancelamentos e devoluções.")
 
 
-def _render_resumo(st, loja, r, ontem, pendente=False):
+def _render_resumo(st, loja, r, ontem, pendente=False, rotulo='carga pendente'):
     c1, c2, c3 = st.columns(3)
     if pendente:
-        c1.metric(f"Venda de ontem ({ontem:%d/%m})", "carga pendente",
-                  help="As vendas de hoje ainda não entraram nesta loja: o número de ontem "
+        c1.metric(f"Venda de ontem ({ontem:%d/%m})", rotulo,
+                  help="As vendas desta loja ainda não chegaram até ontem: o número de ontem "
                        "pode estar incompleto e não é comparado.")
         c2.metric("Mês até ontem", _brl(r['mes']), help=f"Pode faltar a carga de hoje. "
                   f"{AJUDA_DIA_FECHADO}")
@@ -1509,26 +1873,33 @@ class _LeituraIncompleta(Exception):
         self.pacote = pacote
 
 
-def _ler_lojas_ml(_engine):
+def _ler_lojas_ml(_engine, mkt=MARKETPLACE):
     conn = _engine.raw_connection()
     try:
-        return [r[0] for r in _ler(conn, SQL_LOJAS_ML, {'marketplace': MARKETPLACE})]
+        return [r[0] for r in _ler(conn, SQL_LOJAS_ML, {'marketplace': mkt})]
     finally:
         conn.close()
 
 
-def _ler_pacote(_engine, hoje, lojas):
+def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE):
     """A leitura do DIA (tudo menos os cientes) + os sinais montados."""
     t0 = time.perf_counter()
     conn = _engine.raw_connection()
     try:
-        dados, erros = ler_tudo(conn, hoje, list(lojas))
+        dados, erros = ler_tudo(conn, hoje, list(lojas), mkt)
         parciais = []
+        if mkt == MARKETPLACE:          # a contagem de fotos de estoque_peca é só do ML
+            try:
+                parciais = [x for x in ep.fotos_parciais(ep.ler_contagens(conn))
+                            if x[0] in lojas]
+            except Exception:  # noqa: BLE001
+                pass
+        sinais, erros_bloco = montar_sinais(dados, hoje, mkt)
+        upload_ate = {}
         try:
-            parciais = [x for x in ep.fotos_parciais(ep.ler_contagens(conn)) if x[0] in lojas]
-        except Exception:  # noqa: BLE001
-            pass
-        sinais, erros_bloco = montar_sinais(dados, hoje)
+            sinais, upload_ate = reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt)
+        except Exception as e:  # noqa: BLE001
+            erros_bloco['vendas'] = e
         try:
             nomes = ep.ler_nomes(conn, {x for sn in sinais for x in sn['skus']})
         except Exception:  # noqa: BLE001
@@ -1538,30 +1909,31 @@ def _ler_pacote(_engine, hoje, lojas):
     return {'dados': dados, 'erros': {k: str(v) for k, v in erros.items()},
             'erros_bloco': {k: str(v) for k, v in erros_bloco.items()},
             'parciais': parciais, 'sinais': sinais, 'nomes': nomes,
+            'upload_ate': upload_ate,
             'lido_em': datetime.now(BRT), 'segundos': time.perf_counter() - t0}
 
 
-def _ler_pacote_completo(_engine, hoje, lojas):
-    pacote = _ler_pacote(_engine, hoje, lojas)
+def _ler_pacote_completo(_engine, hoje, lojas, mkt=MARKETPLACE):
+    pacote = _ler_pacote(_engine, hoje, lojas, mkt)
     if pacote['erros'] or pacote['erros_bloco']:
         raise _LeituraIncompleta(pacote)
     return pacote
 
 
-def _lojas_para_memoria(_engine):
-    return _ler_lojas_ml(_engine)
+def _lojas_para_memoria(_engine, mkt=MARKETPLACE):
+    return _ler_lojas_ml(_engine, mkt)
 
 
-def _pacote_para_memoria(_engine, hoje, lojas):
-    return _ler_pacote_completo(_engine, hoje, lojas)
+def _pacote_para_memoria(_engine, hoje, lojas, mkt=MARKETPLACE):
+    return _ler_pacote_completo(_engine, hoje, lojas, mkt)
 
 
 _MEMORIA = {}
 
 
 def _memoria(nome):
-    """st.cache_data criado uma vez por função (chave: hoje + lojas; o engine
-    não entra na chave)."""
+    """st.cache_data criado uma vez por função (chave: hoje + lojas +
+    marketplace; o engine não entra na chave)."""
     f = _MEMORIA.get(nome)
     if f is None:
         import streamlit
@@ -1576,17 +1948,17 @@ def limpar_memoria():
         f.clear()
 
 
-def obter_lojas_ml(engine):
-    return _memoria('lojas')(engine) if _no_streamlit() else _ler_lojas_ml(engine)
+def obter_lojas_ml(engine, mkt=MARKETPLACE):
+    return _memoria('lojas')(engine, mkt) if _no_streamlit() else _ler_lojas_ml(engine, mkt)
 
 
-def obter_pacote(engine, hoje, lojas):
+def obter_pacote(engine, hoje, lojas, mkt=MARKETPLACE):
     """(pacote, veio_da_memoria)."""
     if not _no_streamlit():
-        return _ler_pacote(engine, hoje, tuple(lojas)), False
+        return _ler_pacote(engine, hoje, tuple(lojas), mkt), False
     antes = datetime.now(BRT)
     try:
-        pacote = _memoria('pacote')(engine, hoje, tuple(lojas))
+        pacote = _memoria('pacote')(engine, hoje, tuple(lojas), mkt)
     except _LeituraIncompleta as e:
         return e.pacote, False
     return pacote, pacote['lido_em'] < antes
@@ -1601,6 +1973,12 @@ def _como_fragmento(f):
 
 
 def _render_mercado_livre(st, engine):
+    _render_marketplace(st, engine, MARKETPLACE)
+
+
+def _render_marketplace(st, engine, mkt=MARKETPLACE):
+    cfg = MARKETPLACES[mkt]
+    sigla = cfg['sigla']
     t_ini = time.perf_counter()
     tempos = []
     agora = datetime.now(BRT)
@@ -1613,18 +1991,18 @@ def _render_mercado_livre(st, engine):
 
     t = time.perf_counter()
     try:
-        lojas_ml = obter_lojas_ml(engine)
+        lojas_ml = obter_lojas_ml(engine, mkt)
     except Exception:  # noqa: BLE001
         st.error("Não consegui ler a lista de lojas agora. Tente de novo em instantes.")
         return
     tempos.append(('Lista de lojas', time.perf_counter() - t))
     lojas = lojas_visiveis(lojas_ml, restricao)
     if not lojas:
-        st.caption("Nenhuma loja do Mercado Livre atribuída ao seu perfil.")
+        st.caption(f"Nenhuma loja da aba {cfg['aba']} atribuída ao seu perfil.")
         return
 
     t = time.perf_counter()
-    pacote, da_memoria = obter_pacote(engine, hoje, lojas)
+    pacote, da_memoria = obter_pacote(engine, hoje, lojas, mkt)
     tempos.append(('Leitura do dia ' + (f"(da memória, lida às {pacote['lido_em']:%H:%M})"
                                         if da_memoria else "(do banco)"),
                    time.perf_counter() - t))
@@ -1636,14 +2014,19 @@ def _render_mercado_livre(st, engine):
     try:
         conn = engine.raw_connection()
         try:
-            cientes_linhas = ler_cientes(conn, lojas)
+            cientes_linhas = ler_cientes(conn, lojas, mkt)
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
         erro_ciente = True
         erros = {**erros, 'ciente': 'erro'}
     tempos.append(('Cientes (relidos a cada carga)', time.perf_counter() - t))
-    pendentes = lojas_carga_pendente(dados.get('frescor') or [], lojas, hoje)
+    pendentes = {l: 'carga' for l in lojas_carga_pendente(dados.get('frescor') or [], lojas,
+                                                         hoje)}
+    pendentes.update({l: f"upload:{d:%d/%m}" for l, d in
+                      lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items()
+                      if upload_suspenso(d, hoje)})
+    upload_ate = pacote.get('upload_ate') or {}
     sinais = suspender_venda_pendente(sinais, pendentes)
     ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
                                  sinais, cientes_linhas or [], hoje)
@@ -1656,7 +2039,7 @@ def _render_mercado_livre(st, engine):
         f"{j['base_ini']:%d/%m}–{j['base_fim']:%d/%m}. Loja cuja carga de vendas de hoje "
         "ainda não entrou fica com os sinais de venda suspensos (\"carga pendente\"). "
         f"Leitura de {pacote['lido_em']:%H:%M}.")
-    if c_bt.button("🔄 Atualizar dados", key="sin_atualizar"):
+    if c_bt.button("🔄 Atualizar dados", key=f"sin_atualizar_{sigla}"):
         limpar_memoria()
         st.rerun()
     if erros:
@@ -1665,7 +2048,17 @@ def _render_mercado_livre(st, engine):
     for bloco in erros_bloco:
         st.error(f"Os sinais de {ROTULO_BLOCO.get(bloco, bloco)} não puderam ser montados "
                  "agora; os outros blocos estão abaixo.")
-    if dados.get('visitas') is None and 'visitas' not in erros:
+    if mkt == SHOPEE:
+        if not dados.get('foto') and 'foto' not in erros:
+            st.info("📦 Estoque/Full da Shopee: em construção (a [DADOS SHOPEE] está levando "
+                    "o estoque ao sistema). Até lá não há sinal de Full nem de espiral.")
+        if dados.get('visitas') is None and 'visitas' not in erros:
+            st.info("👀 Visualizações de página (30d) e nota da Shopee: em construção.")
+        st.caption("Na Shopee, ads informa PEDIDOS, não unidades: o custo por venda de ads é "
+                   "por pedido, comparado com a margem por pedido do anúncio. Visualização de "
+                   "página (Shopee) não é visita única (ML): as duas nunca se comparam. A nota "
+                   "das avaliações novas conta só avaliações com comentário (aproximação).")
+    elif dados.get('visitas') is None and 'visitas' not in erros:
         st.info("👀 Visitas: coleta de visitas em construção.")
     com_ciente = cientes_linhas is not None and not erro_ciente and 'ciente' not in erros_bloco
     pode = com_ciente and pode_dar_ciente()
@@ -1681,7 +2074,8 @@ def _render_mercado_livre(st, engine):
                 'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
                 'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
                 'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
-                'lido_em': pacote['lido_em'], 'pendentes': pendentes}
+                'lido_em': pacote['lido_em'], 'pendentes': pendentes, 'mkt': mkt,
+                'upload_ate': upload_ate}
 
     try:
         _render_excel(st, ativos, silenciados, nomes, base_ctx)
@@ -1720,29 +2114,33 @@ def _excel_em_cache(ativos, nomes, ctx):
     import streamlit
     versao = streamlit.session_state.get('sin_versao', 0)
     chave = (ctx['lido_em'].isoformat(), versao, tuple(ctx['lojas']), len(ativos))
-    guardado = streamlit.session_state.get('sin_xlsx')
+    mkt = ctx.get('mkt', MARKETPLACE)
+    nome = f"sin_xlsx_{MARKETPLACES[mkt]['sigla']}"
+    guardado = streamlit.session_state.get(nome)
     if not guardado or guardado[0] != chave:
         ordem = sorted(ativos, key=lambda x: (x['loja'], -x['em_jogo']))
-        guardado = (chave, excel_sinais(ordem, nomes, ctx['hoje']))
-        streamlit.session_state['sin_xlsx'] = guardado
+        guardado = (chave, excel_sinais(ordem, nomes, ctx['hoje'], mkt))
+        streamlit.session_state[nome] = guardado
     return guardado[1]
 
 
 def _render_excel(st, ativos, silenciados, nomes, ctx):
     import streamlit
     hoje = ctx['hoje']
+    mkt = ctx.get('mkt', MARKETPLACE)
+    sigla = MARKETPLACES[mkt]['sigla']
     versao = streamlit.session_state.get('sin_versao', 0)
     with st.expander("📥 Excel: baixar os sinais e subir cientes"):
         st.download_button(
             "Baixar Excel dos sinais", data=_excel_em_cache(ativos, nomes, ctx),
-            file_name=f"sinais_ML_{hoje:%Y-%m-%d}.xlsx",
+            file_name=f"sinais_{sigla}_{hoje:%Y-%m-%d}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="sin_xlsx_baixar")
+            key=f"sin_xlsx_baixar_{sigla}")
         if not ctx['pode']:
             st.caption("Seu perfil pode baixar, mas não subir cientes.")
             return
         arq = st.file_uploader("Subir o Excel preenchido (Status, Motivo, Nota, Silenciar até)",
-                               type=['xlsx'], key=f"sin_xlsx_subir_{versao}")
+                               type=['xlsx'], key=f"sin_xlsx_subir_{sigla}_{versao}")
         if arq is None:
             return
         try:
@@ -1763,11 +2161,11 @@ def _render_excel(st, ativos, silenciados, nomes, ctx):
         rotulo = f"Gravar {len(itens)} ciente(s)"
         if recusadas:
             rotulo += f" — as {recusadas} recusada(s) ficam de fora"
-        if st.button(rotulo, key=f"sin_xlsx_gravar_{versao}"):
+        if st.button(rotulo, key=f"sin_xlsx_gravar_{sigla}_{versao}"):
             usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
             conn = ctx['engine'].raw_connection()
             try:
-                n = gravar_cientes(conn, itens, usuario, hoje, ctx['lojas'])
+                n = gravar_cientes(conn, itens, usuario, hoje, ctx['lojas'], mkt)
             except Exception:  # noqa: BLE001
                 st.error("Não consegui gravar agora; nada foi gravado. Tente de novo.")
                 return
@@ -1819,7 +2217,7 @@ def _render_form_ciente(st, loja, marcados, ctx):
     conn = ctx['engine'].raw_connection()
     try:
         n = gravar_cientes(conn, [(x, motivo, nota, ate) for x in marcados], usuario, hoje,
-                           ctx['lojas'])
+                           ctx['lojas'], ctx.get('mkt', MARKETPLACE))
     except Exception:  # noqa: BLE001
         st.error("Não consegui registrar o ciente agora; nada foi gravado. Tente de novo.")
         return
@@ -1851,7 +2249,7 @@ def _render_silenciados(st, loja, ctx):
             usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
             conn = ctx['engine'].raw_connection()
             try:
-                reativar_ciente(conn, escolha, usuario, ctx['lojas'])
+                reativar_ciente(conn, escolha, usuario, ctx['lojas'], ctx.get('mkt', MARKETPLACE))
             except Exception:  # noqa: BLE001
                 st.error("Não consegui reativar agora; nada mudou.")
                 return
@@ -1878,16 +2276,31 @@ def _render_loja(st, loja, ativos, ctx):
             st.warning(f"⚠️ Foto do estoque possivelmente PARCIAL: {n_ult} estoques em "
                        f"{pd.Timestamp(ult):%d/%m} contra {n_ant} em {pd.Timestamp(ant):%d/%m}.")
 
-    pendente = loja in ctx.get('pendentes', ())
-    if pendente:
+    motivo_pend = (ctx.get('pendentes') or {}).get(loja)
+    pendente = motivo_pend is not None
+    if motivo_pend == 'carga':
         st.warning(f"⏳ Carga pendente: as vendas de hoje ainda não entraram nesta loja. "
                    f"A venda de {j['ontem']:%d/%m} pode estar incompleta; os sinais de venda "
                    "ficam suspensos até a carga entrar (clique em \"Atualizar dados\").")
+    elif pendente:
+        st.warning(f"⏳ Upload atrasado: a última venda desta loja (upload) é de "
+                   f"{motivo_pend.split(':', 1)[1]}, há mais de {UPLOAD_MAX_DIAS} dias. Os "
+                   "sinais de venda ficam suspensos até um upload mais novo.")
+    ate_upload = (ctx.get('upload_ate') or {}).get(loja)
+    if ate_upload is not None:
+        st.caption(f"📤 Dados até {ate_upload:%d/%m} (upload): os sinais de venda comparam a "
+                   "semana que termina nessa data.")
     if 'resumo' in erros:
         st.error("Resumo indisponível agora.")
     else:
         try:
-            _render_resumo(st, loja, resumo[loja], j['ontem'], pendente)
+            if ate_upload is not None:
+                _render_resumo(st, loja, resumo[loja], j['ontem'], True,
+                               f"upload até {ate_upload:%d/%m}")
+            else:
+                _render_resumo(st, loja, resumo[loja], j['ontem'], pendente,
+                               'upload atrasado' if pendente and motivo_pend != 'carga'
+                               else 'carga pendente')
         except Exception:  # noqa: BLE001
             st.error("Resumo indisponível agora.")
 
@@ -1931,4 +2344,8 @@ def render(engine):
             st.error("Os sinais do Mercado Livre não carregaram agora. Tente de novo em "
                      "instantes; se persistir, avise o time do sistema.")
     with aba_shopee:
-        st.info("Shopee: em seguida (v2).")
+        try:
+            _render_marketplace(st, engine, SHOPEE)
+        except Exception:  # noqa: BLE001
+            st.error("Os sinais da Shopee não carregaram agora. Tente de novo em instantes; "
+                     "se persistir, avise o time do sistema.")

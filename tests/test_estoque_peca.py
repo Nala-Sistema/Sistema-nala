@@ -333,6 +333,121 @@ class Sql(unittest.TestCase):
             self.assertNotIn('public.', sql)
 
 
+SHP_LPT, SHP_NALA = 'Shopee-LPT', 'Shopee Lithouse(Nala)'
+
+
+class FullDaShopee(unittest.TestCase):
+    """Parte (b) da frente [DADOS SHOPEE] (decisões B1–B3 do Mestre, 06/10/2026)."""
+
+    def _montar(self, estoque, shopee, vendas=(), prazo=14):
+        return ep.montar(list(estoque), list(vendas), COMP, (), None, prazo, list(shopee))
+
+    def test_full_shopee_soma_por_peca_em_coluna_propria_e_na_cobertura_total(self):
+        pecas, _, _ = self._montar(
+            [(LPT, 'e1', 'L-0320', D, 10, 0, 300)],
+            [(SHP_LPT, '1:11', 'K2-L-0320', D, 5, 0, 150),     # kit: 5 × 2
+             (SHP_NALA, '2:0', 'L-0320', D, 7, 0, 300)],
+            vendas=[('L-0320', 7, 30, 300.0)])
+        l = _linha(pecas, 'L-0320')
+        self.assertEqual((l['full'], l['full_shopee']), (10, 5 * 2 + 7))
+        self.assertAlmostEqual(l['cobertura_dias'], (300 + 10 + 17) / 1.0)
+        # "só Full ML": Full do ML ÷ venda, sem o Full da Shopee (B3)
+        self.assertAlmostEqual(l['cobertura_full_dias'], 10 / 1.0)
+
+    def test_galpao_do_ml_vale_e_shopee_divergente_so_avisa(self):
+        pecas, _, avisos = self._montar([(LPT, 'e1', 'L-0355', D, 0, 0, 2677)],
+                                        [(SHP_LPT, '1:0', 'L-0355', D, 0, 0, 3145)])
+        l = _linha(pecas, 'L-0355')
+        self.assertEqual((l['galpao'], l['galpao_tipo'], l['galpao_shopee_diverge']),
+                         (2677, 'conhecido', 3145))
+        self.assertEqual(avisos['galpao_shopee_divergente'], [('L-0355', 2677, 3145)])
+        self.assertEqual(ep.texto_galpao(l), '2.677 ⚠ Shopee publica 3.145')
+        self.assertFalse(l['galpao_diverge'])           # o aviso entre lojas do ML é outro
+
+    def test_galpao_shopee_dentro_do_ruido_nao_avisa(self):
+        pecas, _, avisos = self._montar([(LPT, 'e1', 'L-0303', D, 0, 0, 4389)],
+                                        [(SHP_LPT, '1:0', 'L-0303', D, 0, 0, 4390)])
+        self.assertIsNone(_linha(pecas, 'L-0303')['galpao_shopee_diverge'])
+        self.assertEqual(avisos['galpao_shopee_divergente'], [])
+
+    def test_galpao_pela_shopee_quando_o_ml_nao_publica_a_peca(self):
+        pecas, _, _ = self._montar([], [(SHP_LPT, '1:0', 'L-0500', D, 0, 0, 80)],
+                                   vendas=[('L-0500', 7, 30, 100.0)])
+        l = _linha(pecas, 'L-0500')
+        self.assertEqual((l['galpao'], l['galpao_tipo']), (80, 'shopee'))
+        self.assertFalse(l['cobertura_minima'])
+        self.assertEqual(ep.texto_galpao(l), '80 (pela Shopee)')
+
+    def test_galpao_pela_shopee_divergente_entre_anuncios_usa_o_maior_e_avisa(self):
+        # ressalva R1 do auditor: como entre as lojas do ML
+        pecas, _, avisos = self._montar([], [(SHP_LPT, '1:0', 'L-0500', D, 0, 0, 80),
+                                             (SHP_NALA, '2:0', 'L-0500', D, 0, 0, 20)])
+        l = _linha(pecas, 'L-0500')
+        self.assertEqual((l['galpao'], l['galpao_tipo'], l['galpao_diverge']),
+                         (80, 'shopee', True))
+        self.assertEqual(avisos['galpao_divergente'], ['L-0500'])
+        self.assertEqual(ep.texto_galpao(l), '80 (pela Shopee) ⚠ publicado diferente entre lojas')
+
+    def test_galpao_pela_shopee_igual_entre_anuncios_nao_avisa(self):
+        pecas, _, avisos = self._montar([], [(SHP_LPT, '1:0', 'L-0500', D, 0, 0, 80),
+                                             (SHP_NALA, '2:0', 'L-0500', D, 0, 0, 80)])
+        self.assertFalse(_linha(pecas, 'L-0500')['galpao_diverge'])
+        self.assertEqual(avisos['galpao_divergente'], [])
+
+    def test_galpao_pela_shopee_vence_o_piso_pelo_kit(self):
+        pecas, _, _ = self._montar([(LPT, 'e1', 'K3-L-0330', D, 0, 0, 438)],
+                                   [(SHP_LPT, '1:0', 'L-0330', D, 0, 0, 1300)])
+        l = _linha(pecas, 'L-0330')
+        self.assertEqual((l['galpao'], l['galpao_tipo']), (1300, 'shopee'))
+
+    def test_galpao_de_kit_da_shopee_e_ignorado(self):
+        # galpão de kit vem dividido pelo UpSeller: não vira galpão da peça nem piso
+        pecas, _, _ = self._montar([], [(SHP_LPT, '1:11', 'K3-L-0330', D, 2, 0, 438)])
+        l = _linha(pecas, 'L-0330')
+        self.assertEqual((l['galpao_tipo'], l['full_shopee']), ('desconhecido', 6))
+
+    def test_galpao_da_shopee_nunca_soma_com_o_do_ml(self):
+        pecas, _, _ = self._montar([(LPT, 'e1', 'L-0320', D, 0, 0, 300),
+                                    (NALA, 'e2', 'L-0320', D, 0, 0, 300)],
+                                   [(SHP_LPT, '1:0', 'L-0320', D, 0, 0, 300),
+                                    (SHP_NALA, '2:0', 'L-0320', D, 0, 0, 300)],
+                                   vendas=[('L-0320', 7, 30, 1.0)])
+        l = _linha(pecas, 'L-0320')
+        self.assertEqual(l['galpao'], 300)
+        self.assertAlmostEqual(l['cobertura_dias'], 300.0)
+
+    def test_full_shopee_nulo_conta_zero(self):
+        pecas, _, _ = self._montar([], [(SHP_LPT, '1:0', 'L-0320', D, None, None, None)])
+        self.assertEqual(_linha(pecas, 'L-0320')['full_shopee'], 0)
+
+    def test_data_da_foto_shopee_e_kits_com_os_dois_fulls(self):
+        _, kits, avisos = self._montar([(LPT, 'e1', 'K2-L-0320', D, 3, 0, 150)],
+                                       [(SHP_LPT, '1:11', 'K2-L-0320', D, 4, 0, 150)],
+                                       vendas=[('K2-L-0320', 1, 3, 90.0)])
+        self.assertEqual(avisos['datas_loja'], {LPT: D, SHP_LPT: D})
+        k, = kits['L-0320']
+        self.assertEqual((k['Full ML do kit (kits)'], k['Full Shopee do kit (kits)']), (3, 4))
+
+    def test_sem_shopee_o_resultado_e_o_de_antes(self):
+        estoque = [(LPT, 'e1', 'LKE-3104-4030', D, 17, 0, 1315)]
+        antes, _, _ = ep.montar(estoque, [], COMP)
+        depois, _, _ = ep.montar(estoque, [], COMP, estoque_shopee=[])
+        self.assertEqual(antes.drop(columns=['full_shopee', 'galpao_shopee_diverge']).to_dict(),
+                         depois.drop(columns=['full_shopee', 'galpao_shopee_diverge']).to_dict())
+
+    def test_tela(self):
+        pecas, _, _ = self._montar([(LPT, 'e1', 'L-0320', D, 10, 0, 300)],
+                                   [(SHP_LPT, '1:0', 'L-0320', D, 7, 0, 300)])
+        tela = ep._tabela_tela(pecas, {})
+        self.assertIn('Full Shopee (peças)', tela.columns)
+        self.assertIn('Cobertura só Full ML (dias)', tela.columns)
+        self.assertEqual(tela['Full Shopee (peças)'].iloc[0], '7')
+        with open(os.path.join(RAIZ, 'estoque_peca.py'), encoding='utf-8') as f:
+            fonte = f.read()
+        self.assertNotIn('O Full da Shopee e da Amazon ainda não entra', fonte)
+        self.assertIn('Cobertura em peça (ML + Shopee)', fonte)
+
+
 # ============================================================
 # COM BANCO
 # ============================================================
@@ -453,6 +568,19 @@ class ComBanco(unittest.TestCase):
         self.assertEqual(c[LPT], (2, D, 1, date(2026, 9, 29)))
         self.assertEqual(c[NALA], (1, D, None, None))
         self.assertNotIn('Shopee-LPT', c)
+
+    def test_estoque_da_shopee_pela_sql(self):
+        shopee = ep.ler_estoque_shopee(self.c)
+        self.assertEqual([r[:2] for r in shopee], [('Shopee-LPT', 's1')])
+        estoque, vendas, comp, pend, mapa = ep.ler(self.c, self.hoje)
+        pecas, _, avisos = ep.montar(estoque, vendas, comp, pend, mapa, estoque_shopee=shopee)
+        l = _linha(pecas, 'LKE-3104-4030')
+        self.assertEqual((l['full'], l['full_shopee'], l['galpao']), (17 + 29 * 10, 500, 1315))
+        self.assertEqual(avisos['galpao_shopee_divergente'], [('LKE-3104-4030', 1315, 500)])
+
+    def test_contagem_da_shopee_so_quando_pedida(self):
+        c = dict((r[0], r[1:]) for r in ep.ler_contagens(self.c, ep.MARKETPLACE_SHOPEE))
+        self.assertEqual(list(c), ['Shopee-LPT'])
 
     def test_sku_errado_e_certo_no_mesmo_estoque_pela_sql(self):
         self.cur.execute("INSERT INTO dim_estoque_anuncio VALUES "
