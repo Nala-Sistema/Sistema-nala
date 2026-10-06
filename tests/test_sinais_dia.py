@@ -22,6 +22,11 @@ Duas partes:
     espiral só com estoque no banco, views de página D × D-30 em data exata,
     nota só das avaliações novas, carga pendente só para loja de API; com
     banco, o cenário Shopee inteiro pelas SQL.
+  - Full × galpão (regra do Thiago, 06/10, igual no ML e na Shopee) com os
+    casos reais de 05/10: K10-L-7248-A (Shopee Nala, Full 0, galpão 18, ads
+    ligado), L-0321 (Shopee LPT, Full 29, galpão 2.328), K-L-0421-A (Shopee
+    LPT, Full 0, galpão 364) e um caso ML com Full 0 e galpão > 0; upload
+    atrasado da Litstore (R2); nota inválida com rating 0 (R3).
   - Com banco (NALA_TEST_DB_URL, usuário de permissão mínima): EXECUTA as SQL
     de verdade em tabelas TEMPORÁRIAS com os nomes das reais, com as CHECK
     COPIADAS da tabela real (lição de 05/10: a TEMP sem CHECK aceitava o que
@@ -175,7 +180,7 @@ class Ads(unittest.TestCase):
         s = self._ads(ads, vendas, {(NALA, 'MLB7175749876'): 3})
         self.assertEqual(len(s), 1)
         self.assertEqual(s[0]['tipo'], 'FULL')
-        self.assertTrue(s[0]['numero'].startswith('Ruptura: estoque em só 3 de 7'))
+        self.assertTrue(s[0]['numero'].startswith('Ruptura: estoque (Full ou galpão) em só 3 de 7'))
         self.assertFalse(any(x['numero'].startswith('Espiral') for x in s))
 
     def test_sem_leitura_de_estoque_a_espiral_nao_e_julgada(self):
@@ -760,6 +765,13 @@ class Shopee(unittest.TestCase):
         self.assertEqual(sd._roas(0, sd.MARKETPLACE), '0,0')
         self.assertEqual(sd._roas(9.8, sd.SHOPEE), '9,8')
 
+    def test_rating_zero_com_avaliacoes_e_dado_invalido(self):
+        self.assertEqual(sd.nota_das_novas(0, 15, 4.8, 10), (None, 0))
+        self.assertEqual(sd.nota_das_novas(4.5, 20, 0, 10), (None, 0))
+        self.assertEqual(sd.nota_das_novas(4.5, 20, 0, 0), (4.5, 20))   # sem avaliação antes
+        caiu = self._views((S_LPT, '2249', date(2026, 10, 4), 400, 4.5, 20, 400, 4.8, 10))
+        self.assertIn('com comentário: aproximação', caiu[0]['numero'])
+
     def test_nota_so_das_avaliacoes_novas(self):
         nota, novas = sd.nota_das_novas(4.5, 20, 4.8, 10)
         self.assertAlmostEqual(nota, 4.2)
@@ -855,6 +867,133 @@ class Shopee(unittest.TestCase):
         caps = ' '.join(str(c.args[0]) for c in st.caption.call_args_list)
         self.assertIn('ads informa PEDIDOS, não unidades', caps)
         self.assertEqual(st.subheader.call_args.args[0], S_LPT)
+
+
+class FullGalpao(unittest.TestCase):
+    """Regra do Thiago (06/10), igual no ML e na Shopee: sem Full o anúncio
+    ainda vende pelo galpão, mas muito menos; Full E galpão zerados = ruptura."""
+
+    def _full(self, foto, ponte, vendas, ads=None, mkt=sd.SHOPEE):
+        _a, por_sku = sd.agregar_vendas(vendas)
+        return sd.sinais_full(foto, ponte, por_sku, ads or {}, sd.janelas(HOJE), mkt)
+
+    def test_k10_l_7248_a_full_zerado_com_ads_e_galpao_nao_manda_pausar(self):
+        ponte = [(S_NALA, '23298770778', 'E7248', 'K10-L-7248-A', True)]
+        foto = [(S_NALA, 'E7248', date(2026, 10, 4), 0, 0, 0, 18)]
+        vendas = [_vend(S_NALA, '23298770778', 'K10-L-7248-A', qtd_ritmo=7, qtd_30=30,
+                        rec_30=900)]
+        ads = {(S_NALA, '23298770778'): _ads(gasto_ontem=16)}
+        for mkt in (sd.SHOPEE, sd.MARKETPLACE):             # a MESMA regra nos dois
+            s = self._full(foto, ponte, vendas, ads, mkt)
+            self.assertEqual([x['regra'] for x in s], ['full_zerado_ads'], mkt)
+            self.assertTrue(s[0]['urgente'])
+            self.assertIn('galpão 18 un.', s[0]['numero'])
+            self.assertIn('queda forte esperada', s[0]['numero'])
+            self.assertIn('avalie reduzir', s[0]['sugestao'])
+            self.assertNotIn('ausar o ads', s[0]['sugestao'].replace('não pausar', ''))
+            self.assertEqual(s[0]['em_jogo'], 900)           # a venda de 30 dias
+
+    def test_l_0321_full_curto_com_galpao_continua_urgente(self):
+        ponte = [(S_LPT, '22494216736', 'E321', 'L-0321', True)]
+        foto = [(S_LPT, 'E321', date(2026, 10, 4), 29, 0, 0, 2328)]
+        vendas = [_vend(S_LPT, '22494216736', 'L-0321', qtd_ritmo=210, qtd_30=600,
+                        rec_30=12000)]
+        s = self._full(foto, ponte, vendas)
+        self.assertEqual([x['regra'] for x in s], ['full_cobertura'])
+        self.assertTrue(s[0]['urgente'])
+        self.assertIn('1 dias de Full', s[0]['numero'])
+        self.assertIn('galpão 2328 un. (sem Full vende muito menos', s[0]['numero'])
+        self.assertIn('Repor o Full já', s[0]['sugestao'])
+        self.assertEqual(s[0]['em_jogo'], 12000)
+
+    def test_k_l_0421_a_full_zerado_com_galpao_e_ads(self):
+        ponte = [(S_LPT, '46662845939', 'E421', 'K-L-0421-A', True)]
+        foto = [(S_LPT, 'E421', date(2026, 10, 4), 0, 0, 0, 364)]
+        ads = {(S_LPT, '46662845939'): _ads(gasto_ontem=5)}
+        s = self._full(foto, ponte, [], ads)
+        self.assertEqual([x['regra'] for x in s], ['full_zerado_ads'])
+        self.assertIn('galpão 364 un.', s[0]['numero'])
+        self.assertIn('não pausar', s[0]['sugestao'])
+
+    def test_full_e_galpao_zerados_e_ruptura_e_ai_sim_pausar(self):
+        ponte = [(S_NALA, 'I1', 'E1', 'A', True)]
+        foto = [(S_NALA, 'E1', date(2026, 10, 4), 0, 0, 0, 0)]
+        ads = {(S_NALA, 'I1'): _ads(gasto_ontem=10)}
+        vendas = [_vend(S_NALA, 'I1', 'A', qtd_ritmo=7, qtd_30=30, rec_30=800)]
+        for mkt in (sd.SHOPEE, sd.MARKETPLACE):
+            s = self._full(foto, ponte, vendas, ads, mkt)
+            self.assertEqual([x['regra'] for x in s], ['full_ruptura'], mkt)
+            self.assertTrue(s[0]['numero'].startswith('RUPTURA — Full e galpão zerados'))
+            self.assertIn('Pausar o ads até repor', s[0]['sugestao'])
+            self.assertEqual(s[0]['em_jogo'], 800)
+        sem_ads = self._full(foto, ponte, vendas)
+        self.assertEqual(sem_ads[0]['sugestao'], 'Repor o estoque já')
+        parado = self._full(foto, ponte, [])                 # sem venda e sem ads: nada
+        self.assertEqual(parado, [])
+
+    def test_caso_ml_full_zerado_com_galpao_nao_pausa(self):
+        ponte = [(LPT, 'MLB5183384677', 'MLBU5071722523', 'K-L-0421-A', True)]
+        foto = [(LPT, 'MLBU5071722523', date(2026, 10, 4), 0, 2, 0, 1315)]
+        vendas = [_vend(LPT, 'MLB5183384677', 'K-L-0421-A', qtd_ritmo=21, qtd_30=65,
+                        rec_30=2000)]
+        ads = {(LPT, 'MLB5183384677'): _ads(gasto_ontem=19)}
+        s = self._full(foto, ponte, vendas, ads, sd.MARKETPLACE)
+        self.assertEqual(s[0]['regra'], 'full_zerado_ads')
+        self.assertIn('2 em transferência', s[0]['numero'])
+        self.assertIn('galpão 1315 un.', s[0]['numero'])
+        self.assertIn('não pausar', s[0]['sugestao'])
+
+    def test_galpao_desconhecido_nao_vira_ruptura(self):
+        ponte = [(LPT, 'MLB1', 'E1', 'A', True)]
+        foto = [(LPT, 'E1', date(2026, 10, 4), 0, 0, 0)]          # sem coluna de galpão
+        ads = {(LPT, 'MLB1'): _ads(gasto_ontem=10)}
+        s = self._full(foto, ponte, [], ads, sd.MARKETPLACE)
+        self.assertEqual([x['regra'] for x in s], ['full_zerado_ads'])
+        self.assertNotIn('galpão', s[0]['numero'])
+
+    def test_espiral_e_ruptura_olham_o_estoque_total(self):
+        ponte = [(S_LPT, 'I1', 'E1', 'A', True)]
+        semana = [(S_LPT, 'E1', date(2026, 9, 28) + timedelta(days=i), 0, 50) for i in range(7)]
+        self.assertEqual(sd.dias_com_estoque(semana, ponte), {(S_LPT, 'I1'): 7})
+        self.assertEqual(sd.dias_com_estoque(semana, ponte, so_full=True), {})
+        for mkt in (sd.SHOPEE, sd.MARKETPLACE):
+            dados = {'vendas': [_vend(S_LPT, 'I1', 'A', rec_sem=100, rec_base=4000)],
+                     'ads': [(S_LPT, 'I1', 5, 400, 0, 0, 0, 0, 0, 0, 0)], 'config': [],
+                     'ponte': ponte, 'estoque_semana': semana,
+                     'foto': [(S_LPT, 'E1', date(2026, 10, 4), 0, 0, 0, 50)]}
+            s, _ = sd.montar_sinais(dados, HOJE, mkt)
+            regras = {x['regra'] for x in s}
+            self.assertIn('ads_espiral', regras, mkt)         # tinha estoque (galpão)
+            self.assertNotIn('full_ruptura', regras, mkt)
+
+    def test_texto_da_ruptura_mostra_os_dias_com_full(self):
+        vendas = [_vend(NALA, 'MLB7', 'X', rec_sem=150, rec_base=3200)]
+        ads = {(NALA, 'MLB7'): _ads(gasto_sem=10, gasto_base=300)}
+        por_an, _ = sd.agregar_vendas(vendas)
+        s = sd.sinais_ads(ads, [], por_an, {(NALA, 'MLB7'): 4}, sd.janelas(HOJE),
+                          dias_full={(NALA, 'MLB7'): 2})
+        self.assertIn('estoque (Full ou galpão) em só 4 de 7 dias da semana, Full em 2',
+                      s[0]['numero'])
+
+
+class UploadAtrasado(unittest.TestCase):
+    def test_litstore_com_ultima_venda_antes_de_ontem(self):
+        linhas = [('Vendas', S_LPT, datetime(2026, 10, 5, 4, 20)),
+                  ('Vendas', S_YANNI, None),
+                  ('Último dia de venda (upload)', S_YANNI, datetime(2026, 10, 3))]
+        self.assertEqual(sd.lojas_upload_atrasado(linhas, [S_LPT, S_YANNI], HOJE),
+                         {S_YANNI: date(2026, 10, 3)})
+        em_dia = linhas[:2] + [('Último dia de venda (upload)', S_YANNI, datetime(2026, 10, 4))]
+        self.assertEqual(sd.lojas_upload_atrasado(em_dia, [S_LPT, S_YANNI], HOJE), {})
+
+    def test_loja_de_api_nunca_e_upload_atrasado(self):
+        linhas = [('Vendas', S_LPT, datetime(2026, 10, 5, 4, 20)),
+                  ('Último dia de venda (upload)', S_LPT, datetime(2026, 9, 1))]
+        self.assertEqual(sd.lojas_upload_atrasado(linhas, [S_LPT], HOJE), {})
+
+    def test_suspende_as_regras_de_venda_da_litstore(self):
+        x = sd._sinal(S_YANNI, 'VENDAS', 'SKU:L-0500', [], 'Queda', 's', 1, regra='vendas_queda')
+        self.assertEqual(sd.suspender_venda_pendente([x], {S_YANNI: 'upload:03/10'}), [])
 
 
 class CargaPendente(unittest.TestCase):
@@ -1234,7 +1373,7 @@ class ComBanco(unittest.TestCase):
         self.assertIn('100 (Boa) → 65 (Média)', por[(LPT, 'EXPERIÊNCIA', 'Experiência')]['numero'])
 
         rup = por[(NALA, 'FULL', 'Ruptura')]
-        self.assertIn('só 3 de 7', rup['numero'])
+        self.assertIn('só 3 de 7 dias da semana, Full em 3', rup['numero'])
         self.assertFalse(any(x['numero'].startswith('Espiral') for x in s))
 
         r = sd.resumo_lojas(dados['resumo'], dados['metas'], [LPT, NALA], HOJE)
@@ -1297,6 +1436,8 @@ class ComBanco(unittest.TestCase):
         self.assertAlmostEqual(nota['medida'], 4.2)                # (90 − 48) ÷ 10 novas
         self.assertFalse([x for x in s if x['regra'] in ('ads_espiral', 'full_ruptura')])
         self.assertEqual(sd.lojas_carga_pendente(dados['frescor'], lojas, HOJE), set())
+        self.assertEqual(sd.lojas_upload_atrasado(dados['frescor'], lojas, HOJE),
+                         {S_YANNI: date(2026, 9, 12)})
 
     def test_lojas_ml_e_restricao_pela_sql(self):
         lojas = [r[0] for r in sd._ler(self.c, sd.SQL_LOJAS_ML, {'marketplace': sd.MARKETPLACE})]
