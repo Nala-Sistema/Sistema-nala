@@ -35,8 +35,25 @@
 -- QUEM MAIS LÊ fact_estoque_diario (conferido em 06/10/2026)
 --   v_movimento_full_diario: já filtra ML. v_estoque_envio_manual: só tem
 --   ramo não-ML para agendamento de outro marketplace (nenhum existe).
---   estoque_peca.py e sinais_dia.py filtram ML no código. cobertura_full.py
---   lê a não-ML só onde unidades_entrada_coleta > 0 (a Shopee grava NULL).
+--   estoque_peca.py filtra ML no código; sinais_dia.py recebe o marketplace
+--   como parâmetro. cobertura_full.py (CORRIGIDO após o parecer do auditor,
+--   ressalva C2, 06/10/2026 — a versão anterior deste cabeçalho dizia que ele
+--   só lia a não-ML com unidades_entrada_coleta > 0, o que vale só para
+--   SQL_ENTRADAS):
+--     - SQL_ENTRADAS: não-ML só com unidades_entrada_coleta > 0 -> a Shopee
+--       (NULL) não entra;
+--     - SQL_SKUS: dim_estoque_anuncio SEM filtro de marketplace -> lê as
+--       ~1.200 linhas Shopee; hoje sem efeito na tela (o SKU só é usado para
+--       as linhas da v_cobertura_full, que é só ML), só leitura a mais;
+--     - SQL_COLETA_POR_DIA: marketplace <> 'MERCADO LIVRE' -> devolve um total
+--       NULL por dia para a SHOPEE; vira 0 e nenhum "dia de onda" da Shopee,
+--       o que só importaria para agendamento de envio Shopee (nenhum existe).
+--   Os três são tarefa do card "Cobertura do Full da Shopee" (Notion).
+--
+-- NUNCA APLICAR DDL em fact_estoque_diario, dim_estoque_anuncio,
+-- fact_visitas_anuncio nem nas views delas entre 04:00 e 06:30 (Brasília):
+-- é a janela dos coletores (estoque ML, visitas ML, foto da Shopee às 05:05);
+-- o bloqueio do DDL travaria a gravação deles (ressalva S2 do auditor).
 --
 -- DESFAZER: sql/v_cobertura_full_so_ml_DESFAZER.sql
 -- =============================================================================

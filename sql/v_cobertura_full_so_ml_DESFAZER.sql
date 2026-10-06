@@ -12,6 +12,8 @@
 --             depende da tabela temporária criada no começo, na MESMA transação.
 --             ANTES DE EXECUTAR: anotar a hora e o minuto (ponto de
 --             restauração; o projeto guarda 7 dias de histórico).
+--             NUNCA entre 04:00 e 06:30 (Brasília): janela dos coletores
+--             (ressalva S2 do auditor, 06/10/2026).
 --
 -- ATENÇÃO À ORDEM: sem a trava, linha da Shopee em fact_estoque_diario aparece
 -- na "Cobertura do Full" SEM VENDA. Se o tratamento da Shopee já gravou,
