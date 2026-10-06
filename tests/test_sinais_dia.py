@@ -68,15 +68,15 @@ def _ads(gasto_sem=0, gasto_base=0, gasto_ontem=0, gasto_recente=0, dias_com_gas
 
 
 class Janelas(unittest.TestCase):
-    def test_d1_e_d2_fora_e_semanas_inteiras_sem_sobrepor(self):
+    def test_janelas_terminam_em_d1_semanas_inteiras_sem_sobrepor(self):
         j = sd.janelas(HOJE)
-        self.assertEqual(j['fim'], date(2026, 10, 2))          # D-3
-        self.assertEqual(j['sem_ini'], date(2026, 9, 26))      # D-9
-        self.assertEqual(j['base_fim'], date(2026, 9, 25))     # D-10
-        self.assertEqual(j['base_ini'], date(2026, 8, 29))     # D-37
+        self.assertEqual(j['fim'], date(2026, 10, 4))          # D-1 (medido: D-1 não muda)
+        self.assertEqual(j['sem_ini'], date(2026, 9, 28))      # D-7
+        self.assertEqual(j['base_fim'], date(2026, 9, 27))     # D-8
+        self.assertEqual(j['base_ini'], date(2026, 8, 31))     # D-35
         self.assertEqual((j['base_fim'] - j['base_ini']).days + 1, 28)
-        self.assertEqual(j['ritmo_ini'], date(2026, 9, 26))
-        self.assertEqual(j['piso_ini'], date(2026, 9, 3))
+        self.assertEqual(j['ritmo_ini'], date(2026, 9, 28))
+        self.assertEqual(j['piso_ini'], date(2026, 9, 5))
         self.assertEqual(j['mesmo_dia'], [date(2026, 9, 27), date(2026, 9, 20),
                                           date(2026, 9, 13), date(2026, 9, 6)])
         self.assertTrue(all(d.weekday() == j['ontem'].weekday() for d in j['mesmo_dia']))
@@ -274,7 +274,7 @@ class VendasEOrdem(unittest.TestCase):
         s = sd.sinais_vendas(por_an, sd.janelas(HOJE))
         self.assertEqual(sorted(x['anuncio'] for x in s), ['MLB1', 'MLB2'])
         q = next(x for x in s if x['anuncio'] == 'MLB1')
-        self.assertIn('semana 26/09–02/10', q['numero'])
+        self.assertIn('semana 28/09–04/10', q['numero'])
         self.assertAlmostEqual(q['em_jogo'], 600)
 
     def test_ruptura_tira_a_queda_generica_do_mesmo_anuncio(self):
@@ -637,6 +637,50 @@ class _ConnConta:
 
 
 class V12(unittest.TestCase):
+    def test_ler_tudo_fecha_a_transacao_no_fim(self):
+        c = _ConnConta()
+        with mock.patch.object(sd, '_ler', return_value=[(False,)]):
+            sd.ler_tudo(c, HOJE, [LPT])
+        self.assertEqual(c.rollbacks, 1)                    # solta os locks de leitura
+
+    def test_memoria_por_lojas_do_usuario(self):
+        """Teste do auditor (06/10): a chave da memória são as lojas visíveis;
+        nenhum gestor recebe a leitura de outro perfil; incompleta não fica."""
+        chamadas = []
+
+        def falso(_engine, hoje, lojas):
+            chamadas.append(tuple(lojas))
+            return {'dados': {}, 'erros': {}, 'erros_bloco': {}, 'parciais': [],
+                    'sinais': [{'loja': l} for l in lojas], 'nomes': {},
+                    'lido_em': datetime.now(sd.BRT), 'segundos': 0}
+
+        sd._MEMORIA.clear()
+        try:
+            with mock.patch.object(sd, '_ler_pacote', side_effect=falso):
+                f = sd._memoria('pacote')
+                f.clear()
+                hoje = date(2026, 10, 6)
+                f(object(), hoje, (LPT, NALA, RJ, SP))
+                gestor = f(object(), hoje, (NALA,))
+                f(object(), hoje, (NALA,))                  # mesma loja: memória
+                outro = f(object(), hoje, (LPT,))
+            self.assertEqual(len(chamadas), 3)
+            self.assertEqual({x['loja'] for x in gestor['sinais']}, {NALA})
+            self.assertEqual({x['loja'] for x in outro['sinais']}, {LPT})
+
+            def incompleto(_engine, hoje, lojas):
+                r = falso(_engine, hoje, lojas)
+                r['erros'] = {'ads': 'x'}
+                return r
+            with mock.patch.object(sd, '_ler_pacote', side_effect=incompleto):
+                for _ in range(2):
+                    with self.assertRaises(sd._LeituraIncompleta):
+                        f(object(), hoje, (RJ,))
+            self.assertEqual(chamadas[-2:], [(RJ,), (RJ,)])  # releu: não ficou na memória
+        finally:
+            sd.limpar_memoria()
+            sd._MEMORIA.clear()
+
     def test_ler_so_desfaz_a_transacao_no_erro(self):
         c = _ConnConta()
         self.assertEqual(sd._ler(c, 'SELECT 1', {}), [(1,)])
@@ -677,8 +721,8 @@ class V12(unittest.TestCase):
         for x in s:
             self.assertTrue(x['periodo'], x['regra'])
         por = {x['regra']: x['periodo'] for x in s}
-        self.assertEqual(por['vendas_queda'], '26/09–02/10 × 29/08–25/09')
-        self.assertEqual(por['full_cobertura'], 'foto 04/10 · venda 26/09–02/10')
+        self.assertEqual(por['vendas_queda'], '28/09–04/10 × 31/08–27/09')
+        self.assertEqual(por['full_cobertura'], 'foto 04/10 · venda 28/09–04/10')
         self.assertEqual(por['full_envio'], 'foto 04/10')
         self.assertEqual(por['ads_config'], 'foto 04/10 → 05/10')
         self.assertEqual(por['ads_sem_venda'], '02/10–04/10')
@@ -692,6 +736,33 @@ class V12(unittest.TestCase):
             with mock.patch.object(permissoes, '_get_role', return_value=perfil):
                 sd._render_tempos(st, [('Total', 1.0)], {'segundos': 0.5}, False)
             self.assertEqual(st.expander.called, ve, perfil)
+
+
+class CargaPendente(unittest.TestCase):
+    def test_loja_sem_a_carga_de_hoje_fica_pendente(self):
+        linhas = [('Vendas', LPT, datetime(2026, 10, 5, 6, 4)),
+                  ('Vendas', NALA, datetime(2026, 10, 4, 6, 7)),
+                  ('Estoque', RJ, datetime(2026, 10, 4, 4, 0))]
+        self.assertEqual(sd.lojas_carga_pendente(linhas, [LPT, NALA, RJ], HOJE), {NALA})
+
+    def test_suspende_so_os_sinais_de_venda_da_loja_pendente(self):
+        sinais = [sd._sinal(NALA, 'VENDAS', 'MLB1', [], 'x', 's', 1, regra='vendas_queda'),
+                  sd._sinal(NALA, 'ADS', 'MLB1', [], 'x', 's', 1, regra='ads_sem_venda'),
+                  sd._sinal(NALA, 'EXP', 'MLB1', [], 'x', 's', 1, regra='exp_anuncio'),
+                  sd._sinal(LPT, 'VENDAS', 'MLB2', [], 'x', 's', 1, regra='vendas_queda')]
+        r = sd.suspender_venda_pendente(sinais, {NALA})
+        self.assertEqual([(x['loja'], x['regra']) for x in r],
+                         [(NALA, 'ads_sem_venda'), (NALA, 'exp_anuncio'), (LPT, 'vendas_queda')])
+
+    def test_resumo_mostra_carga_pendente_sem_comparar(self):
+        st = mock.MagicMock()
+        cols = [mock.MagicMock(), mock.MagicMock(), mock.MagicMock()]
+        st.columns.return_value = cols
+        r = sd.resumo_lojas([(NALA, 50, 16000, 12000)], [], [NALA], HOJE)[NALA]
+        sd._render_resumo(st, NALA, r, date(2026, 10, 4), pendente=True)
+        args, kw = cols[0].metric.call_args
+        self.assertEqual(args[1], 'carga pendente')
+        self.assertEqual(len(args), 2)                      # sem delta de comparação
 
 
 class ResumoTexto(unittest.TestCase):
@@ -804,6 +875,24 @@ class Excel(unittest.TestCase):
         self.assertIn('ilegível', res[3])
         self.assertEqual(itens, [])
 
+    def test_limites_do_arquivo(self):
+        with self.assertRaises(ValueError) as e:
+            sd.ler_excel(b'x' * (sd.EXCEL_MAX_BYTES + 1))
+        self.assertIn('limite', str(e.exception))
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Sinais'
+        ws.append(list(sd.COLUNAS_EXCEL))
+        with mock.patch.object(sd, 'EXCEL_MAX_LINHAS', 3):
+            for i in range(4):
+                ws.append([LPT, 'vendas_queda', f'MLB{i}'])
+            bio = io.BytesIO()
+            wb.save(bio)
+            with self.assertRaises(ValueError) as e:
+                sd.ler_excel(bio.getvalue())
+        self.assertIn('mais de 3 linhas', str(e.exception))
+
     def test_arquivo_sem_as_colunas(self):
         from openpyxl import Workbook
         wb = Workbook()
@@ -912,6 +1001,11 @@ class ComBanco(unittest.TestCase):
         return len(checks)
 
     def setUp(self):
+        # o cenário (datas) foi montado com as janelas da v1, que terminavam em
+        # D-3; a SQL não depende do deslocamento, então ele fica fixo aqui
+        p = mock.patch.object(sd, 'DIAS_ATRASO_API', 2)
+        p.start()
+        self.addCleanup(p.stop)
         c = self.cur = self.conn.cursor()
         for ddl in _DDL:
             c.execute(ddl)

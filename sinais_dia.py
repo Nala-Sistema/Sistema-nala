@@ -80,9 +80,9 @@ v1.2 (06/10/2026)
     carga; rollback só no erro; cada loja é um st.fragment (marcar uma caixa
     não recarrega as outras); quadro "⏱ tempos desta carga" só para ADMIN.
   - "Venda de ontem" e "Mês até ontem" sem selo "parcial" (dia fechado), com
-    "?" explicando o que ainda muda. A exclusão de D-1/D-2 nas comparações de
-    VENDAS fica até a v1.3 medir (pedido pago depois pode entrar com data de
-    ontem).
+    "?" explicando o que ainda muda. As janelas de VENDA terminam em D-1 (o
+    [MESTRE ANÁLISES] mediu: D-1 não muda depois); loja cuja carga de vendas
+    do dia ainda não entrou mostra "carga pendente" e não compara.
   - Coluna "Período" em cada sinal (janela analisada ou foto usada).
   - Excel de ida e volta: baixar os sinais com a chave e Status/Motivo/Nota/
     Até vazios; subir preenchido com PRÉVIA; grava só as linhas ok, numa
@@ -120,7 +120,12 @@ MARKETPLACE = 'MERCADO LIVRE'
 # LIMIARES (calibrar aqui)
 # ============================================================
 
-DIAS_ATRASO_API = 2              # D-1 e D-2 ainda recebem venda da API
+# Dias no fim das janelas que ficam FORA da comparação. Era 2 (v1, calibragem
+# de 05/10); medido pelo [MESTRE ANÁLISES] em 06/10 na ML-LPT: o D-1 não mudou
+# em 2 dias e o D-2 perdeu 1 de 111 pedidos (cancelamento) -> 0: as janelas
+# terminam em D-1. Loja cuja carga de vendas do dia ainda não entrou fica com
+# os sinais de venda suspensos ("carga pendente"), em vez de comparar.
+DIAS_ATRASO_API = 0
 SEMANAS_BASE = 4                 # base = média semanal das 4 semanas anteriores
 QUEDA_VENDA = 0.50               # semana < 50% da média semanal → queda
 ALTA_VENDA = 2.0                 # semana > 2× a média semanal → alta
@@ -160,6 +165,14 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'exp_anuncio': 'Experiência piorou', 'exp_familia': 'Experiência da família',
           'visitas_queda': 'Visitas caíram', 'visitas_alta': 'Visitas subiram'}
 
+# Regras que comparam janelas de VENDA: suspensas na loja com carga pendente.
+REGRAS_DE_VENDA = ('vendas_queda', 'vendas_alta', 'ads_espiral', 'full_ruptura', 'ads_custo',
+                   'full_cobertura', 'visitas_queda', 'visitas_alta')
+
+# Excel: limites do arquivo que sobe (auditor 06/10, R1)
+EXCEL_MAX_BYTES = 2 * 1024 * 1024
+EXCEL_MAX_LINHAS = 5000
+
 MAX_SINAIS_POR_LOJA = 10
 TTL_LEITURA_S = 600              # leitura do dia em memória por 10 min
 HORA_COLETA_COMPLETA = 10        # depois das 10h (Brasília) o dado do dia já devia ter chegado
@@ -175,10 +188,10 @@ BRT = timezone(timedelta(hours=-3))
 def janelas(hoje):
     """Todas as datas que a tela usa, a partir de HOJE (Brasília)."""
     ontem = hoje - timedelta(days=1)
-    fim = hoje - timedelta(days=DIAS_ATRASO_API + 1)                 # D-3
-    sem_ini = fim - timedelta(days=6)                                # D-9
-    base_fim = sem_ini - timedelta(days=1)                           # D-10
-    base_ini = base_fim - timedelta(days=7 * SEMANAS_BASE - 1)       # D-37
+    fim = hoje - timedelta(days=DIAS_ATRASO_API + 1)                 # D-1
+    sem_ini = fim - timedelta(days=6)                                # D-7
+    base_fim = sem_ini - timedelta(days=1)                           # D-8
+    base_ini = base_fim - timedelta(days=7 * SEMANAS_BASE - 1)       # D-35
     ritmo_ini = fim - timedelta(days=JANELA_RITMO_FULL - 1)
     piso_ini = fim - timedelta(days=JANELA_PISO_FULL - 1)
     mes_ini = ontem.replace(day=1)
@@ -495,6 +508,12 @@ def ler_tudo(conn, hoje, lojas):
             dados['visitas'] = None
     except Exception as e:  # noqa: BLE001
         erros['visitas'] = e
+    # Fecha a transação de leitura já aqui: sem isto ela segura AccessShareLock
+    # em ~10 tabelas até o close (auditor 06/10, R2). Uma ida e volta só.
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001
+        pass
     return dados, erros
 
 
@@ -1163,11 +1182,20 @@ def excel_sinais(sinais, nomes, hoje):
 
 
 def ler_excel(conteudo):
-    """[{coluna: valor, '_linha': n}] das linhas não vazias da aba Sinais."""
+    """[{coluna: valor, '_linha': n}] das linhas não vazias da aba Sinais.
+    Recusa arquivo acima de EXCEL_MAX_BYTES e lê no máximo EXCEL_MAX_LINHAS."""
+    if len(conteudo) > EXCEL_MAX_BYTES:
+        raise ValueError(f"arquivo de {len(conteudo) / 1024 / 1024:.1f} MB; o limite é "
+                         f"{EXCEL_MAX_BYTES // 1024 // 1024} MB (use o Excel baixado aqui).")
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
     ws = wb['Sinais'] if 'Sinais' in wb.sheetnames else wb.active
-    linhas = list(ws.iter_rows(values_only=True))
+    linhas = []
+    for r in ws.iter_rows(values_only=True):
+        linhas.append(r)
+        if len(linhas) > EXCEL_MAX_LINHAS + 1:
+            raise ValueError(f"mais de {EXCEL_MAX_LINHAS} linhas; suba no máximo "
+                             f"{EXCEL_MAX_LINHAS} (o Excel baixado aqui tem bem menos).")
     if not linhas:
         raise ValueError("Planilha vazia.")
     cab = [str(c).strip() if c is not None else '' for c in linhas[0]]
@@ -1312,6 +1340,24 @@ def resumo_lojas(linhas_resumo, metas, lojas, hoje):
     return out
 
 
+def lojas_carga_pendente(linhas_frescor, lojas, hoje):
+    """Lojas cuja carga de vendas de HOJE ainda não entrou (a última gravação
+    de venda é de antes de hoje): o D-1 delas pode estar incompleto. A
+    data_processamento é regravada a cada carga, então diz SE a carga do dia
+    rodou (não serve para medir quanto a venda atrasa). Loja sem venda nenhuma
+    nos últimos dias não conta como pendente."""
+    ult = {l: u for f, l, u in linhas_frescor if f == 'Vendas'}
+    return {l for l in lojas
+            if ult.get(l) is not None and pd.Timestamp(ult[l]).date() < hoje}
+
+
+def suspender_venda_pendente(sinais, pendentes):
+    """Tira os sinais que comparam janelas de venda das lojas com carga
+    pendente (voltam quando a carga entrar)."""
+    return [x for x in sinais
+            if not (x['loja'] in pendentes and x['regra'] in REGRAS_DE_VENDA)]
+
+
 def avaliar_frescor(linhas, lojas, agora):
     """[(nível, texto)] por loja: 'atrasado' quando a fonte não chegou hoje e já
     passou da HORA_COLETA_COMPLETA; 'cedo' antes disso. Fonte sem nenhum dado
@@ -1419,8 +1465,19 @@ AJUDA_DIA_FECHADO = ("Pode subir com pagamentos aprovados depois (boleto/Pix) e 
                      "com cancelamentos e devoluções.")
 
 
-def _render_resumo(st, loja, r, ontem):
+def _render_resumo(st, loja, r, ontem, pendente=False):
     c1, c2, c3 = st.columns(3)
+    if pendente:
+        c1.metric(f"Venda de ontem ({ontem:%d/%m})", "carga pendente",
+                  help="As vendas de hoje ainda não entraram nesta loja: o número de ontem "
+                       "pode estar incompleto e não é comparado.")
+        c2.metric("Mês até ontem", _brl(r['mes']), help=f"Pode faltar a carga de hoje. "
+                  f"{AJUDA_DIA_FECHADO}")
+        if r['meta']:
+            c3.metric("Meta do mês", _brl(r['meta']))
+        else:
+            c3.metric("Meta do mês", "não cadastrada", help="Cadastrar na aba Performance.")
+        return
     c1.metric(f"Venda de ontem ({ontem:%d/%m})", _brl(r['ontem']),
               None if r['var_ontem'] is None else _pct(r['var_ontem']) + " vs mesmo dia da semana",
               help=f"Dia fechado. {AJUDA_DIA_FECHADO} Comparada com a média dos "
@@ -1586,6 +1643,8 @@ def _render_mercado_livre(st, engine):
         erro_ciente = True
         erros = {**erros, 'ciente': 'erro'}
     tempos.append(('Cientes (relidos a cada carga)', time.perf_counter() - t))
+    pendentes = lojas_carga_pendente(dados.get('frescor') or [], lojas, hoje)
+    sinais = suspender_venda_pendente(sinais, pendentes)
     ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
                                  sinais, cientes_linhas or [], hoje)
 
@@ -1594,8 +1653,8 @@ def _render_mercado_livre(st, engine):
     c_txt.caption(
         f"Dado de {j['ontem']:%d/%m} (ontem, dia fechado). Os sinais de venda comparam a "
         f"semana {j['sem_ini']:%d/%m}–{j['fim']:%d/%m} com a média semanal de "
-        f"{j['base_ini']:%d/%m}–{j['base_fim']:%d/%m}: D-1 e D-2 ficam fora porque pedido "
-        "pago depois (boleto/Pix) ainda pode entrar com a data deles. "
+        f"{j['base_ini']:%d/%m}–{j['base_fim']:%d/%m}. Loja cuja carga de vendas de hoje "
+        "ainda não entrou fica com os sinais de venda suspensos (\"carga pendente\"). "
         f"Leitura de {pacote['lido_em']:%H:%M}.")
     if c_bt.button("🔄 Atualizar dados", key="sin_atualizar"):
         limpar_memoria()
@@ -1622,7 +1681,7 @@ def _render_mercado_livre(st, engine):
                 'parciais': parciais, 'erros': erros, 'resumo': resumo, 'nomes': nomes,
                 'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
                 'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
-                'lido_em': pacote['lido_em']}
+                'lido_em': pacote['lido_em'], 'pendentes': pendentes}
 
     try:
         _render_excel(st, ativos, silenciados, nomes, base_ctx)
@@ -1819,11 +1878,16 @@ def _render_loja(st, loja, ativos, ctx):
             st.warning(f"⚠️ Foto do estoque possivelmente PARCIAL: {n_ult} estoques em "
                        f"{pd.Timestamp(ult):%d/%m} contra {n_ant} em {pd.Timestamp(ant):%d/%m}.")
 
+    pendente = loja in ctx.get('pendentes', ())
+    if pendente:
+        st.warning(f"⏳ Carga pendente: as vendas de hoje ainda não entraram nesta loja. "
+                   f"A venda de {j['ontem']:%d/%m} pode estar incompleta; os sinais de venda "
+                   "ficam suspensos até a carga entrar (clique em \"Atualizar dados\").")
     if 'resumo' in erros:
         st.error("Resumo indisponível agora.")
     else:
         try:
-            _render_resumo(st, loja, resumo[loja], j['ontem'])
+            _render_resumo(st, loja, resumo[loja], j['ontem'], pendente)
         except Exception:  # noqa: BLE001
             st.error("Resumo indisponível agora.")
 
