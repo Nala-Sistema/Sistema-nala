@@ -21,7 +21,9 @@ SHOPEE (decisões do Mestre B1–B3, 06/10/2026)
   - Galpão: é o MESMO galpão físico (UpSeller) nos dois. Vale o do ML; a
     Shopee só AVISA quando publica diferente (mesma regra de ruído). Quando o
     ML não tem anúncio da própria peça, usa-se o galpão da Shopee, marcado
-    "pela Shopee" (vem antes do piso pelo kit, que é estimativa). Galpão de
+    "pela Shopee" (vem antes do piso pelo kit, que é estimativa); com
+    anúncios Shopee publicando números diferentes, usa-se o MAIOR e avisa,
+    como entre as lojas do ML (ressalva R1 do auditor à parte (b)). Galpão de
     anúncio de KIT da Shopee é ignorado (vem dividido).
   - Regra do Full (Thiago, 06/10/2026, ML e Shopee iguais): Full zerado ainda
     vende pelo galpão, mas MUITO menos — é urgente; Full + galpão zerados =
@@ -561,7 +563,11 @@ def montar(estoque, vendas, composicao, kits_pendentes=(), mapa=None,
                 galpao_shopee_diverge = shopee
                 divergentes_shopee.append((peca, galpao, shopee))
         elif shopee is not None:
+            # O maior, como entre as lojas do ML (o UpSeller pode publicar com
+            # limite num anúncio/loja), e avisa quando os anúncios divergem.
             galpao, galpao_tipo = shopee, 'shopee'
+            if _diverge(list(reg['galpao_shopee'])):
+                divergentes.append(peca)
         elif peca in piso:
             galpao, galpao_tipo = piso[peca], 'piso'
         else:
@@ -666,7 +672,8 @@ def texto_galpao(linha):
             texto += f' ⚠ Shopee publica {_int(shopee)}'
         return texto
     if linha['galpao_tipo'] == 'shopee':
-        return f"{_int(linha['galpao'])} (pela Shopee)"
+        return f"{_int(linha['galpao'])} (pela Shopee)" + (
+            ' ⚠ publicado diferente entre lojas' if linha['galpao_diverge'] else '')
     if linha['galpao_tipo'] == 'piso':
         return f"desconhecido (≥ {_int(linha['galpao'])} pelo kit, estimativa)"
     return 'desconhecido'

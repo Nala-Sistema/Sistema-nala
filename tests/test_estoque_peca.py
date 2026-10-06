@@ -378,6 +378,22 @@ class FullDaShopee(unittest.TestCase):
         self.assertFalse(l['cobertura_minima'])
         self.assertEqual(ep.texto_galpao(l), '80 (pela Shopee)')
 
+    def test_galpao_pela_shopee_divergente_entre_anuncios_usa_o_maior_e_avisa(self):
+        # ressalva R1 do auditor: como entre as lojas do ML
+        pecas, _, avisos = self._montar([], [(SHP_LPT, '1:0', 'L-0500', D, 0, 0, 80),
+                                             (SHP_NALA, '2:0', 'L-0500', D, 0, 0, 20)])
+        l = _linha(pecas, 'L-0500')
+        self.assertEqual((l['galpao'], l['galpao_tipo'], l['galpao_diverge']),
+                         (80, 'shopee', True))
+        self.assertEqual(avisos['galpao_divergente'], ['L-0500'])
+        self.assertEqual(ep.texto_galpao(l), '80 (pela Shopee) ⚠ publicado diferente entre lojas')
+
+    def test_galpao_pela_shopee_igual_entre_anuncios_nao_avisa(self):
+        pecas, _, avisos = self._montar([], [(SHP_LPT, '1:0', 'L-0500', D, 0, 0, 80),
+                                             (SHP_NALA, '2:0', 'L-0500', D, 0, 0, 80)])
+        self.assertFalse(_linha(pecas, 'L-0500')['galpao_diverge'])
+        self.assertEqual(avisos['galpao_divergente'], [])
+
     def test_galpao_pela_shopee_vence_o_piso_pelo_kit(self):
         pecas, _, _ = self._montar([(LPT, 'e1', 'K3-L-0330', D, 0, 0, 438)],
                                    [(SHP_LPT, '1:0', 'L-0330', D, 0, 0, 1300)])
