@@ -17,6 +17,11 @@ Duas partes:
     rollback só no erro e em memória só quando completa, quadro de tempos só
     para ADMIN, Excel de ida e volta (gera, lê, prévia com cada recusa,
     grava pela mesma gravar_cientes; DIRETOR baixa e não sobe).
+  - Aba Shopee: anúncio pela ponte do espelho (números do snapshot), Litstore
+    por SKU, ROAS 0 = automático, custo por PEDIDO × margem por PEDIDO,
+    espiral só com estoque no banco, views de página D × D-30 em data exata,
+    nota só das avaliações novas, carga pendente só para loja de API; com
+    banco, o cenário Shopee inteiro pelas SQL.
   - Com banco (NALA_TEST_DB_URL, usuário de permissão mínima): EXECUTA as SQL
     de verdade em tabelas TEMPORÁRIAS com os nomes das reais, com as CHECK
     COPIADAS da tabela real (lição de 05/10: a TEMP sem CHECK aceitava o que
@@ -42,6 +47,7 @@ import sinais_dia as sd  # noqa: E402
 DB_URL = os.environ.get('NALA_TEST_DB_URL')
 HOJE = date(2026, 10, 5)
 LPT, NALA, RJ, SP = 'ML-LPT', 'ML-Nala', 'ML-YanniRJ', 'ML-YanniSP'
+S_LPT, S_NALA, S_YANNI = 'Shopee-LPT', 'Shopee Lithouse(Nala)', 'Shopee Litstore(Yanni)'
 
 
 def _colunas(n):
@@ -280,7 +286,9 @@ class VendasEOrdem(unittest.TestCase):
     def test_ruptura_tira_a_queda_generica_do_mesmo_anuncio(self):
         dados = {'vendas': [_vend(NALA, 'MLB7', 'LTT-CT3821', rec_sem=150, rec_base=3200)],
                  'ads': [(NALA, 'MLB7', 10, 300, 0, 0, 0, 0, 0, 0, 0)],
-                 'estoque_semana': [], 'ponte': [], 'foto': [], 'config': []}
+                 'estoque_semana': [], 'ponte': [], 'config': [],
+                 # a loja tem estoque no banco (outro anúncio); o MLB7 não teve na semana
+                 'foto': [(NALA, 'OUTRO', date(2026, 10, 4), 5, 0, 0)]}
         s, erros = sd.montar_sinais(dados, HOJE)
         self.assertEqual(erros, {})
         self.assertEqual([(x['tipo'], x['numero'].split(':')[0]) for x in s], [('FULL', 'Ruptura')])
@@ -648,7 +656,7 @@ class V12(unittest.TestCase):
         nenhum gestor recebe a leitura de outro perfil; incompleta não fica."""
         chamadas = []
 
-        def falso(_engine, hoje, lojas):
+        def falso(_engine, hoje, lojas, mkt=sd.MARKETPLACE):
             chamadas.append(tuple(lojas))
             return {'dados': {}, 'erros': {}, 'erros_bloco': {}, 'parciais': [],
                     'sinais': [{'loja': l} for l in lojas], 'nomes': {},
@@ -664,11 +672,12 @@ class V12(unittest.TestCase):
                 gestor = f(object(), hoje, (NALA,))
                 f(object(), hoje, (NALA,))                  # mesma loja: memória
                 outro = f(object(), hoje, (LPT,))
-            self.assertEqual(len(chamadas), 3)
+                f(object(), hoje, (LPT,), sd.SHOPEE)        # outra aba: outra chave
+            self.assertEqual(len(chamadas), 4)
             self.assertEqual({x['loja'] for x in gestor['sinais']}, {NALA})
             self.assertEqual({x['loja'] for x in outro['sinais']}, {LPT})
 
-            def incompleto(_engine, hoje, lojas):
+            def incompleto(_engine, hoje, lojas, mkt=sd.MARKETPLACE):
                 r = falso(_engine, hoje, lojas)
                 r['erros'] = {'ads': 'x'}
                 return r
@@ -736,6 +745,116 @@ class V12(unittest.TestCase):
             with mock.patch.object(permissoes, '_get_role', return_value=perfil):
                 sd._render_tempos(st, [('Total', 1.0)], {'segundos': 0.5}, False)
             self.assertEqual(st.expander.called, ve, perfil)
+
+
+class Shopee(unittest.TestCase):
+    def test_fontes_da_shopee(self):
+        f = sd.fontes(sd.SHOPEE)
+        self.assertIs(f['vendas'], sd.SQL_VENDAS_ANUNCIO_SHOPEE)
+        self.assertNotIn('experiencia', f)
+        self.assertIs(sd.fontes(sd.MARKETPLACE)['vendas'], sd.SQL_VENDAS_ANUNCIO)
+        self.assertEqual(sd.params(HOJE, [S_LPT], sd.SHOPEE)['marketplace'], 'SHOPEE')
+
+    def test_roas_zero_e_automatico_so_na_shopee(self):
+        self.assertEqual(sd._roas(0, sd.SHOPEE), 'automático')
+        self.assertEqual(sd._roas(0, sd.MARKETPLACE), '0,0')
+        self.assertEqual(sd._roas(9.8, sd.SHOPEE), '9,8')
+
+    def test_nota_so_das_avaliacoes_novas(self):
+        nota, novas = sd.nota_das_novas(4.5, 20, 4.8, 10)
+        self.assertAlmostEqual(nota, 4.2)
+        self.assertEqual(novas, 10)
+        self.assertEqual(sd.nota_das_novas(4.8, 10, 4.8, 10), (None, 0))
+        self.assertEqual(sd.nota_das_novas(None, 10, 4.8, 10), (None, 0))
+
+    def _views(self, linha, rec_base=4000):
+        por_an, _ = sd.agregar_vendas([_vend(S_LPT, '2249', 'A', rec_base=rec_base, rec_30=900,
+                                             qtd_30=10) + (9,)])
+        return sd.sinais_views_shopee([linha], por_an, sd.janelas(HOJE))
+
+    def test_views_d_contra_d30_exato(self):
+        s = self._views((S_LPT, '2249', date(2026, 10, 4), 100, 4.8, 10, 400, 4.8, 10))
+        self.assertEqual([x['regra'] for x in s], ['visitas_queda'])
+        self.assertIn('Visualizações de página (30d)', s[0]['numero'])
+        self.assertIn('pedidos por visualização', s[0]['numero'])
+        self.assertNotIn('visita', s[0]['numero'].lower().replace('visualiza', ''))
+        # sem a foto de D-30 (ref None): não acende
+        self.assertEqual(self._views((S_LPT, '2249', date(2026, 10, 4), 100, 4.8, 10,
+                                      None, None, None)), [])
+        self.assertEqual(self._views((S_LPT, '2249', date(2026, 10, 4), 900, 4.8, 10,
+                                      400, 4.8, 10))[0]['regra'], 'visitas_alta')
+
+    def test_nota_precisa_de_3_novas_e_queda_de_meio_ponto(self):
+        poucas = self._views((S_LPT, '2249', date(2026, 10, 4), 400, 4.0, 12, 400, 4.8, 10))
+        self.assertEqual(poucas, [])                         # 2 avaliações novas
+        pouca_queda = self._views((S_LPT, '2249', date(2026, 10, 4), 400, 4.75, 20, 400, 4.8, 10))
+        self.assertEqual(pouca_queda, [])                    # novas 4,7: só 0,1 abaixo
+        caiu = self._views((S_LPT, '2249', date(2026, 10, 4), 400, 4.5, 20, 400, 4.8, 10))
+        self.assertEqual(caiu[0]['regra'], 'exp_anuncio')
+        self.assertIn('10 avaliações novas', caiu[0]['numero'])
+
+    def test_custo_por_pedido_na_shopee_aceita_varios_skus(self):
+        vendas = [_vend(S_LPT, '2249', 'A', qtd_30=5, margem_30=20) + (5,),
+                  _vend(S_LPT, '2249', 'B', qtd_30=5, margem_30=20) + (5,)]   # R$ 4/pedido
+        ads = {(S_LPT, '2249'): _ads(gasto_30=80, unid_ads_30=8, cliques_30=100)}  # R$ 10/pedido
+        por_an, _ = sd.agregar_vendas(vendas)
+        s = sd.sinais_ads(ads, [], por_an, {}, sd.janelas(HOJE), mkt=sd.SHOPEE)
+        self.assertEqual(len(s), 1)
+        self.assertIn('Custo por PEDIDO de ads R$ 10,00', s[0]['numero'])
+        self.assertIn('margem por PEDIDO R$ 4,00', s[0]['numero'])
+        self.assertIn('pedidos de ads, não unidades', s[0]['numero'])
+        # o mesmo cenário no ML (por unidade, SKU único): não julga
+        self.assertEqual(sd.sinais_ads(ads, [], por_an, {}, sd.janelas(HOJE)), [])
+
+    def test_sem_estoque_no_banco_espiral_nao_e_julgada(self):
+        vendas = [_vend(S_LPT, '2249', 'A', rec_sem=100, rec_base=4000)]
+        ads = {(S_LPT, '2249'): _ads(gasto_sem=5, gasto_base=400)}
+        por_an, _ = sd.agregar_vendas(vendas)
+        s = sd.sinais_ads(ads, [], por_an, {}, sd.janelas(HOJE), mkt=sd.SHOPEE,
+                          lojas_com_estoque=set())
+        self.assertEqual(s, [])                              # nem espiral, nem "ruptura"
+
+    def test_config_da_shopee_usa_o_item_id_do_detalhe(self):
+        config = [(S_LPT, '106156986', 'Kit Escova', date(2026, 10, 4), HOJE, 5, 0, 10, 10,
+                   '2249')]
+        s = sd.sinais_ads({}, config, {}, {}, sd.janelas(HOJE), mkt=sd.SHOPEE)
+        self.assertEqual((s[0]['anuncio'], s[0]['objeto']), ('2249', '2249@2026-10-05'))
+        self.assertIn('5,0 → automático', s[0]['numero'])
+
+    def test_litstore_por_sku(self):
+        x = sd._sinal(S_YANNI, 'VENDAS', 'SKU:L-0500', ['L-0500'], 'Queda', 's', 1,
+                      regra='vendas_queda')
+        self.assertEqual(x['objeto'], 'SKU:L-0500')
+        self.assertEqual(list(sd.tabela_sinais([x], {})['Anúncio']), ['(por SKU)'])
+
+    def test_carga_pendente_ignora_loja_de_upload(self):
+        linhas = [('Vendas', S_LPT, datetime(2026, 10, 4, 7, 0)), ('Vendas', S_YANNI, None)]
+        self.assertEqual(sd.lojas_carga_pendente(linhas, [S_LPT, S_YANNI], HOJE), {S_LPT})
+
+    def test_aba_shopee_mostra_em_construcao_e_o_aviso_de_pedido(self):
+        import permissoes
+        dados = {'vendas': [_vend(S_LPT, '2249', 'A', rec_sem=0, rec_base=4000)],
+                 'resumo': [], 'metas': [], 'frescor': [], 'visitas': None, 'foto': []}
+        st = mock.MagicMock()
+        st.columns.side_effect = _colunas
+        st.file_uploader.return_value = None
+        with mock.patch.object(sd, 'restricao_de_lojas', return_value=None), \
+             mock.patch.object(sd, '_ler', return_value=[(S_LPT,)]), \
+             mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})) as lt, \
+             mock.patch.object(sd, 'ler_cientes', return_value=[]) as lc, \
+             mock.patch.object(sd.ep, 'ler_contagens') as contagens, \
+             mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
+             mock.patch.object(permissoes, '_get_role', return_value='GESTOR'):
+            sd._render_marketplace(st, mock.MagicMock(), sd.SHOPEE)
+        self.assertEqual(lt.call_args.args[3], sd.SHOPEE)
+        self.assertEqual(lc.call_args.args[2], sd.SHOPEE)
+        contagens.assert_not_called()                        # fotos parciais: só ML
+        infos = ' '.join(str(c.args[0]) for c in st.info.call_args_list)
+        self.assertIn('Estoque/Full da Shopee: em construção', infos)
+        self.assertIn('Visualizações de página (30d) e nota da Shopee: em construção', infos)
+        caps = ' '.join(str(c.args[0]) for c in st.caption.call_args_list)
+        self.assertIn('ads informa PEDIDOS, não unidades', caps)
+        self.assertEqual(st.subheader.call_args.args[0], S_LPT)
 
 
 class CargaPendente(unittest.TestCase):
@@ -937,7 +1056,12 @@ _DDL = [
         data_importacao timestamp)""",
     """CREATE TEMP TABLE fact_ads_campanha_config (
         marketplace varchar, loja varchar, campanha varchar, data_captura timestamp,
-        roas_objetivo numeric, orcamento_diario numeric, id_campanha varchar)""",
+        roas_objetivo numeric, orcamento_diario numeric, id_campanha varchar,
+        detalhe jsonb)""",
+    """CREATE TEMP TABLE fact_pedidos_itens_marketplace (
+        marketplace varchar, loja varchar, numero_pedido varchar, sku varchar,
+        id_anuncio_plataforma varchar, id_variacao varchar, quantidade integer,
+        PRIMARY KEY (marketplace, loja, numero_pedido, sku))""",
     """CREATE TEMP TABLE fact_saude_anuncio (
         marketplace varchar, loja varchar, codigo_anuncio varchar, data date,
         tipo_sinal varchar, valor numeric, texto varchar, data_importacao timestamp)""",
@@ -949,7 +1073,8 @@ _DDL = [
 ]
 TABELAS = ['fact_vendas_snapshot', 'dim_metas_loja', 'dim_estoque_anuncio',
            'fact_estoque_diario', 'fact_ads_performance', 'fact_ads_campanha_config',
-           'fact_saude_anuncio', 'dim_kit_composicao', 'dim_sku_mapeamento', 'dim_lojas']
+           'fact_saude_anuncio', 'dim_kit_composicao', 'dim_sku_mapeamento', 'dim_lojas',
+           'fact_pedidos_itens_marketplace']
 
 
 class _Conexao:
@@ -1015,6 +1140,10 @@ class ComBanco(unittest.TestCase):
             SELECT NULL::varchar AS marketplace, NULL::varchar AS loja,
                    NULL::varchar AS codigo_anuncio, NULL::date AS data,
                    NULL::integer AS visitas WHERE false""")
+        c.execute("""CREATE TEMP TABLE vw_views_shopee_30d (
+            marketplace varchar, loja varchar, codigo_anuncio varchar, data date,
+            views_30d integer, rating_star numeric, comment_count integer,
+            data_importacao timestamp)""")
         for ddl in _ddl_ciente_em_temp():
             c.execute(ddl)
         copiadas = {t: self._copiar_checks(t) for t in TABELAS}
@@ -1023,10 +1152,11 @@ class ComBanco(unittest.TestCase):
         self.assertGreaterEqual(copiadas['fact_vendas_snapshot'], 1)
         self.assertGreaterEqual(copiadas['dim_kit_composicao'], 3)
         self.assertGreaterEqual(copiadas['fact_ads_performance'], 1)
+        self.assertGreaterEqual(copiadas['fact_pedidos_itens_marketplace'], 1)
         c.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(%s) AS t(nome) JOIN pg_class c ON c.oid = t.nome::regclass
-        """, (TABELAS + ['vw_visitas_dia', 'sinal_ciente'],))
+        """, (TABELAS + ['vw_visitas_dia', 'sinal_ciente', 'vw_views_shopee_30d'],))
         self.assertTrue(c.fetchone()[0], 'tabela não resolveu para pg_temp')
         self._popular()
         self.c = _Conexao(self.conn)
@@ -1115,6 +1245,58 @@ class ComBanco(unittest.TestCase):
         fres = {(f, l) for f, l, _u in dados['frescor']}
         self.assertIn(('Estoque', LPT), fres)
         self.assertIn(('Experiência', LPT), fres)
+
+    def _popular_shopee(self):
+        c, SH = self.cur, 'SHOPEE'
+        vendas = [(SH, S_LPT, f'S{i}', date(2026, 9, 10), 'L-0320', 'L-0320', 1, 200, 5)
+                  for i in range(10)]                       # base: R$ 2.000
+        vendas.append((SH, S_LPT, 'S99', date(2026, 9, 27), 'L-0320', 'L-0320', 1, 100, 5))
+        c.executemany("INSERT INTO fact_vendas_snapshot VALUES "
+                      "(%s,%s,%s,%s,%s,%s,%s,%s,%s,'2026-10-05 06:04','API')", vendas)
+        c.executemany("INSERT INTO fact_pedidos_itens_marketplace VALUES "
+                      "(%s,%s,%s,%s,'2249','0',1)",
+                      [(SH, S_LPT, v[2], 'L-0320') for v in vendas])
+        c.executemany("INSERT INTO fact_vendas_snapshot VALUES "
+                      "(%s,%s,%s,%s,%s,%s,%s,%s,%s,'2026-09-20 10:00','upload Yanni.xlsx')",
+                      [(SH, S_YANNI, f'Y{i}', date(2026, 9, 12), 'L-0500', 'L-0500', 1, 200, 5)
+                       for i in range(12)])
+        c.execute("INSERT INTO fact_ads_performance VALUES "
+                  "('2026-09-20', %s, %s, '2249', 50, 5, 100, '106156986', '2026-10-05 05:32')",
+                  (SH, S_LPT))
+        c.executemany("INSERT INTO fact_ads_campanha_config VALUES (%s,%s,'Kit Escova',%s,%s,10,"
+                      "'106156986', '{\"item_id\": \"2249\"}')", [
+                          (SH, S_LPT, datetime(2026, 10, 4, 5, 32), 5),
+                          (SH, S_LPT, datetime(2026, 10, 5, 5, 32), 0)])
+        c.executemany("INSERT INTO vw_views_shopee_30d VALUES (%s,%s,'2249',%s,%s,%s,%s,%s)", [
+            (SH, S_LPT, date(2026, 10, 4), 100, 4.5, 20, datetime(2026, 10, 5, 4, 30)),
+            (SH, S_LPT, date(2026, 9, 4), 400, 4.8, 10, datetime(2026, 9, 5, 4, 30))])
+
+    def test_shopee_ponta_a_ponta_pelas_sql(self):
+        self._popular_shopee()
+        lojas = [S_LPT, S_YANNI]
+        dados, erros = sd.ler_tudo(self.c, HOJE, lojas, sd.SHOPEE)
+        self.assertEqual(erros, {})
+        self.assertNotIn('experiencia', dados)               # só do ML
+        anuncios = {(r[0], r[1]) for r in dados['vendas']}
+        self.assertEqual(anuncios, {(S_LPT, '2249'), (S_YANNI, 'SKU:L-0500')})
+        s, erros_bloco = sd.montar_sinais(dados, HOJE, sd.SHOPEE)
+        self.assertEqual(erros_bloco, {})
+        por = {(x['loja'], x['regra']): x for x in s}
+        self.assertEqual(por[(S_LPT, 'vendas_queda')]['anuncio'], '2249')
+        self.assertEqual(por[(S_YANNI, 'vendas_queda')]['objeto'], 'SKU:L-0500')
+        cfg = por[(S_LPT, 'ads_config')]
+        self.assertIn('ROAS objetivo 5,0 → automático', cfg['numero'])
+        self.assertEqual(cfg['objeto'], '2249@2026-10-05')
+        custo = por[(S_LPT, 'ads_custo')]['numero']
+        self.assertIn('Custo por PEDIDO de ads R$ 20,00', custo)   # 100 ÷ 5 pedidos
+        self.assertIn('margem por PEDIDO R$ 5,00', custo)          # 55 ÷ 11 pedidos
+        views = por[(S_LPT, 'visitas_queda')]
+        self.assertIn('Visualizações de página (30d) 100 × 400', views['numero'])
+        self.assertEqual(views['periodo'], '05/09–04/10 × 06/08–04/09')
+        nota = por[(S_LPT, 'exp_anuncio')]
+        self.assertAlmostEqual(nota['medida'], 4.2)                # (90 − 48) ÷ 10 novas
+        self.assertFalse([x for x in s if x['regra'] in ('ads_espiral', 'full_ruptura')])
+        self.assertEqual(sd.lojas_carga_pendente(dados['frescor'], lojas, HOJE), set())
 
     def test_lojas_ml_e_restricao_pela_sql(self):
         lojas = [r[0] for r in sd._ler(self.c, sd.SQL_LOJAS_ML, {'marketplace': sd.MARKETPLACE})]
