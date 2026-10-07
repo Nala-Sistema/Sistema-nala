@@ -27,6 +27,12 @@ Duas partes:
     ligado), L-0321 (Shopee LPT, Full 29, galpão 2.328), K-L-0421-A (Shopee
     LPT, Full 0, galpão 364) e um caso ML com Full 0 e galpão > 0; upload
     atrasado da Litstore (R2); nota inválida com rating 0 (R3).
+  - v1.3 "Aparece desde": a conta da sequência (dia sem execução do job não
+    quebra; "🆕 hoje"), a montagem única da tela e do job, o job do repo
+    público (só contagens na saída, erro só com o tipo, nada antes das 10h,
+    backfill), a gravação com upsert numa TEMP criada com o DDL LIDO de
+    sql/sinais_historico.sql, e o teto de data das leituras de "última foto"
+    (o backfill de um dia passado lê a foto e a config daquele dia).
   - Com banco (NALA_TEST_DB_URL, usuário de permissão mínima): EXECUTA as SQL
     de verdade em tabelas TEMPORÁRIAS com os nomes das reais, com as CHECK
     COPIADAS da tabela real (lição de 05/10: a TEMP sem CHECK aceitava o que
@@ -422,9 +428,11 @@ class Sql(unittest.TestCase):
 
     def test_todo_parametro_da_sql_existe(self):
         p = sd.params(HOJE, [LPT])
-        escrita = (sd.SQL_FECHAR_ABERTO, sd.SQL_INSERIR_CIENTE, sd.SQL_REATIVAR)
+        escrita = (sd.SQL_FECHAR_ABERTO, sd.SQL_INSERIR_CIENTE, sd.SQL_REATIVAR,
+                   sd.SQL_GRAVAR_HISTORICO)
         p_escrita = {'marketplace', 'loja', 'regra', 'objeto', 'motivo', 'nota',
-                     'silenciar_ate', 'medida', 'texto', 'usuario', 'id', 'lojas'}
+                     'silenciar_ate', 'medida', 'texto', 'usuario', 'id', 'lojas',
+                     'data', 'em_jogo'}
         for sql in sd.TODAS_AS_SQL:
             for nome in re.findall(r'%\((\w+)\)s', sql):
                 self.assertIn(nome, p_escrita if sql in escrita else p, nome)
@@ -443,6 +451,18 @@ def _ddl_ciente_em_temp():
     tabela = re.findall(r'^CREATE TABLE public\.sinal_ciente \(.*?^\);', texto, re.S | re.M)
     indice = re.findall(r'^CREATE UNIQUE INDEX .*?;$', texto, re.M)
     assert len(tabela) == 1 and len(indice) == 1, 'DDL de sql/sinais_ciente.sql mudou'
+    return [x.replace('public.', 'pg_temp.') for x in tabela + indice]
+
+
+SQL_HISTORICO_ARQ = os.path.join(RAIZ, 'sql', 'sinais_historico.sql')
+
+
+def _ddl_historico_em_temp():
+    with open(SQL_HISTORICO_ARQ, encoding='utf-8') as f:
+        texto = f.read()
+    tabela = re.findall(r'^CREATE TABLE public\.sinal_historico \(.*?^\);', texto, re.S | re.M)
+    indice = re.findall(r'^CREATE INDEX ix_sinal_historico.*?;$', texto, re.M)
+    assert len(tabela) == 1 and len(indice) == 1, 'DDL de sql/sinais_historico.sql mudou'
     return [x.replace('public.', 'pg_temp.') for x in tabela + indice]
 
 
@@ -1076,6 +1096,175 @@ class UploadAtrasado(unittest.TestCase):
         self.assertEqual(sd.suspender_venda_pendente([x], {S_YANNI: 'upload:03/10'}), [])
 
 
+class ApareceDesde(unittest.TestCase):
+    def _s(self, loja=LPT, regra='vendas_queda', objeto='MLB1'):
+        return sd._sinal(loja, 'VENDAS', objeto, [], 'x', 's', 1, regra=regra, objeto=objeto)
+
+    def _desde(self, historico, dias_job, hoje=date(2026, 10, 6), sinal=None):
+        return sd.aparece_desde([sinal or self._s()], historico, dias_job, hoje)[0]
+
+    def test_novo_hoje(self):
+        x = self._desde([(date(2026, 10, 5), LPT, 'vendas_queda', 'MLB9')], [date(2026, 10, 5)])
+        self.assertEqual((x['desde'], x['desde_txt']), (date(2026, 10, 6), '🆕 hoje'))
+
+    def test_sequencia_ate_ontem(self):
+        k = (LPT, 'vendas_queda', 'MLB1')
+        hist = [(date(2026, 10, 4),) + k, (date(2026, 10, 5),) + k]
+        x = self._desde(hist, [date(2026, 10, 3), date(2026, 10, 4), date(2026, 10, 5)])
+        self.assertEqual(x['desde'], date(2026, 10, 4))
+        self.assertEqual(x['desde_txt'], 'há 2 dias (desde 04/10)')
+
+    def test_dia_sem_execucao_do_job_nao_quebra(self):
+        k = (LPT, 'vendas_queda', 'MLB1')
+        hist = [(date(2026, 10, 3),) + k, (date(2026, 10, 5),) + k]
+        x = self._desde(hist, [date(2026, 10, 3), date(2026, 10, 5)])   # 04/10 sem job
+        self.assertEqual(x['desde'], date(2026, 10, 3))
+
+    def test_dia_com_job_e_sem_o_sinal_quebra(self):
+        k = (LPT, 'vendas_queda', 'MLB1')
+        hist = [(date(2026, 10, 3),) + k, (date(2026, 10, 5),) + k,
+                (date(2026, 10, 4), LPT, 'vendas_queda', 'OUTRO')]
+        x = self._desde(hist, [date(2026, 10, 3), date(2026, 10, 4), date(2026, 10, 5)])
+        self.assertEqual(x['desde'], date(2026, 10, 5))
+
+    def test_a_chave_e_regra_loja_e_objeto(self):
+        hist = [(date(2026, 10, 5), NALA, 'vendas_queda', 'MLB1'),   # outra loja
+                (date(2026, 10, 5), LPT, 'vendas_alta', 'MLB1')]     # outra regra
+        x = self._desde(hist, [date(2026, 10, 5)])
+        self.assertEqual(x['desde_txt'], '🆕 hoje')
+
+    def test_coluna_na_tabela_e_no_excel(self):
+        x = sd.aparece_desde([self._s()], [], [], date(2026, 10, 6))
+        self.assertEqual(list(sd.tabela_sinais(x, {})['Aparece desde']), ['🆕 hoje'])
+        self.assertEqual(list(sd.tabela_sinais([self._s()], {})['Aparece desde']), ['—'])
+        from openpyxl import load_workbook
+        ws = load_workbook(io.BytesIO(sd.excel_sinais(x, {}, HOJE)))['Sinais']
+        cab = [c.value for c in ws[1]]
+        self.assertEqual(ws.cell(row=2, column=cab.index('Aparece desde') + 1).value, '🆕 hoje')
+
+
+class MontagemUnicaEJob(unittest.TestCase):
+    def test_tela_e_job_usam_a_mesma_suspensao(self):
+        pacote = {'dados': {'frescor': [('Vendas', NALA, datetime(2026, 10, 4, 6, 7))]},
+                  'sinais': [sd._sinal(NALA, 'VENDAS', 'MLB1', [], 'x', 's', 1,
+                                       regra='vendas_queda'),
+                             sd._sinal(NALA, 'ADS', 'MLB1', [], 'x', 's', 1,
+                                       regra='ads_sem_venda')],
+                  'upload_ate': {}}
+        sinais, pendentes, _u = sd.sinais_da_loja_hoje(pacote, [NALA], HOJE)
+        self.assertEqual(pendentes, {NALA: 'carga'})
+        self.assertEqual([x['regra'] for x in sinais], ['ads_sem_venda'])
+
+    def test_job_nao_le_nomes_e_nao_grava_leitura_incompleta(self):
+        ok = {'dados': {'frescor': []}, 'erros': {}, 'erros_bloco': {},
+              'sinais': [sd._sinal(LPT, 'VENDAS', 'MLB1', [], 'x', 's', 1, regra='vendas_queda')],
+              'upload_ate': {}}
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT, NALA]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=ok) as lp:
+            sinais, n = sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
+        self.assertEqual((len(sinais), n), (1, 2))
+        self.assertIs(lp.call_args.kwargs['com_nomes'], False)
+        ruim = dict(ok, erros={'ads': 'x'})
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=ruim):
+            with self.assertRaises(sd._LeituraIncompleta):
+                sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
+
+    def test_gravar_historico_upsert_numa_transacao(self):
+        conn = mock.MagicMock()
+        x = sd._sinal(LPT, 'VENDAS', 'MLB1', [], 'x', 's', 12.345, regra='vendas_queda',
+                      medida=-0.5)
+        self.assertEqual(sd.gravar_historico(conn, [x], HOJE, sd.MARKETPLACE), 1)
+        sql, linhas = conn.cursor.return_value.executemany.call_args.args
+        self.assertIn('ON CONFLICT (data, marketplace, loja, regra, objeto) DO UPDATE', sql)
+        self.assertEqual(linhas[0], {'data': HOJE, 'marketplace': 'MERCADO LIVRE', 'loja': LPT,
+                                     'regra': 'vendas_queda', 'objeto': 'MLB1', 'medida': -0.5,
+                                     'em_jogo': 12.35})
+        conn.commit.assert_called_once()
+
+
+class JobHistorico(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, os.path.join(RAIZ, 'jobs'))
+        import historico_sinais
+        self.job = historico_sinais
+
+    def _rodar(self, argv=(), agora=datetime(2026, 10, 6, 12, 5), efeito=None):
+        saida = []
+        with mock.patch.object(self.job, 'gravar_dia', side_effect=efeito or (lambda e, d, m: (7, 4))):
+            cod = self.job.main(list(argv), agora=agora, engine=object(), saida=saida.append)
+        return cod, '\n'.join(saida)
+
+    def test_dias_para_gravar(self):
+        f = self.job.dias_para_gravar
+        self.assertEqual(f(datetime(2026, 10, 6, 9, 59)), [])          # antes das 10h
+        self.assertEqual(f(datetime(2026, 10, 6, 12, 0)), [date(2026, 10, 6)])
+        self.assertEqual(f(datetime(2026, 10, 6, 8, 0), date(2026, 10, 3)),
+                         [date(2026, 10, 3), date(2026, 10, 4), date(2026, 10, 5)])
+        self.assertEqual(f(datetime(2026, 10, 6, 8, 0), date(2026, 10, 4), date(2026, 10, 9)),
+                         [date(2026, 10, 4), date(2026, 10, 5)])         # nunca hoje/futuro
+
+    def test_saida_so_com_contagens(self):
+        cod, txt = self._rodar()
+        self.assertEqual(cod, 0)
+        self.assertIn('06/10/2026 Mercado Livre: gravou 7 sinais em 4 lojas.', txt)
+        self.assertIn('06/10/2026 Shopee: gravou 7 sinais em 4 lojas.', txt)
+        for proibido in ('R$', 'MLB', 'ML-', 'Shopee-', 'L-0', 'postgres', '@'):
+            self.assertNotIn(proibido, txt)
+
+    def test_falha_mostra_so_o_tipo_do_erro(self):
+        def quebra(e, d, m):
+            raise RuntimeError('valor R$ 50 do SKU L-0320 na loja ML-LPT senha=xyz')
+        cod, txt = self._rodar(efeito=quebra)
+        self.assertEqual(cod, 1)
+        self.assertIn('falhou (RuntimeError)', txt)
+        for proibido in ('R$', 'L-0320', 'ML-LPT', 'senha', 'Traceback'):
+            self.assertNotIn(proibido, txt)
+
+    def test_antes_das_10h_nao_grava(self):
+        cod, txt = self._rodar(agora=datetime(2026, 10, 6, 9, 0),
+                               efeito=lambda e, d, m: self.fail('não devia gravar'))
+        self.assertEqual(cod, 0)
+        self.assertIn('Nada a gravar', txt)
+
+    def test_backfill(self):
+        dias = []
+        cod, _t = self._rodar(['--desde', '2026-10-03', '--ate', '2026-10-04'],
+                              efeito=lambda e, d, m: dias.append((d, m)) or (1, 1))
+        self.assertEqual(cod, 0)
+        self.assertEqual(dias, [(date(2026, 10, 3), sd.MARKETPLACE), (date(2026, 10, 3), sd.SHOPEE),
+                                (date(2026, 10, 4), sd.MARKETPLACE), (date(2026, 10, 4), sd.SHOPEE)])
+
+    def test_sem_a_variavel_de_conexao(self):
+        saida = []
+        with mock.patch.dict(os.environ, {}, clear=True):
+            cod = self.job.main([], agora=datetime(2026, 10, 6, 12, 0), saida=saida.append)
+        self.assertEqual(cod, 2)
+        self.assertIn('SINAIS_HIST_DB_URL', saida[0])
+
+    def test_workflow_do_repo_publico(self):
+        with open(os.path.join(RAIZ, '.github', 'workflows', 'sinais_historico.yml'),
+                  encoding='utf-8') as f:
+            wf = f.read()
+        self.assertIn("cron: '0 15 * * *'", wf)
+        self.assertIn('workflow_dispatch', wf)
+        self.assertIn('contents: read', wf)
+        self.assertNotIn('pull_request', wf)
+        self.assertIn('secrets.SINAIS_HIST_DB_URL', wf)
+        usos = re.findall(r'uses:\s*(\S+)', wf)
+        self.assertEqual(len(usos), 2)
+        for u in usos:                                       # por SHA, não por tag
+            self.assertRegex(u, r'^actions/[\w-]+@[0-9a-f]{40}$')
+
+    def test_listas_de_regras_iguais_nas_duas_tabelas(self):
+        with open(SQL_HISTORICO_ARQ, encoding='utf-8') as f:
+            texto = f.read()
+        self.assertIn('CREATE ROLE sinais_historico NOLOGIN;', texto)
+        self.assertNotIn('PASSWORD', texto.split('BEGIN;', 1)[1].split('COMMIT;', 1)[0])
+        regra = re.search(r'sinal_historico_regra_valida CHECK \(regra IN \((.*?)\)\)', texto, re.S)
+        self.assertEqual(set(re.findall(r"'(\w+)'", regra.group(1))), set(sd.REGRAS))
+
+
 class CargaPendente(unittest.TestCase):
     def test_loja_sem_a_carga_de_hoje_fica_pendente(self):
         linhas = [('Vendas', LPT, datetime(2026, 10, 5, 6, 4)),
@@ -1172,11 +1361,11 @@ class Excel(unittest.TestCase):
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(arq))
         ws = wb['Sinais']
-        ws.append([LPT, 'full_cobertura', 'E999'] + [None] * 8 + ['Ciente', 'Já em andamento', None, None])
-        ws.append([LPT, 'full_cobertura', 'E1'] + [None] * 8 + ['Ciente', 'Já em andamento', None, None])
-        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + ['ok', None, None, None])
-        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + ['Ciente', 'Já em andamento', None, '31/02/2026'])
-        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 8 + [None, 'Outro', 'ignorada', None])
+        ws.append([LPT, 'full_cobertura', 'E999'] + [None] * 9 + ['Ciente', 'Já em andamento', None, None])
+        ws.append([LPT, 'full_cobertura', 'E1'] + [None] * 9 + ['Ciente', 'Já em andamento', None, None])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 9 + ['ok', None, None, None])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 9 + ['Ciente', 'Já em andamento', None, '31/02/2026'])
+        ws.append([LPT, 'vendas_queda', 'MLB2'] + [None] * 9 + [None, 'Outro', 'ignorada', None])
         bio = io.BytesIO()
         wb.save(bio)
         linhas = sd.ler_excel(bio.getvalue())
@@ -1365,6 +1554,8 @@ class ComBanco(unittest.TestCase):
             data_importacao timestamp)""")
         for ddl in _ddl_ciente_em_temp():
             c.execute(ddl)
+        for ddl in _ddl_historico_em_temp():
+            c.execute(ddl)
         copiadas = {t: self._copiar_checks(t) for t in TABELAS}
         # as CHECK que existem hoje em produção (05/10/2026) chegaram à TEMP
         self.assertGreaterEqual(copiadas['fact_estoque_diario'], 2)
@@ -1375,7 +1566,8 @@ class ComBanco(unittest.TestCase):
         c.execute("""
             SELECT bool_and(c.relnamespace = pg_my_temp_schema())
             FROM unnest(%s) AS t(nome) JOIN pg_class c ON c.oid = t.nome::regclass
-        """, (TABELAS + ['vw_visitas_dia', 'sinal_ciente', 'vw_views_shopee_30d'],))
+        """, (TABELAS + ['vw_visitas_dia', 'sinal_ciente', 'vw_views_shopee_30d',
+                          'sinal_historico'],))
         self.assertTrue(c.fetchone()[0], 'tabela não resolveu para pg_temp')
         self._popular()
         self.c = _Conexao(self.conn)
@@ -1536,6 +1728,48 @@ class ComBanco(unittest.TestCase):
         self.assertEqual(len(q), 1)
         j = sd.janelas(date(2026, 10, 1))                    # janelas do último upload
         self.assertIn(f"semana {j['sem_ini']:%d/%m}–{j['fim']:%d/%m}", q[0]['numero'])
+
+    def test_backfill_le_a_foto_e_a_config_daquele_dia(self):
+        # captura de config em 03/10 (ROAS 20); as de 04 e 05/10 já estão no cenário
+        self.cur.execute("INSERT INTO fact_ads_campanha_config VALUES "
+                         "('MERCADO LIVRE', %s, 'MLB5183384677 kit', '2026-10-03 05:30', 20, 12, "
+                         "'MLB5183384677 kit')", (LPT,))
+        dia = date(2026, 10, 4)                              # backfill de 04/10
+        dados, erros = sd.ler_tudo(self.c, dia, [LPT])
+        self.assertEqual(erros, {})
+        foto = {r[1]: (r[2], r[3]) for r in dados['foto']}
+        self.assertEqual(foto['MLBU5071722523'], (date(2026, 10, 3), 99))   # a foto de 03/10
+        cfg = [r for r in dados['config'] if r[1] == 'MLB5183384677 kit']
+        self.assertEqual(len(cfg), 1)                        # 03/10 -> 04/10 (não 05/10)
+        self.assertEqual((float(cfg[0][5]), float(cfg[0][6])), (20.0, 14.0))
+
+    def test_historico_grava_com_upsert_e_a_tela_le(self):
+        x = sd._sinal(LPT, 'VENDAS', 'MLB1', [], 'x', 's', 100, regra='vendas_queda', medida=-0.5)
+        y = sd._sinal(LPT, 'FULL', 'MLB2', [], 'x', 's', 50, regra='full_cobertura',
+                      objeto='E2', medida=6)
+        for dia in (date(2026, 10, 3), date(2026, 10, 4)):
+            sd.gravar_historico(self.c, [x, y], dia, sd.MARKETPLACE)
+        sd.gravar_historico(self.c, [dict(x, em_jogo=999)], date(2026, 10, 4), sd.MARKETPLACE)
+        self.cur.execute("SELECT data, objeto, em_jogo FROM sinal_historico ORDER BY 1, 2")
+        self.assertEqual([(r[0], r[1], float(r[2])) for r in self.cur.fetchall()],
+                         [(date(2026, 10, 3), 'E2', 50.0), (date(2026, 10, 3), 'MLB1', 100.0),
+                          (date(2026, 10, 4), 'E2', 50.0), (date(2026, 10, 4), 'MLB1', 999.0)])
+        dados, erros = sd.ler_tudo(self.c, HOJE, [LPT])
+        self.assertEqual(erros, {})
+        self.assertEqual(sorted(dados['historico_dias']), [date(2026, 10, 3), date(2026, 10, 4)])
+        marcado = sd.aparece_desde([x], dados['historico'], dados['historico_dias'], HOJE)[0]
+        self.assertEqual(marcado['desde_txt'], 'há 2 dias (desde 03/10)')
+
+    def test_check_do_historico_iguais_as_de_producao_quando_aplicado(self):
+        self.cur.execute("SELECT to_regclass('public.sinal_historico') IS NOT NULL")
+        if not self.cur.fetchone()[0]:
+            self.skipTest('sql/sinais_historico.sql ainda não aplicado em produção')
+        q = ("SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+             "WHERE conrelid = %s::regclass AND contype = 'c' ORDER BY conname")
+        self.cur.execute(q, ('public.sinal_historico',))
+        real = self.cur.fetchall()
+        self.cur.execute(q, ('pg_temp.sinal_historico',))
+        self.assertEqual(real, self.cur.fetchall())
 
     def test_lojas_ml_e_restricao_pela_sql(self):
         lojas = [r[0] for r in sd._ler(self.c, sd.SQL_LOJAS_ML, {'marketplace': sd.MARKETPLACE})]

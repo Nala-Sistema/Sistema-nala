@@ -149,6 +149,26 @@ ABA SHOPEE (06/10/2026; contrato com a [DADOS SHOPEE])
     na margem por pedido (alarme erra para avisar); o mesmo SKU em 2 modelos
     do mesmo anúncio vê a venda inteira em cada estoque (como a R1 do ML).
 
+v1.3 "APARECE DESDE" (06/10/2026, plano aprovado pelo Thiago/Mestre)
+  - Tabela sinal_historico (sql/sinais_historico.sql): uma linha por dia ×
+    sinal, chave = data + a chave do Ciente (marketplace, loja, regra,
+    objeto). Quem grava é o job diário jobs/historico_sinais.py (GitHub
+    Actions do repo público, 12h de Brasília, usuário sinais_historico) com
+    a MESMA montagem da tela (sinais_hoje_para_historico ->
+    sinais_da_loja_hoje); a tela nunca grava ao abrir.
+  - O histórico guarda os sinais ANTES do Ciente (o silêncio da gestora não
+    apaga que o sinal acendeu).
+  - "Aparece desde" = dias seguidos no histórico até o último dia gravado +
+    hoje (calculado ao vivo). Conta só os dias em que o job rodou naquele
+    marketplace: dia sem execução não quebra a sequência. "🆕 hoje" quando o
+    sinal não estava no último dia gravado. Registrado (auditor 07/10, R4):
+    "dia rodado" = dia com pelo menos um sinal gravado no marketplace; um dia
+    em que o job rodou sem gravar nenhum sinal não conta (na prática não
+    acontece: todo dia há dezenas de sinais por marketplace).
+  - As leituras de "última foto" têm teto de data (estoque: data <= ontem;
+    config de ads: captura < amanhã) para o backfill de um dia passado ler o
+    dado DAQUELE dia. No uso diário nada muda.
+
 RESSALVAS CONHECIDAS (auditor-tecnico, 05/10/2026, aprovado com ressalvas)
   - R1: o mesmo SKU em DOIS estoques do mesmo anúncio conta a venda nos dois
     (a venda não diz de qual variação saiu). O alarme fica pessimista (cada
@@ -248,6 +268,9 @@ UPLOAD_MAX_DIAS = 7
 # Excel: limites do arquivo que sobe (auditor 06/10, R1)
 EXCEL_MAX_BYTES = 2 * 1024 * 1024
 EXCEL_MAX_LINHAS = 5000
+
+# v1.3: histórico lido pela tela (dias para trás)
+DIAS_HISTORICO = 60
 
 MAX_SINAIS_POR_LOJA = 10
 TTL_LEITURA_S = 600              # leitura do dia em memória por 10 min
@@ -367,7 +390,7 @@ SQL_ESTOQUE_FOTO = """
         SELECT loja, max(data) AS data
           FROM fact_estoque_diario
          WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
-           AND data >= %(ini_curto)s
+           AND data >= %(ini_curto)s AND data <= %(ontem)s
          GROUP BY loja)
     SELECT f.loja, f.estoque_id, f.data,
            COALESCE(f.full_disponivel, 0)       AS full_disponivel,
@@ -416,7 +439,7 @@ SQL_CONFIG_MUDOU = """
                roas_objetivo, orcamento_diario, detalhe->>'item_id' AS item_id
           FROM fact_ads_campanha_config
          WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
-           AND data_captura >= %(ini_curto)s
+           AND data_captura >= %(ini_curto)s AND data_captura < %(amanha)s
          ORDER BY loja, id_campanha, data_captura::date, data_captura DESC),
     r AS (
         SELECT c.*, row_number() OVER (PARTITION BY loja, id_campanha ORDER BY dia DESC) AS k
@@ -559,12 +582,41 @@ SQL_REATIVAR = """
        AND encerrado_em IS NULL
 """
 
+# ---- Histórico (v1.3): lido pela tela, gravado SÓ pelo job ----------------
+SQL_EXISTE_HISTORICO = "SELECT to_regclass('sinal_historico') IS NOT NULL"
+
+# As chaves gravadas nos dias anteriores das lojas do usuário.
+SQL_HISTORICO = """
+    SELECT data, loja, regra, objeto
+      FROM sinal_historico
+     WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
+       AND data >= %(ini_hist)s AND data < %(hoje)s
+"""
+
+# Os dias em que o job rodou no marketplace (qualquer loja): só datas.
+SQL_HISTORICO_DIAS = """
+    SELECT DISTINCT data
+      FROM sinal_historico
+     WHERE marketplace = %(marketplace)s
+       AND data >= %(ini_hist)s AND data < %(hoje)s
+"""
+
+SQL_GRAVAR_HISTORICO = """
+    INSERT INTO sinal_historico (data, marketplace, loja, regra, objeto, medida, em_jogo)
+    VALUES (%(data)s, %(marketplace)s, %(loja)s, %(regra)s, %(objeto)s, %(medida)s,
+            %(em_jogo)s)
+    ON CONFLICT (data, marketplace, loja, regra, objeto) DO UPDATE
+       SET medida = EXCLUDED.medida, em_jogo = EXCLUDED.em_jogo,
+           gravado_em = (now() AT TIME ZONE 'America/Sao_Paulo')
+"""
+
 FONTES_FRESCOR = ('Vendas', 'Estoque', 'Ads', 'Config. de ads', 'Experiência')
 
 TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
                 SQL_VENDAS_ANUNCIO_SHOPEE, SQL_EXISTE_VIEWS_SHOPEE, SQL_VIEWS_SHOPEE, SQL_PONTE,
                 SQL_ESTOQUE_FOTO, SQL_ESTOQUE_SEMANA, SQL_ADS, SQL_CONFIG_MUDOU,
                 SQL_EXPERIENCIA, SQL_EXISTE_VISITAS, SQL_VISITAS, SQL_FRESCOR,
+                SQL_EXISTE_HISTORICO, SQL_HISTORICO, SQL_HISTORICO_DIAS, SQL_GRAVAR_HISTORICO,
                 SQL_EXISTE_CIENTE, SQL_CIENTES_ABERTOS, SQL_FECHAR_ABERTO,
                 SQL_INSERIR_CIENTE, SQL_REATIVAR)
 
@@ -572,6 +624,8 @@ TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
 def params(hoje, lojas, mkt=MARKETPLACE):
     p = janelas(hoje)
     p.update({'marketplace': mkt, 'lojas': list(lojas),
+              'amanha': hoje + timedelta(days=1),
+              'ini_hist': hoje - timedelta(days=DIAS_HISTORICO),
               'dias_ref': DIAS_REF_EXPERIENCIA, 'janela_views': JANELA_VIEWS_SHOPEE,
               'ano_mes': p['ontem'].strftime('%Y-%m')})
     return p
@@ -643,6 +697,14 @@ def ler_tudo(conn, hoje, lojas, mkt=MARKETPLACE):
         dados['mapa'] = dict(_ler(conn, ep.SQL_MAPEAMENTO, {}))
     except Exception as e:  # noqa: BLE001
         erros['composicao'] = e
+    try:
+        if _ler(conn, SQL_EXISTE_HISTORICO, {})[0][0]:
+            dados['historico'] = _ler(conn, SQL_HISTORICO, p)
+            dados['historico_dias'] = [r[0] for r in _ler(conn, SQL_HISTORICO_DIAS, p)]
+        else:
+            dados['historico'] = None           # SQL da v1.3 ainda não aplicado
+    except Exception as e:  # noqa: BLE001
+        erros['historico'] = e
     existe, sql_v = ((SQL_EXISTE_VIEWS_SHOPEE, SQL_VIEWS_SHOPEE) if mkt == SHOPEE
                      else (SQL_EXISTE_VISITAS, SQL_VISITAS))
     try:
@@ -1434,7 +1496,7 @@ def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE
 # ============================================================
 
 COLUNAS_EXCEL = ('Loja', 'Regra', 'Objeto', 'Tipo', 'O que é', 'SKU', 'Produto', 'Anúncio',
-                 'O que disparou', 'Período', 'R$ em jogo',
+                 'O que disparou', 'Período', 'Aparece desde', 'R$ em jogo',
                  'Status', 'Motivo', 'Nota', 'Silenciar até')
 EDITAVEIS_EXCEL = ('Status', 'Motivo', 'Nota', 'Silenciar até')
 OBRIGATORIAS_EXCEL = ('Loja', 'Regra', 'Objeto') + EDITAVEIS_EXCEL
@@ -1457,7 +1519,7 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
         ws.append([sn['loja'], sn['regra'], sn['objeto'], sn['tipo'],
                    REGRAS.get(sn['regra'], sn['regra']), ', '.join(sn['skus']), produto,
                    sn['anuncio'], sn['numero'], sn.get('periodo', ''),
-                   round(sn['em_jogo'], 2), None, None, None, None])
+                   sn.get('desde_txt', '—'), round(sn['em_jogo'], 2), None, None, None, None])
     ultima = max(len(sinais) + 1, 2)
     col = {c: get_column_letter(i + 1) for i, c in enumerate(COLUNAS_EXCEL)}
     dv_status = DataValidation(type='list', formula1='"Ciente"', allow_blank=True)
@@ -1481,6 +1543,7 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
         c.font = Font(bold=True)
     larguras = {'Loja': 12, 'Regra': 16, 'Objeto': 22, 'Tipo': 12, 'O que é': 22, 'SKU': 16,
                 'Produto': 30, 'Anúncio': 16, 'O que disparou': 60, 'Período': 24,
+                'Aparece desde': 22,
                 'R$ em jogo': 12, 'Status': 10, 'Motivo': 22, 'Nota': 30, 'Silenciar até': 14}
     for nome, w in larguras.items():
         ws.column_dimensions[col[nome]].width = w
@@ -1714,6 +1777,75 @@ def reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt):
     return sinais, ate
 
 
+def aparece_desde(sinais, historico, dias_job, hoje):
+    """Marca em cada sinal 'desde' (data em que a sequência começou) e
+    'desde_txt' ("🆕 hoje" / "há N dias (desde dd/mm)"). historico: [(data,
+    loja, regra, objeto)] dos dias anteriores; dias_job: os dias em que o job
+    rodou no marketplace — só eles contam (dia sem execução não quebra)."""
+    por_dia = {}
+    for d, loja, regra, objeto in historico or []:
+        por_dia.setdefault(pd.Timestamp(d).date(), set()).add((loja, regra, objeto))
+    dias = sorted({pd.Timestamp(d).date() for d in dias_job or []} | set(por_dia),
+                  reverse=True)
+    dias = [d for d in dias if d < hoje]
+    out = []
+    for x in sinais:
+        chave = (x['loja'], x['regra'], x['objeto'])
+        desde = hoje
+        for d in dias:
+            if chave in por_dia.get(d, ()):
+                desde = d
+            else:
+                break
+        n = (hoje - desde).days
+        out.append({**x, 'desde': desde,
+                    'desde_txt': '🆕 hoje' if n == 0 else f"há {n} dias (desde {desde:%d/%m})"})
+    return out
+
+
+def sinais_da_loja_hoje(pacote, lojas, hoje):
+    """A montagem final dos sinais do dia, a MESMA na tela e no job do
+    histórico: suspende a venda das lojas com carga pendente ou upload muito
+    atrasado. Devolve (sinais, pendentes {loja: motivo}, upload_ate {loja: dia})."""
+    frescor = pacote['dados'].get('frescor') or []
+    pendentes = {l: 'carga' for l in lojas_carga_pendente(frescor, lojas, hoje)}
+    pendentes.update({l: f"upload:{d:%d/%m}" for l, d in
+                      lojas_upload_atrasado(frescor, lojas, hoje).items()
+                      if upload_suspenso(d, hoje)})
+    sinais = suspender_venda_pendente(pacote['sinais'], pendentes)
+    return sinais, pendentes, pacote.get('upload_ate') or {}
+
+
+def gravar_historico(conn, sinais, dia, mkt):
+    """Grava os sinais do dia em sinal_historico (upsert pela chave), numa
+    transação só. Só o job chama isto; a tela nunca. Devolve quantos."""
+    cur = conn.cursor()
+    try:
+        cur.executemany(SQL_GRAVAR_HISTORICO, [
+            {'data': dia, 'marketplace': mkt, 'loja': x['loja'], 'regra': x['regra'],
+             'objeto': x['objeto'], 'medida': x['medida'], 'em_jogo': round(x['em_jogo'], 2)}
+            for x in sinais])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+    return len(sinais)
+
+
+def sinais_hoje_para_historico(engine, hoje, mkt):
+    """(sinais do dia, nº de lojas) com a montagem da tela, para o job. Leitura
+    com fonte em erro levanta (_LeituraIncompleta): o histórico não grava dia
+    pela metade. Não lê nomes de produto (o usuário do job não lê dim_produtos)."""
+    lojas = _ler_lojas_ml(engine, mkt)
+    pacote = _ler_pacote(engine, hoje, tuple(lojas), mkt, com_nomes=False)
+    if pacote['erros'] or pacote['erros_bloco']:
+        raise _LeituraIncompleta(pacote)
+    sinais, _p, _u = sinais_da_loja_hoje(pacote, lojas, hoje)
+    return sinais, len(lojas)
+
+
 def suspender_venda_pendente(sinais, pendentes):
     """Tira os sinais que comparam janelas de venda das lojas com carga
     pendente (voltam quando a carga entrar)."""
@@ -1767,11 +1899,12 @@ ROTULO_FONTE = {
     'ponte': 'anúncios × estoque', 'foto': 'foto do Full', 'estoque_semana': 'estoque da semana',
     'ads': 'ads', 'config': 'mudanças de ROAS/orçamento', 'experiencia': 'experiência de compra',
     'frescor': 'datas de chegada', 'composicao': 'composição de kits', 'visitas': 'visitas',
-    'ciente': 'cientes registrados',
+    'ciente': 'cientes registrados', 'historico': 'histórico dos sinais',
 }
 
 ROTULO_BLOCO = {'vendas': 'VENDAS', 'full': 'FULL', 'ads': 'ADS',
-                'experiencia': 'EXPERIÊNCIA', 'visitas': 'VISITAS', 'ciente': 'CIENTE'}
+                'experiencia': 'EXPERIÊNCIA', 'visitas': 'VISITAS', 'ciente': 'CIENTE',
+                'historico': '"APARECE DESDE"'}
 
 ICONE = {'VENDAS': '📉', 'FULL': '📦', 'ADS': '📣', 'EXPERIÊNCIA': '⭐', 'VISITAS': '👀'}
 
@@ -1789,6 +1922,7 @@ def tabela_sinais(sinais, nomes):
                     for s in sinais],
         'O que disparou': [s['numero'] for s in sinais],
         'Período': [s.get('periodo', '') for s in sinais],
+        'Aparece desde': [s.get('desde_txt', '—') for s in sinais],
         'Sugestão': [s['sugestao'] for s in sinais],
         'R$ em jogo': [_brl(s['em_jogo']) for s in sinais],
         'Família (mesma peça, mesma loja)': [s['familia'] for s in sinais],
@@ -1881,7 +2015,7 @@ def _ler_lojas_ml(_engine, mkt=MARKETPLACE):
         conn.close()
 
 
-def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE):
+def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE, com_nomes=True):
     """A leitura do DIA (tudo menos os cientes) + os sinais montados."""
     t0 = time.perf_counter()
     conn = _engine.raw_connection()
@@ -1900,10 +2034,12 @@ def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE):
             sinais, upload_ate = reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt)
         except Exception as e:  # noqa: BLE001
             erros_bloco['vendas'] = e
-        try:
-            nomes = ep.ler_nomes(conn, {x for sn in sinais for x in sn['skus']})
-        except Exception:  # noqa: BLE001
-            nomes = {}
+        nomes = {}
+        if com_nomes:
+            try:
+                nomes = ep.ler_nomes(conn, {x for sn in sinais for x in sn['skus']})
+            except Exception:  # noqa: BLE001
+                nomes = {}
     finally:
         conn.close()
     return {'dados': dados, 'erros': {k: str(v) for k, v in erros.items()},
@@ -2021,13 +2157,10 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
         erro_ciente = True
         erros = {**erros, 'ciente': 'erro'}
     tempos.append(('Cientes (relidos a cada carga)', time.perf_counter() - t))
-    pendentes = {l: 'carga' for l in lojas_carga_pendente(dados.get('frescor') or [], lojas,
-                                                         hoje)}
-    pendentes.update({l: f"upload:{d:%d/%m}" for l, d in
-                      lojas_upload_atrasado(dados.get('frescor') or [], lojas, hoje).items()
-                      if upload_suspenso(d, hoje)})
-    upload_ate = pacote.get('upload_ate') or {}
-    sinais = suspender_venda_pendente(sinais, pendentes)
+    sinais, pendentes, upload_ate = sinais_da_loja_hoje(pacote, lojas, hoje)
+    if dados.get('historico') is not None:
+        sinais = _bloco('historico', erros_bloco, sinais, aparece_desde, sinais,
+                        dados['historico'], dados.get('historico_dias'), hoje)
     ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
                                  sinais, cientes_linhas or [], hoje)
 
