@@ -22,7 +22,7 @@ VERSÃO 1.5 (14/04/2026):
 import streamlit as st
 import pandas as pd
 import io
-from datetime import date
+from datetime import date, timedelta
 from database_utils import get_engine
 from performance_utils import (
     MODELOS_PROJECAO, get_ano_mes, get_mes_anterior, get_dias_vendas,
@@ -787,6 +787,12 @@ def _render_tab_margem_real(engine, ano_mes):
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_COLETA'), 0)      AS coleta,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM_PROLONGADA'), 0) AS antigo,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'ADS'), 0)              AS ads,
+                   -- Ate que dia o Full do mes esta cobrado (o coletor semanal
+                   -- grava o mes corrente parcial) e quanto da armazenagem a API
+                   -- cobrou sem produto identificado.
+                   MAX(periodo_fim) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM') AS full_ate,
+                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM'
+                                               AND forma_rateio = 'nao_atribuido'), 0) AS full_nao_atribuido,
                    -- Tudo que nao e um dos quatro tipos nomeados acima. Definido
                    -- por exclusao de propósito: o ML cria tipos de custo novos
                    -- (excesso de espaco, retirada de estoque), e um filtro por
@@ -807,15 +813,23 @@ def _render_tab_margem_real(engine, ano_mes):
         return
 
     df = vendas.merge(custos, on='loja', how='left')
+    df['full_ate'] = pd.to_datetime(df.get('full_ate'), errors='coerce').dt.date
+    df['full_nao_atribuido'] = pd.to_numeric(df.get('full_nao_atribuido'), errors='coerce').fillna(0.0)
     for c in ('receita', 'margem_contabil', 'armazenagem', 'coleta', 'antigo', 'ads', 'outros'):
         df[c] = pd.to_numeric(df.get(c), errors='coerce').fillna(0.0)
 
     # O que falta em cada loja. Ads hoje falta em todas — o modulo de Ads
     # ainda nao grava custo em fact_custos_extras.
+    ultimo_dia = fim - timedelta(days=1)
+
     def _faltantes(r):
         faltam = []
         if r['armazenagem'] == 0:
             faltam.append('armazenagem de Full')
+        elif pd.notna(r.get('full_ate')) and r['full_ate'] < ultimo_dia:
+            # Custo do Full lancado so ate uma data: o resto do mes ainda vai
+            # entrar. Sem isto o mes corrente pareceria com margem melhor.
+            faltam.append(f"Full depois de {r['full_ate']:%d/%m}")
         if r['coleta'] == 0:
             faltam.append('coleta de Full')
         if r['ads'] == 0:
@@ -865,11 +879,24 @@ def _render_tab_margem_real(engine, ano_mes):
             'Receita': _brl(r['receita']),
             '% contábil': f"{100*r['margem_contabil']/r['receita']:.1f}%" if r['receita'] else "—",
             'Custos lançados': _brl(-r['custo_extra']) if r['custo_extra'] else "—",
+            'Full até': f"{r['full_ate']:%d/%m}" if pd.notna(r['full_ate']) else "—",
             'Margem até agora': rotulo_margem,
             'Situação': situacao,
         })
 
     st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+
+    # Armazenagem cobrada pela API sem produto identificado (estoque ou classe
+    # do item desconhecidos). Entra na margem da loja do mesmo jeito; o aviso
+    # e sobre a atribuicao por produto, que perde precisao acima de 5%.
+    alto = df[(df['armazenagem'] > 0) & (df['full_nao_atribuido'] > 0.05 * df['armazenagem'])]
+    if not alto.empty:
+        st.warning(
+            "⚠️ Armazenagem do Full **sem produto identificado** acima de 5% em: "
+            + ", ".join(f"{r['loja']} ({100 * r['full_nao_atribuido'] / r['armazenagem']:.0f}%, "
+                        f"{_brl(r['full_nao_atribuido'])})" for _, r in alto.iterrows())
+            + ". O total da loja está certo; o custo por produto dessas lojas está menos preciso."
+        )
     st.caption(
         "\"Margem até agora\" só vira **margem real** quando a linha estiver ✅ fechado. "
         "Enquanto houver custo por lançar, o número é um teto — nunca o resultado."
