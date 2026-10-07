@@ -734,6 +734,94 @@ def _render_tab_geral(engine, ano_mes):
 # TAB — MARGEM REAL (fechamento mensal)
 # ============================================================
 
+# Ads por loja na Margem Real (07/10/2026). O gasto vem SO das tabelas da API
+# (fonte unica): nunca de fact_custos_extras nem do upload antigo da Shopee
+# (fact_ads_shopee).
+#   - ML: soma por anuncio de fact_ads_performance (o ML cobra ads so por
+#     anuncio; nao ha total por loja-dia).
+#   - Shopee: fact_ads_diario_loja, o TOTAL DA LOJA no dia (inclui campanha de
+#     loja e grupo sem anuncio, que a soma por anuncio perde).
+# Loja entra pela API se dim_fonte_dados (assunto 'ads') diz 'api'.
+ADS_TABELA_API = {
+    'MERCADO LIVRE': 'fact_ads_performance',
+    'SHOPEE': 'fact_ads_diario_loja',
+}
+
+# Marketplaces SEM ads por decisao do Thiago (07/10/2026): R$ 0, nao bloqueiam
+# o fechamento. Se um deles voltar a anunciar, TIRE a linha daqui: as lojas
+# dele voltam a aparecer como "falta Ads".
+ADS_SEM_GASTO = {
+    'AMAZON': 'ads pausado',
+    'MAGALU': 'ads pausado',
+    'TIKTOK': 'sem ads no mês',
+    'SHEIN': 'não faz ads',
+}
+
+
+def situacao_ads(marketplace, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo_dia):
+    """
+    Decide o ads de uma loja no mes. Devolve (valor, ate, falta, nota):
+      falta: texto do que falta (None = nao bloqueia); nota: observacao.
+    - Loja na API: so conta se a tabela da API cobre o mes desde o dia 1
+      (mes antes da API = "falta", nunca soma com upload). Mes corrente ou
+      coleta atrasada: "Ads depois de dd/mm".
+    - Marketplace em ADS_SEM_GASTO: R$ 0 com nota, sem bloquear.
+    - Resto (ex.: Shopee Litstore, que faz ads sem fonte): "falta Ads".
+    """
+    if na_api:
+        if cobertura_ini is None or cobertura_ini > ini:
+            desde = f" (API só desde {cobertura_ini:%d/%m/%Y})" if cobertura_ini else ""
+            return 0.0, None, f"Ads{desde}", None
+        valor = float(gasto or 0)
+        if ads_ate is None:
+            return valor, None, "Ads do mês", None
+        if ads_ate < ultimo_dia:
+            return valor, ads_ate, f"Ads depois de {ads_ate:%d/%m}", None
+        return valor, ads_ate, None, None
+    if marketplace in ADS_SEM_GASTO:
+        return 0.0, None, None, ADS_SEM_GASTO[marketplace]
+    return 0.0, None, "Ads", None
+
+
+def _ads_do_mes(engine, lojas_mkt, ini, fim):
+    """
+    {loja: (valor, ate, falta, nota)} para as lojas de `lojas_mkt`
+    ({loja: marketplace}). Le dim_fonte_dados e as tabelas da API.
+    """
+    ultimo_dia = fim - timedelta(days=1)
+    api = set(pd.read_sql(
+        "SELECT loja FROM dim_fonte_dados WHERE assunto = 'ads' AND fonte = 'api'",
+        engine)['loja'])
+    gastos, cobertura, ate_mkt = {}, {}, {}
+    for mkt, tabela in ADS_TABELA_API.items():
+        g = pd.read_sql(f"""
+            SELECT loja, SUM(gasto_ads) AS gasto, MAX(data) AS ate
+            FROM {tabela}
+            WHERE marketplace = %(m)s AND data >= %(ini)s AND data < %(fim)s
+            GROUP BY loja
+        """, engine, params={'m': mkt, 'ini': ini, 'fim': fim})
+        for _, r in g.iterrows():
+            gastos[r['loja']] = (float(r['gasto'] or 0), pd.to_datetime(r['ate']).date())
+        c = pd.read_sql(f"""
+            SELECT MIN(data) AS ini, MAX(data) FILTER (WHERE data < %(fim)s) AS ate
+            FROM {tabela} WHERE marketplace = %(m)s
+        """, engine, params={'m': mkt, 'fim': fim})
+        cobertura[mkt] = pd.to_datetime(c['ini'].iloc[0]).date() if pd.notna(c['ini'].iloc[0]) else None
+        ate = c['ate'].iloc[0]
+        ate_mkt[mkt] = min(pd.to_datetime(ate).date(), ultimo_dia) if pd.notna(ate) else None
+
+    saida = {}
+    for loja, mkt in lojas_mkt.items():
+        gasto, ate = gastos.get(loja, (0.0, None))
+        # A tabela do ML so tem linha de anuncio com movimento: o "ate" da loja
+        # e o da coleta do marketplace (loja sem gasto no dia nao e atraso).
+        if mkt == 'MERCADO LIVRE' or ate is None:
+            ate = ate_mkt.get(mkt)
+        saida[loja] = situacao_ads(mkt, loja in api and mkt in ADS_TABELA_API,
+                                   cobertura.get(mkt), gasto, ate, ini, ultimo_dia)
+    return saida
+
+
 def _render_tab_margem_real(engine, ano_mes):
     """
     Fechamento mensal: margem contabil menos os custos que nao estao na venda.
@@ -773,6 +861,7 @@ def _render_tab_margem_real(engine, ano_mes):
     try:
         vendas = pd.read_sql(f"""
             SELECT loja_origem AS loja,
+                   MAX(marketplace_origem)  AS marketplace,
                    SUM(valor_venda_efetivo) AS receita,
                    SUM(margem_total)        AS margem_contabil
             FROM fact_vendas_snapshot
@@ -786,14 +875,15 @@ def _render_tab_margem_real(engine, ano_mes):
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM'), 0) AS armazenagem,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_COLETA'), 0)      AS coleta,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM_PROLONGADA'), 0) AS antigo,
-                   COALESCE(SUM(valor) FILTER (WHERE tipo = 'ADS'), 0)              AS ads,
                    -- Ate que dia o Full do mes esta cobrado (o coletor semanal
                    -- grava o mes corrente parcial) e quanto da armazenagem a API
                    -- cobrou sem produto identificado.
                    MAX(periodo_fim) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM') AS full_ate,
                    COALESCE(SUM(valor) FILTER (WHERE tipo = 'FULL_ARMAZENAGEM'
                                                AND forma_rateio = 'nao_atribuido'), 0) AS full_nao_atribuido,
-                   -- Tudo que nao e um dos quatro tipos nomeados acima. Definido
+                   -- 'ADS' fica FORA de proposito: ads vem so das tabelas da API
+                   -- (_ads_do_mes); uma linha ADS aqui somaria em dobro.
+                   -- Tudo que nao e um dos tipos nomeados acima. Definido
                    -- por exclusao de propósito: o ML cria tipos de custo novos
                    -- (excesso de espaco, retirada de estoque), e um filtro por
                    -- prefixo deixaria esses valores fora da conta sem avisar.
@@ -815,11 +905,19 @@ def _render_tab_margem_real(engine, ano_mes):
     df = vendas.merge(custos, on='loja', how='left')
     df['full_ate'] = pd.to_datetime(df.get('full_ate'), errors='coerce').dt.date
     df['full_nao_atribuido'] = pd.to_numeric(df.get('full_nao_atribuido'), errors='coerce').fillna(0.0)
+    try:
+        ads = _ads_do_mes(engine, dict(zip(df['loja'], df['marketplace'])), ini, fim)
+    except Exception as e:
+        st.error(f"Não foi possível carregar o Ads: {e}")
+        return
+    df['ads'] = df['loja'].map(lambda l: ads[l][0])
+    df['ads_ate'] = df['loja'].map(lambda l: ads[l][1])
+    df['ads_falta'] = df['loja'].map(lambda l: ads[l][2])
+    df['ads_nota'] = df['loja'].map(lambda l: ads[l][3])
     for c in ('receita', 'margem_contabil', 'armazenagem', 'coleta', 'antigo', 'ads', 'outros'):
         df[c] = pd.to_numeric(df.get(c), errors='coerce').fillna(0.0)
 
-    # O que falta em cada loja. Ads hoje falta em todas — o modulo de Ads
-    # ainda nao grava custo em fact_custos_extras.
+    # O que falta em cada loja.
     ultimo_dia = fim - timedelta(days=1)
 
     def _faltantes(r):
@@ -832,8 +930,8 @@ def _render_tab_margem_real(engine, ano_mes):
             faltam.append(f"Full depois de {r['full_ate']:%d/%m}")
         if r['coleta'] == 0:
             faltam.append('coleta de Full')
-        if r['ads'] == 0:
-            faltam.append('Ads')
+        if r['ads_falta']:
+            faltam.append(r['ads_falta'])
         return faltam
 
     df['faltam'] = df.apply(_faltantes, axis=1)
@@ -869,7 +967,7 @@ def _render_tab_margem_real(engine, ano_mes):
     for _, r in df.iterrows():
         pct = (100 * r['margem_ate_agora'] / r['receita']) if r['receita'] else 0
         if r['completo']:
-            situacao = "✅ fechado"
+            situacao = "✅ fechado" + (f" · {r['ads_nota']}" if r['ads_nota'] else "")
             rotulo_margem = f"{pct:.1f}%"
         else:
             situacao = "🟡 falta " + ", ".join(r['faltam'])
@@ -880,6 +978,9 @@ def _render_tab_margem_real(engine, ano_mes):
             '% contábil': f"{100*r['margem_contabil']/r['receita']:.1f}%" if r['receita'] else "—",
             'Custos lançados': _brl(-r['custo_extra']) if r['custo_extra'] else "—",
             'Full até': f"{r['full_ate']:%d/%m}" if pd.notna(r['full_ate']) else "—",
+            'Ads': (r['ads_nota'] if r['ads_nota'] else
+                    "—" if r['ads_falta'] and not r['ads'] else _brl(r['ads'])),
+            'Ads até': f"{r['ads_ate']:%d/%m}" if pd.notna(r['ads_ate']) else "—",
             'Margem até agora': rotulo_margem,
             'Situação': situacao,
         })
