@@ -1,13 +1,14 @@
 """
 Testa o Ads na Margem Real (performance.py). Sem banco: a leitura e simulada.
 
-Regras do Thiago (07/10/2026), num lugar so (ADS_SEM_GASTO):
+Regras do Thiago (07/10/2026), num lugar so (REGRAS_MARKETPLACE):
   - ML e Shopee na API (dim_fonte_dados): gasto das tabelas da API;
   - Amazon e Magalu "ads pausado", TikTok "sem ads no mes", Shein "nao faz
     ads": R$ 0, nao bloqueiam;
   - Shopee Litstore (faz ads, sem fonte): continua "falta Ads";
   - mes antes da API: "falta", nunca soma com upload;
-  - mes corrente: "Ads depois de dd/mm".
+  - mes corrente: "Ads depois de dd/mm";
+  - Full: ML, Shopee, Amazon e Magalu bloqueiam sem custo; TikTok e Shein nao.
 
 Rodar:  pytest tests/test_margem_real_ads.py
 """
@@ -57,8 +58,8 @@ class Regra(unittest.TestCase):
         self.assertEqual(v, (0.0, None, 'Ads', None))
 
     def test_amazon_voltando_a_anunciar_vira_falta(self):
-        with mock.patch.dict(pf.ADS_SEM_GASTO, clear=False):
-            del pf.ADS_SEM_GASTO['AMAZON']
+        with mock.patch.dict(pf.REGRAS_MARKETPLACE,
+                             {'AMAZON': {'usa_full': True}}):
             self.assertEqual(pf.situacao_ads('AMAZON', False, None, None, None,
                                              SET_INI, SET_FIM)[2], 'Ads')
 
@@ -128,6 +129,11 @@ class Tela(unittest.TestCase):
         self.assertNotIn('Ads', t.loc['AMZ-LPT', 'Situação'].replace('ads pausado', ''))
         self.assertEqual(t.loc['TikTok-Nala', 'Ads'], 'sem ads no mês')
         self.assertNotIn('Ads', t.loc['ML-LPT', 'Situação'])
+        # Full: TikTok nao usa e fecha; Amazon e Shopee Litstore usam e faltam
+        self.assertTrue(t.loc['TikTok-Nala', 'Situação'].startswith('✅ fechado'))
+        self.assertEqual(t.loc['TikTok-Nala', 'Full até'], 'não usa Full')
+        self.assertIn('armazenagem de Full', t.loc['AMZ-LPT', 'Situação'])
+        self.assertIn('armazenagem de Full', t.loc['Shopee Litstore(Yanni)', 'Situação'])
         # o ads entra no custo lancado da loja
         self.assertIn('6.261,64', t.loc['ML-LPT', 'Custos lançados'])
 

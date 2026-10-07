@@ -747,15 +747,23 @@ ADS_TABELA_API = {
     'SHOPEE': 'fact_ads_diario_loja',
 }
 
-# Marketplaces SEM ads por decisao do Thiago (07/10/2026): R$ 0, nao bloqueiam
-# o fechamento. Se um deles voltar a anunciar, TIRE a linha daqui: as lojas
-# dele voltam a aparecer como "falta Ads".
-ADS_SEM_GASTO = {
-    'AMAZON': 'ads pausado',
-    'MAGALU': 'ads pausado',
-    'TIKTOK': 'sem ads no mês',
-    'SHEIN': 'não faz ads',
+# Regras por marketplace na Margem Real (Thiago, 07/10/2026) -- UM lugar so.
+#   usa_full: False = a loja nao usa Full e NAO bloqueia o fechamento por
+#             falta de armazenagem/coleta. Marketplace fora daqui usa Full.
+#   ads:      marketplace SEM ads -> R$ 0 com esta nota, sem bloquear. Se ele
+#             voltar a anunciar, TIRE o 'ads': as lojas voltam a "falta Ads".
+REGRAS_MARKETPLACE = {
+    'MERCADO LIVRE': {'usa_full': True},
+    'SHOPEE':        {'usa_full': True},
+    'AMAZON':        {'usa_full': True,  'ads': 'ads pausado'},
+    'MAGALU':        {'usa_full': True,  'ads': 'ads pausado'},
+    'TIKTOK':        {'usa_full': False, 'ads': 'sem ads no mês'},
+    'SHEIN':         {'usa_full': False, 'ads': 'não faz ads'},
 }
+
+
+def usa_full(marketplace):
+    return REGRAS_MARKETPLACE.get(marketplace, {}).get('usa_full', True)
 
 
 def situacao_ads(marketplace, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo_dia):
@@ -765,7 +773,7 @@ def situacao_ads(marketplace, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo
     - Loja na API: so conta se a tabela da API cobre o mes desde o dia 1
       (mes antes da API = "falta", nunca soma com upload). Mes corrente ou
       coleta atrasada: "Ads depois de dd/mm".
-    - Marketplace em ADS_SEM_GASTO: R$ 0 com nota, sem bloquear.
+    - Marketplace com 'ads' em REGRAS_MARKETPLACE: R$ 0 com nota, sem bloquear.
     - Resto (ex.: Shopee Litstore, que faz ads sem fonte): "falta Ads".
     """
     if na_api:
@@ -778,8 +786,9 @@ def situacao_ads(marketplace, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo
         if ads_ate < ultimo_dia:
             return valor, ads_ate, f"Ads depois de {ads_ate:%d/%m}", None
         return valor, ads_ate, None, None
-    if marketplace in ADS_SEM_GASTO:
-        return 0.0, None, None, ADS_SEM_GASTO[marketplace]
+    nota = REGRAS_MARKETPLACE.get(marketplace, {}).get('ads')
+    if nota:
+        return 0.0, None, None, nota
     return 0.0, None, "Ads", None
 
 
@@ -922,13 +931,15 @@ def _render_tab_margem_real(engine, ano_mes):
 
     def _faltantes(r):
         faltam = []
-        if r['armazenagem'] == 0:
+        if not usa_full(r['marketplace']):
+            pass  # TikTok e Shein nao usam Full: nao ha custo a esperar
+        elif r['armazenagem'] == 0:
             faltam.append('armazenagem de Full')
         elif pd.notna(r.get('full_ate')) and r['full_ate'] < ultimo_dia:
             # Custo do Full lancado so ate uma data: o resto do mes ainda vai
             # entrar. Sem isto o mes corrente pareceria com margem melhor.
             faltam.append(f"Full depois de {r['full_ate']:%d/%m}")
-        if r['coleta'] == 0:
+        if usa_full(r['marketplace']) and r['coleta'] == 0:
             faltam.append('coleta de Full')
         if r['ads_falta']:
             faltam.append(r['ads_falta'])
@@ -977,7 +988,8 @@ def _render_tab_margem_real(engine, ano_mes):
             'Receita': _brl(r['receita']),
             '% contábil': f"{100*r['margem_contabil']/r['receita']:.1f}%" if r['receita'] else "—",
             'Custos lançados': _brl(-r['custo_extra']) if r['custo_extra'] else "—",
-            'Full até': f"{r['full_ate']:%d/%m}" if pd.notna(r['full_ate']) else "—",
+            'Full até': (f"{r['full_ate']:%d/%m}" if pd.notna(r['full_ate']) else
+                         "não usa Full" if not usa_full(r['marketplace']) else "—"),
             'Ads': (r['ads_nota'] if r['ads_nota'] else
                     "—" if r['ads_falta'] and not r['ads'] else _brl(r['ads'])),
             'Ads até': f"{r['ads_ate']:%d/%m}" if pd.notna(r['ads_ate']) else "—",
