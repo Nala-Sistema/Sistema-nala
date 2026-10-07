@@ -12,9 +12,12 @@ Roda:
     Brasília (as coletas do dia podem não ter rodado);
   - backfill (o Mestre, na máquina do Thiago):
         python jobs/historico_sinais.py --desde 2026-09-06 --ate 2026-10-06
-    Ressalva do backfill: usa a venda como está hoje (já sem os cancelamentos
+    Ressalvas do backfill: usa a venda como está hoje (já sem os cancelamentos
     posteriores) e a ligação anúncio × estoque atual; foto de estoque, ads,
-    config e saúde são as do dia.
+    config e saúde são as do dia. "Carga pendente" e "upload atrasado" saem
+    das datas de HOJE (SQL_FRESCOR: última gravação/último upload), não das
+    do dia do backfill — efeito pequeno: no passado a carga já tinha entrado,
+    e a Litstore só é comparada até o último upload, que é posterior.
 
 Conexão: SINAIS_HIST_DB_URL (usuário sinais_historico, permissão mínima).
 

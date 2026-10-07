@@ -1251,10 +1251,16 @@ class JobHistorico(unittest.TestCase):
         self.assertIn('contents: read', wf)
         self.assertNotIn('pull_request', wf)
         self.assertIn('secrets.SINAIS_HIST_DB_URL', wf)
+        usos = re.findall(r'uses:\s*(\S+)', wf)
+        self.assertEqual(len(usos), 2)
+        for u in usos:                                       # por SHA, não por tag
+            self.assertRegex(u, r'^actions/[\w-]+@[0-9a-f]{40}$')
 
     def test_listas_de_regras_iguais_nas_duas_tabelas(self):
         with open(SQL_HISTORICO_ARQ, encoding='utf-8') as f:
             texto = f.read()
+        self.assertIn('CREATE ROLE sinais_historico NOLOGIN;', texto)
+        self.assertNotIn('PASSWORD', texto.split('BEGIN;', 1)[1].split('COMMIT;', 1)[0])
         regra = re.search(r'sinal_historico_regra_valida CHECK \(regra IN \((.*?)\)\)', texto, re.S)
         self.assertEqual(set(re.findall(r"'(\w+)'", regra.group(1))), set(sd.REGRAS))
 

@@ -161,7 +161,10 @@ v1.3 "APARECE DESDE" (06/10/2026, plano aprovado pelo Thiago/Mestre)
   - "Aparece desde" = dias seguidos no histórico até o último dia gravado +
     hoje (calculado ao vivo). Conta só os dias em que o job rodou naquele
     marketplace: dia sem execução não quebra a sequência. "🆕 hoje" quando o
-    sinal não estava no último dia gravado.
+    sinal não estava no último dia gravado. Registrado (auditor 07/10, R4):
+    "dia rodado" = dia com pelo menos um sinal gravado no marketplace; um dia
+    em que o job rodou sem gravar nenhum sinal não conta (na prática não
+    acontece: todo dia há dezenas de sinais por marketplace).
   - As leituras de "última foto" têm teto de data (estoque: data <= ontem;
     config de ads: captura < amanhã) para o backfill de um dia passado ler o
     dado DAQUELE dia. No uso diário nada muda.

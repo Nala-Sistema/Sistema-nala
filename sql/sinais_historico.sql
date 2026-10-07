@@ -12,9 +12,10 @@
 -- QUEM GRAVA: SÓ o job diário jobs/historico_sinais.py (GitHub Actions do repo
 -- Sistema-nala, 12h de Brasília; e o backfill de 30 dias, rodado pelo Mestre),
 -- com o usuário NOVO sinais_historico, criado aqui:
---   - LOGIN SEM SENHA: a senha é definida DEPOIS pelo script do Mestre
---     (ALTER ROLE sinais_historico PASSWORD ...) e vai só para o secret
---     SINAIS_HIST_DB_URL do repositório. Nenhuma senha passa por este arquivo.
+--   - NOLOGIN (padrão dos coletores): nasce sem poder entrar. O script do
+--     Mestre faz, no mesmo passo, ALTER ROLE sinais_historico WITH LOGIN
+--     PASSWORD ... e a senha vai só para o secret SINAIS_HIST_DB_URL do
+--     repositório. Nenhuma senha passa por este arquivo.
 --   - SELECT só nas fontes que a montagem dos sinais lê; INSERT e UPDATE só em
 --     sinal_historico; nada de DELETE; nada em sinal_ciente nem em dim_produtos.
 -- A tela (app) lê sinal_historico com o usuário dela (hoje o dono) e nunca grava.
@@ -22,16 +23,17 @@
 -- O QUE ESTE ARQUIVO FAZ, NUMA TRANSAÇÃO SÓ:
 --   1. Guarda: aborta se a tabela ou o usuário já existirem (nada é tocado).
 --   2. CREATE TABLE + CHECKs + índice de leitura.
---   3. CREATE ROLE sinais_historico (LOGIN, sem senha) + GRANTs.
---   4. Conferência: 3 CHECKs, índice, tabela vazia e cada privilégio esperado
---      (inclusive os que NÃO podem existir); senão aborta.
+--   3. CREATE ROLE sinais_historico NOLOGIN + GRANTs.
+--   4. Conferência: 3 CHECKs, índice, tabela vazia, usuário NOLOGIN e cada
+--      privilégio esperado (inclusive os que NÃO podem existir); senão aborta.
 --
 -- ONDE RODAR: Neon "Gestão Marketplaces" (still-shape-14526725), branch
 --             "production", banco "neondb", SQL EDITOR, credencial do DONO
 --             (neondb_owner). Quem roda: o Thiago, depois do auditor-tecnico.
 -- QUANDO: fora da janela dos coletores (04:00–06:30). A tabela é nova; os
 --   GRANTs não travam as tabelas lidas.
--- DEPOIS: (a) o Mestre define a senha pelo script dele; (b) cadastra o secret
+-- DEPOIS: (a) o script do Mestre libera o login e define a senha (ALTER ROLE
+--   sinais_historico WITH LOGIN PASSWORD ...); (b) cadastra o secret
 --   SINAIS_HIST_DB_URL no repo Sistema-nala; (c) roda o backfill de 30 dias;
 --   (d) dispara o workflow "Sinais do Dia - historico diario" à mão.
 -- DESFAZER: sql/sinais_historico_DESFAZER.sql.
@@ -77,8 +79,8 @@ CREATE INDEX ix_sinal_historico_loja_data ON public.sinal_historico (marketplace
 COMMENT ON TABLE public.sinal_historico IS
     'Sinais do Dia v1.3: os sinais de cada dia (antes do Ciente), gravados só pelo job diário (usuário sinais_historico). Base do "Aparece desde".';
 
--- Usuário do job: LOGIN sem senha (o script do Mestre define a senha depois).
-CREATE ROLE sinais_historico LOGIN;
+-- Usuário do job: NOLOGIN (o script do Mestre libera o login com a senha depois).
+CREATE ROLE sinais_historico NOLOGIN;
 
 GRANT USAGE ON SCHEMA public TO sinais_historico;
 GRANT SELECT ON
@@ -114,6 +116,9 @@ BEGIN
     SELECT count(*) INTO n FROM public.sinal_historico;
     IF n <> 0 THEN
         RAISE EXCEPTION 'sinal_historico deveria nascer vazia (tem %). Nada foi aplicado.', n;
+    END IF;
+    IF (SELECT rolcanlogin FROM pg_roles WHERE rolname = 'sinais_historico') THEN
+        RAISE EXCEPTION 'sinais_historico deveria nascer NOLOGIN. Nada foi aplicado.';
     END IF;
     FOREACH t IN ARRAY ARRAY['dim_lojas', 'fact_vendas_snapshot', 'dim_metas_loja',
         'dim_estoque_anuncio', 'fact_estoque_diario', 'fact_ads_performance',
