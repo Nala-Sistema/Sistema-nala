@@ -20,8 +20,10 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
         Substituiu a cobertura por dim_estoque e a aba de upload do
         UpSeller que a alimentava (fonte única: estoque só da API).
 
-  Tab 5 — 💸 Despesas de Full
-        Upload dos relatórios de custo de Full do ML.
+  (Tab 5 — 💸 Despesas de Full SAIU em 07/10/2026: o custo do Full do ML vem
+   da API de billing pelo coletor coletar_custo_full (nala-coletor-ml), toda
+   semana. Fonte única: o upload morreu junto. Ver dim_fonte_dados, assuntos
+   custo_full_armazenagem e custo_full_eventos.)
 
   Tab 6 — 🧾 Fechamento de Estoque
         Foto mensal valorizada do galpão e de cada Full, ao preço de compra
@@ -575,120 +577,6 @@ def _tab_cobertura_peca(engine):
 # ============================================================
 
 # ============================================================
-# PAINEL DE STATUS DOS CUSTOS DE FULL
-# ============================================================
-
-def _painel_status_full(engine):
-    """
-    Matriz loja x tipo de custo cobrando a rotina de envio.
-
-    A cobranca principal e sobre a ROTINA, nao sobre "nunca enviado": o que
-    interessa ao gestor e se houve envio desde o ultimo prazo. Uma loja pode
-    estar com o dado coberto ate ontem e ainda assim precisar de envio novo no
-    proximo ciclo.
-
-    A data de cobertura aparece como informacao secundaria porque diz outra
-    coisa: ate quando o custo esta lancado. Subir um relatorio que termina em
-    junho cumpre a rotina mas nao atualiza o dado.
-    """
-    from processar_full_ml import (
-        status_custos_full, quinzena_cobrada, proximo_prazo, TIPOS_FULL,
-    )
-
-    st.markdown("#### 📊 Status dos custos de Full")
-
-    # RBAC: gestor de loja so ve e so e cobrado pelas lojas dele
-    lojas_rbac = None if ve_todas_lojas() else get_lojas_usuario(engine)
-    if lojas_rbac is not None and not lojas_rbac:
-        st.caption("Nenhuma loja atribuída ao seu perfil.")
-        return
-
-    try:
-        dados = status_custos_full(engine, lojas=lojas_rbac)
-    except Exception:
-        st.caption("Status indisponível.")
-        return
-
-    if dados.empty:
-        st.caption("Nenhuma loja de Mercado Livre cadastrada.")
-        return
-
-    fim_q, prazo, rotulo = quinzena_cobrada()
-    prox = proximo_prazo()
-    atrasadas = sorted(dados.loc[dados['atrasado'], 'loja'].unique())
-
-    if atrasadas:
-        st.warning(
-            f"⏰ **Quinzena {rotulo} incompleta** (prazo era {prazo:%d/%m}) — "
-            f"{len(atrasadas)} loja(s): {', '.join(atrasadas)}. "
-            f"Próximo prazo: {prox:%d/%m}."
-        )
-    else:
-        st.success(f"✅ Quinzena {rotulo} fechada. Próximo prazo: {prox:%d/%m}.")
-
-    idx = {(r['loja'], r['tipo']): r for _, r in dados.iterrows()}
-    lojas = sorted(dados['loja'].unique())
-
-    html = ["<table style='width:100%;border-collapse:collapse;font-size:0.86rem'>"]
-    html.append("<tr style='background:#f2f2f2'><th style='padding:8px;text-align:left'>Loja</th>")
-    for _, rotulo, _, _cob in TIPOS_FULL:
-        html.append(f"<th style='padding:8px;text-align:center'>{rotulo}</th>")
-    html.append("<th style='padding:8px;text-align:left'>O que subir</th></tr>")
-
-    for loja in lojas:
-        html.append(f"<tr><td style='padding:8px;border-top:1px solid #eee'><b>{loja}</b></td>")
-        pendentes = set()
-        for tipo, _, arquivo, cobravel in TIPOS_FULL:
-            r = idx.get((loja, tipo))
-            sit = r['situacao'] if r is not None else 'nao_enviado'
-
-            # Cores por situacao. So a armazenagem fica vermelha, porque e o
-            # unico custo cujo relatorio o gestor consegue baixar quando quer.
-            # Os demais dependem do ML publicar o fechamento — vermelho ali
-            # seria cobrar o impossivel e transformar o painel em ruido.
-            if sit == 'em_dia':
-                bg, fg = '#e8f5e9', '#1b5e20'
-                txt = f"cobre até {r['ate']:%d/%m}"
-            elif sit == 'sem_cobranca':
-                bg, fg = '#eceff1', '#455a64'
-                txt = "enviado · sem cobrança"
-            elif sit == 'defasado':
-                bg, fg = '#fff8e1', '#8d6e00'
-                txt = f"até {r['ate']:%d/%m} · aguarda ML"
-            elif sit == 'atrasado':
-                bg, fg = '#fdecea', '#b71c1c'
-                txt = f"até {r['ate']:%d/%m} · atrasado"
-            else:  # nao_enviado
-                bg, fg = ('#fdecea', '#b71c1c') if cobravel else ('#fff8e1', '#8d6e00')
-                txt = "nunca enviado"
-
-            if r is not None and bool(r['atrasado']):
-                pendentes.add(arquivo)
-
-            rodape = ''
-            if r is not None and not pd.isna(r['subido_em']) and sit != 'sem_cobranca':
-                rodape = (f"<br><span style='font-size:0.76rem;opacity:.75'>"
-                          f"enviado {r['subido_em']:%d/%m}</span>")
-            html.append(
-                f"<td style='padding:8px;border-top:1px solid #eee;text-align:center;"
-                f"background:{bg};color:{fg}'>{txt}{rodape}</td>"
-            )
-        acao = ' + '.join(sorted(pendentes)) if pendentes else '—'
-        html.append(f"<td style='padding:8px;border-top:1px solid #eee;color:#555'>{acao}</td></tr>")
-    html.append("</table>")
-    st.markdown(''.join(html), unsafe_allow_html=True)
-    st.caption(
-        f"**Armazenagem** é cobrada por quinzena (01–15 vence dia 18; 16–fim do mês "
-        f"vence dia 3) — verde quando cobre até {fim_q:%d/%m}, vermelho quando não. "
-        f"**Coleta e estoque antigo** vêm do Relatório de Tarifas Full, que o ML "
-        f"publica em data própria de cada loja: aparecem em amarelo quando estão "
-        f"defasados, porque o gestor não consegue baixar o que ainda não foi liberado. "
-        f"Cinza significa que o relatório foi enviado e não houve cobrança daquele tipo."
-    )
-    st.divider()
-
-
-# ============================================================
 # TAB 6 — FECHAMENTO DE ESTOQUE
 # ============================================================
 
@@ -1084,154 +972,6 @@ def _fechamento_historico(engine):
         st.caption("Histórico indisponível.")
 
 
-def _tab_despesas_full(engine):
-    """
-    Tab de upload dos relatorios de custo de Full.
-
-    Todo o corpo roda dentro de try/except de proposito: esta tab entra numa
-    tela que os gestores usam no dia a dia, e uma excecao aqui derrubaria a
-    pagina inteira, inclusive as tabs de estoque e cobertura que ja funcionam.
-    Falha nesta tab tem que ficar contida nesta tab.
-    """
-    try:
-        _render_despesas_full(engine)
-    except Exception as e:
-        st.error(
-            "Esta aba encontrou um erro e foi isolada — as demais abas continuam "
-            "funcionando normalmente."
-        )
-        st.caption(f"Detalhe técnico: {type(e).__name__}: {e}")
-
-
-def _render_despesas_full(engine):
-    st.subheader("💸 Despesas de Full")
-    _painel_status_full(engine)
-    st.caption(
-        "Suba aqui os relatórios de custo do Full: **custos de armazenagem** e "
-        "**custos de coleta**. O sistema reconhece sozinho qual é qual. "
-        "Diferente das vendas, subir o mesmo arquivo de novo substitui o "
-        "anterior — pode corrigir e resubir à vontade."
-    )
-
-    from processar_full_ml import detectar_e_ler, gravar_custos_extras, identificar_loja
-
-    # ---- Loja: quem sobe escolhe, igual ao fluxo de vendas ----
-    try:
-        lojas = pd.read_sql(
-            "SELECT loja FROM dim_lojas WHERE marketplace = 'MERCADO LIVRE' "
-            "AND COALESCE(visivel_no_painel, TRUE) ORDER BY loja", engine
-        )['loja'].tolist()
-    except Exception:
-        lojas = []
-
-    if not lojas:
-        st.error("Não consegui carregar as lojas de Mercado Livre.")
-        return
-
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        loja = st.selectbox("Loja", lojas, key="full_loja")
-    with col2:
-        arquivo = st.file_uploader(
-            "Relatório de custo de Full (.xlsx)", type=["xlsx"], key="full_upl"
-        )
-
-    if not arquivo:
-        _historico_despesas_full(engine)
-        return
-
-    df, avisos, rotulo = detectar_e_ler(arquivo)
-
-    if rotulo is None:
-        for a in avisos:
-            st.error(a)
-        return
-
-    st.success(f"Reconhecido: **{rotulo}**")
-    for a in avisos:
-        st.warning(a)
-
-    if df.empty:
-        st.warning("O arquivo foi lido mas não produziu nenhuma linha de custo.")
-        return
-
-    # ---- Conferência: os anúncios batem com a loja escolhida? ----
-    try:
-        loja_detectada, conf, detalhe = identificar_loja(
-            engine, df['codigo_anuncio'].tolist()
-        )
-        if loja_detectada and loja_detectada != loja:
-            st.error(
-                f"⚠️ Os anúncios deste arquivo aparecem nas vendas da **{loja_detectada}** "
-                f"({conf}% deles), mas você selecionou **{loja}**. "
-                f"Confira antes de gravar. — {detalhe}"
-            )
-        elif loja_detectada:
-            st.caption(f"✅ Anúncios conferem com {loja} ({conf}%).")
-        else:
-            st.caption(f"ℹ️ Não foi possível conferir a loja pelos anúncios: {detalhe}")
-    except Exception:
-        st.caption("ℹ️ Conferência de loja indisponível.")
-
-    # ---- Preview ----
-    resumo = (df.groupby('tipo')
-                .agg(lancamentos=('valor', 'size'),
-                     anuncios=('codigo_anuncio', 'nunique'),
-                     total=('valor', 'sum'))
-                .reset_index())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total do arquivo", _fmt_brl(float(df['valor'].sum())))
-    c2.metric("Lançamentos", _fmt_int(len(df)))
-    c3.metric("Anúncios", _fmt_int(df['codigo_anuncio'].nunique()))
-
-    ini, fim = df['periodo_inicio'].min(), df['periodo_fim'].max()
-    if pd.notna(ini) and pd.notna(fim):
-        st.caption(f"Período detectado: **{ini:%d/%m/%Y} a {fim:%d/%m/%Y}**")
-
-    resumo['total'] = resumo['total'].apply(lambda v: _fmt_brl(float(v)))
-    st.dataframe(resumo, use_container_width=True, hide_index=True)
-
-    with st.expander("Ver os 20 maiores lançamentos"):
-        top = df.nlargest(20, 'valor')[
-            ['tipo', 'sku', 'codigo_anuncio', 'produto', 'valor']
-        ].copy()
-        top['valor'] = top['valor'].apply(lambda v: _fmt_brl(float(v)))
-        st.dataframe(top, use_container_width=True, hide_index=True)
-
-    if st.button("💾 Gravar despesas", type="primary", key="full_gravar"):
-        with st.spinner("Gravando..."):
-            res = gravar_custos_extras(
-                engine, df, 'MERCADO LIVRE', loja, arquivo.name
-            )
-        st.success(f"✅ {res['mensagem']}")
-        st.rerun()
-
-    _historico_despesas_full(engine)
-
-
-def _historico_despesas_full(engine):
-    st.markdown("### 🗂️ Despesas de Full já lançadas")
-    try:
-        df = pd.read_sql("""
-            SELECT loja, tipo,
-                   MIN(periodo_inicio) AS periodo_de, MAX(periodo_fim) AS periodo_ate,
-                   COUNT(*) AS lancamentos, SUM(valor) AS total,
-                   MAX(data_lancamento) AS lancado_em, arquivo_origem
-            FROM fact_custos_extras
-            WHERE tipo LIKE 'FULL%%'
-            GROUP BY loja, tipo, arquivo_origem
-            ORDER BY MAX(data_lancamento) DESC, loja
-            LIMIT 40
-        """, engine)
-        if df.empty:
-            st.caption("Nenhuma despesa de Full lançada ainda.")
-            return
-        df['total'] = df['total'].apply(lambda v: _fmt_brl(float(v)))
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception:
-        st.caption("Histórico indisponível.")
-
-
 # ============================================================
 # TAB 7 — PENALIZAÇÃO DE FRETE (Shopee + TikTok)
 # ============================================================
@@ -1602,11 +1342,10 @@ def main():
     st.header("📈 Análise de Produtos")
     engine = get_engine()
 
-    t1, t2, t3, t5, t6, t7 = st.tabs([
+    t1, t2, t3, t6, t7 = st.tabs([
         "🏆 Mais Vendidos",
         "📈 Crescimento & Queda",
         "📦 Cobertura em peça (ML + Shopee)",
-        "💸 Despesas de Full",
         "🧾 Fechamento de Estoque",
         "🚚 Penalização de frete",
     ])
@@ -1616,8 +1355,6 @@ def main():
         _tab_crescimento(engine)
     with t3:
         _tab_cobertura_peca(engine)
-    with t5:
-        _tab_despesas_full(engine)
     with t6:
         _tab_fechamento_estoque(engine)
     with t7:
