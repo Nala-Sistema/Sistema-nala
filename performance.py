@@ -747,18 +747,29 @@ ADS_TABELA_API = {
     'SHOPEE': 'fact_ads_diario_loja',
 }
 
-# Regras por marketplace na Margem Real (Thiago, 07/10/2026) -- UM lugar so.
-#   usa_full: False = a loja nao usa Full e NAO bloqueia o fechamento por
-#             falta de armazenagem/coleta. Marketplace fora daqui usa Full.
-#   ads:      marketplace SEM ads -> R$ 0 com esta nota, sem bloquear. Se ele
-#             voltar a anunciar, TIRE o 'ads': as lojas voltam a "falta Ads".
+# Full por marketplace (Thiago, 07/10/2026). usa_full False = a loja nao usa
+# Full e NAO bloqueia o fechamento por falta de armazenagem/coleta.
+# Marketplace fora daqui usa Full.
 REGRAS_MARKETPLACE = {
     'MERCADO LIVRE': {'usa_full': True},
     'SHOPEE':        {'usa_full': True},
-    'AMAZON':        {'usa_full': True,  'ads': 'ads pausado'},
-    'MAGALU':        {'usa_full': True,  'ads': 'ads pausado'},
-    'TIKTOK':        {'usa_full': False, 'ads': 'sem ads no mês'},
-    'SHEIN':         {'usa_full': False, 'ads': 'não faz ads'},
+    'AMAZON':        {'usa_full': True},
+    'MAGALU':        {'usa_full': True},
+    'TIKTOK':        {'usa_full': False},
+    'SHEIN':         {'usa_full': False},
+}
+
+# Lojas SEM ads por decisao do Thiago (07/10/2026), pelo NOME EXATO: R$ 0 com
+# esta nota, sem bloquear. Loja que nao esta aqui nem na API = "falta Ads".
+# Se uma delas voltar a anunciar, TIRE a linha: ela volta a "falta Ads".
+ADS_SEM_GASTO_LOJA = {
+    'AMZ-LPT': 'ads pausado',
+    'AMZ-Nala': 'ads pausado',
+    'AMZ-Yanni': 'ads pausado',
+    'Magalu-Nala': 'ads pausado',
+    'TikTok-Nala': 'sem ads no mês',
+    'Shein LPT': 'não faz ads',
+    'Shein Yanni': 'não faz ads',
 }
 
 
@@ -766,30 +777,46 @@ def usa_full(marketplace):
     return REGRAS_MARKETPLACE.get(marketplace, {}).get('usa_full', True)
 
 
-def situacao_ads(marketplace, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo_dia):
+def situacao_ads(loja, na_api, cobertura_ini, gasto, ads_ate, ini, ultimo_dia,
+                 buraco=None, sem_linha_coberta=False):
     """
     Decide o ads de uma loja no mes. Devolve (valor, ate, falta, nota):
       falta: texto do que falta (None = nao bloqueia); nota: observacao.
-    - Loja na API: so conta se a tabela da API cobre o mes desde o dia 1
-      (mes antes da API = "falta", nunca soma com upload). Mes corrente ou
-      coleta atrasada: "Ads depois de dd/mm".
-    - Marketplace com 'ads' em REGRAS_MARKETPLACE: R$ 0 com nota, sem bloquear.
+    - Loja na API: so conta se a API cobre a LOJA desde o dia 1 do mes (mes
+      antes da API = "falta", nunca soma com upload); dia faltando no meio =
+      "buraco"; mes corrente ou coleta atrasada = "Ads depois de dd/mm".
+      sem_linha_coberta: loja do ML sem nenhuma linha no mes, com o coletor
+      do ML rodando o mes todo = "sem ads no mes" (R$ 0, nao bloqueia).
+    - Loja em ADS_SEM_GASTO_LOJA: R$ 0 com nota, sem bloquear.
     - Resto (ex.: Shopee Litstore, que faz ads sem fonte): "falta Ads".
     """
     if na_api:
         if cobertura_ini is None or cobertura_ini > ini:
             desde = f" (API só desde {cobertura_ini:%d/%m/%Y})" if cobertura_ini else ""
-            return 0.0, None, f"Ads{desde}", None
+            # Mostra o que a API tem (parcial), mas nao fecha o mes.
+            return float(gasto or 0), None, f"Ads{desde}", None
         valor = float(gasto or 0)
+        if buraco is not None:
+            return valor, ads_ate, f"Ads (buraco em {buraco:%d/%m})", None
         if ads_ate is None:
             return valor, None, "Ads do mês", None
         if ads_ate < ultimo_dia:
             return valor, ads_ate, f"Ads depois de {ads_ate:%d/%m}", None
-        return valor, ads_ate, None, None
-    nota = REGRAS_MARKETPLACE.get(marketplace, {}).get('ads')
+        return valor, ads_ate, None, ('sem ads no mês' if sem_linha_coberta else None)
+    nota = ADS_SEM_GASTO_LOJA.get(loja)
     if nota:
         return 0.0, None, None, nota
     return 0.0, None, "Ads", None
+
+
+def primeiro_buraco(dias, de, ate):
+    """Primeiro dia de [de, ate] sem linha em `dias` (None = sem buraco)."""
+    d = de
+    while d <= ate:
+        if d not in dias:
+            return d
+        d += timedelta(days=1)
+    return None
 
 
 def _ads_do_mes(engine, lojas_mkt, ini, fim):
@@ -798,36 +825,63 @@ def _ads_do_mes(engine, lojas_mkt, ini, fim):
     ({loja: marketplace}). Le dim_fonte_dados e as tabelas da API.
     """
     ultimo_dia = fim - timedelta(days=1)
-    api = set(pd.read_sql(
-        "SELECT loja FROM dim_fonte_dados WHERE assunto = 'ads' AND fonte = 'api'",
-        engine)['loja'])
-    gastos, cobertura, ate_mkt = {}, {}, {}
+    fontes = pd.read_sql(
+        "SELECT loja, api_desde FROM dim_fonte_dados WHERE assunto = 'ads' AND fonte = 'api'",
+        engine)
+    api_desde = {r['loja']: (pd.to_datetime(r['api_desde']).date()
+                             if pd.notna(r['api_desde']) else None)
+                 for _, r in fontes.iterrows()}
+
+    gasto, cobertura, dias, ate_mkt = {}, {}, {}, {}
     for mkt, tabela in ADS_TABELA_API.items():
         g = pd.read_sql(f"""
-            SELECT loja, SUM(gasto_ads) AS gasto, MAX(data) AS ate
+            SELECT loja, data, SUM(gasto_ads) AS gasto
             FROM {tabela}
             WHERE marketplace = %(m)s AND data >= %(ini)s AND data < %(fim)s
-            GROUP BY loja
+            GROUP BY loja, data
         """, engine, params={'m': mkt, 'ini': ini, 'fim': fim})
         for _, r in g.iterrows():
-            gastos[r['loja']] = (float(r['gasto'] or 0), pd.to_datetime(r['ate']).date())
+            gasto[r['loja']] = gasto.get(r['loja'], 0.0) + float(r['gasto'] or 0)
+            dias.setdefault(r['loja'], set()).add(pd.to_datetime(r['data']).date())
+        # Inicio da API POR LOJA (a 1a linha da propria loja).
         c = pd.read_sql(f"""
-            SELECT MIN(data) AS ini, MAX(data) FILTER (WHERE data < %(fim)s) AS ate
-            FROM {tabela} WHERE marketplace = %(m)s
+            SELECT loja, MIN(data) AS ini FROM {tabela}
+            WHERE marketplace = %(m)s GROUP BY loja
+        """, engine, params={'m': mkt})
+        for _, r in c.iterrows():
+            cobertura[r['loja']] = pd.to_datetime(r['ini']).date()
+        u = pd.read_sql(f"""
+            SELECT MAX(data) AS ate FROM {tabela}
+            WHERE marketplace = %(m)s AND data < %(fim)s
         """, engine, params={'m': mkt, 'fim': fim})
-        cobertura[mkt] = pd.to_datetime(c['ini'].iloc[0]).date() if pd.notna(c['ini'].iloc[0]) else None
-        ate = c['ate'].iloc[0]
+        ate = u['ate'].iloc[0]
         ate_mkt[mkt] = min(pd.to_datetime(ate).date(), ultimo_dia) if pd.notna(ate) else None
 
     saida = {}
     for loja, mkt in lojas_mkt.items():
-        gasto, ate = gastos.get(loja, (0.0, None))
-        # A tabela do ML so tem linha de anuncio com movimento: o "ate" da loja
-        # e o da coleta do marketplace (loja sem gasto no dia nao e atraso).
-        if mkt == 'MERCADO LIVRE' or ate is None:
+        na_api = loja in api_desde and mkt in ADS_TABELA_API
+        d = dias.get(loja, set())
+        buraco, sem_linha_coberta = None, False
+        if mkt == 'MERCADO LIVRE':
+            # O ML so grava anuncio com movimento: o "ate" da loja e o da
+            # coleta do marketplace, e dia sem linha nao e buraco.
             ate = ate_mkt.get(mkt)
-        saida[loja] = situacao_ads(mkt, loja in api and mkt in ADS_TABELA_API,
-                                   cobertura.get(mkt), gasto, ate, ini, ultimo_dia)
+            cob = cobertura.get(loja)
+            if not d:
+                # Sem nenhuma linha no mes (ex.: ML-YanniSP): so "sem ads no
+                # mes" se a loja esta na API desde antes do mes e o coletor do
+                # ML gravou ate o fim do periodo; senao, falta.
+                cob = api_desde.get(loja)
+                sem_linha_coberta = True
+        else:
+            # Shopee: total da loja-dia, uma linha por dia coletado. Sem linha
+            # no mes = "falta Ads do mes"; dia faltando no meio = buraco.
+            ate = max(d) if d else None
+            cob = cobertura.get(loja)
+            if d and cob:
+                buraco = primeiro_buraco(d, max(ini, cob), ate)
+        saida[loja] = situacao_ads(loja, na_api, cob, gasto.get(loja), ate, ini,
+                                   ultimo_dia, buraco, sem_linha_coberta)
     return saida
 
 
