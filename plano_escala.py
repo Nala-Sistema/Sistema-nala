@@ -197,14 +197,24 @@ def teto_e_virada(rodadas):
 
 # ---- Margem do sistema no preço (conta da Tabela de Preço) ---------------
 
-def margem_ml(custo, comissao, imposto, frete_abaixo=None, frete_acima=None, extra=0.0):
+def margem_ml(custo, comissao, imposto, frete_abaixo=None, frete_acima=None, extra=0.0,
+              preco_ref_abaixo=None):
     """margem_unit(preço) do ML com a conta de tabela_preco.calcular_margem:
     comissão e imposto em % do preço; abaixo da barreira de R$ 79 o frete é a
     taxa fixa (observada, ou a da Tabela de Preço); a partir dela, o frete do
-    vendedor (None = desconhecido)."""
+    vendedor (None = desconhecido).
+    O frete observado abaixo de R$ 79 é a média das vendas ao preço de hoje
+    (preco_ref_abaixo); a rodada em outra faixa da taxa fixa (R$ 4,50 até
+    R$ 30, R$ 6,50 até R$ 50, R$ 6,75 até R$ 79) leva a diferença entre as
+    faixas (ressalva 1 do auditor, 12/10)."""
     def f(preco):
         if preco < BARREIRA_ML:
-            frete = frete_abaixo if frete_abaixo is not None else taxa_fixa_dba(preco)
+            if frete_abaixo is None:
+                frete = taxa_fixa_dba(preco)
+            elif preco_ref_abaixo:
+                frete = frete_abaixo + taxa_fixa_dba(preco) - taxa_fixa_dba(preco_ref_abaixo)
+            else:
+                frete = frete_abaixo
         else:
             if frete_acima is None:
                 return None
@@ -302,11 +312,15 @@ def resolver_insumos(loja, anuncio, sku, categoria, observado,
             continue
         out[campo] = None
         out[campo + '_origem'] = padrao or 'não achado: informe o Frete acima de R$ 79'
+        if not faixa:
+            out['preco_ref_abaixo'] = None
         for nivel in ('anuncio', 'sku'):
             d = observado.get(nivel, {}).get(chaves[nivel])
             o = d[faixa] if d else None
             if o and o['q'] >= MIN_UNID_INSUMO:
                 out[campo] = o['f'] / o['q']
+                if not faixa:
+                    out['preco_ref_abaixo'] = o['v'] / o['q']
                 out[campo + '_origem'] = f"{ROTULO_NIVEL[nivel]} ({jan}, {o['q']} un.)"
                 break
     return out
@@ -323,11 +337,16 @@ def calcular_plano(cad, produto, imposto, insumos):
         raise ValueError('SKU sem custo cadastrado.')
     extra = EXTRA_POR_LOJA.get(cad['loja'], 0.0)
     f = margem_ml(custo, insumos['comissao'], imposto, insumos['frete_abaixo'],
-                  insumos['frete_acima'], extra)
+                  insumos['frete_acima'], extra, insumos.get('preco_ref_abaixo'))
     meta = meta_mensal(cad['venda_concorrente'], cad['meta_propria'])
     rodadas = prever(montar_rodadas(meta, cad['preco_concorrente'], cad['preco_meta'],
                                     cad['precos_mao']), f)
     teto, virada = teto_e_virada(rodadas)
+    avisos = []
+    sobra = sorted(k for k in cad['precos_mao'] if k < 1 or k > len(rodadas))
+    if sobra:
+        avisos.append('Preço à mão ignorado na(s) rodada(s) ' + ', '.join(map(str, sobra)) +
+                      f': o plano tem {len(rodadas)} rodada(s).')
     insumos = dict(insumos)
     if all(r['preco'] < BARREIRA_ML for r in rodadas) and insumos['frete_acima'] is None:
         insumos['frete_acima_origem'] = 'não usado: todas as rodadas abaixo de R$ 79'
@@ -338,6 +357,7 @@ def calcular_plano(cad, produto, imposto, insumos):
         'resultado_total': rodadas[-1]['acumulado'],
         'vendas_total': sum(r['vendas'] for r in rodadas),
         'preco_margem_zero': preco_margem_zero(f),
+        'avisos': avisos,
         'insumos': {'custo': custo, 'imposto': imposto, 'extra': extra, **insumos},
     }
     return rodadas, resumo
@@ -642,8 +662,8 @@ def previa(linhas_brutas, ativos, lojas_permitidas, hoje, calcular):
     for n, bruta in enumerate(linhas_brutas, start=2):
         if all(_vazio(v) for k, v in bruta.items() if k != 'produto'):
             continue
-        item = {'n': n, 'cad': None, 'acao': 'recusado', 'erro': '', 'rodadas': None,
-                'resumo': None, 'ativo': None}
+        item = {'n': n, 'cad': None, 'acao': 'recusado', 'erro': '', 'aviso': '',
+                'rodadas': None, 'resumo': None, 'ativo': None}
         out.append(item)
         try:
             cad = normalizar(bruta)
@@ -669,6 +689,7 @@ def previa(linhas_brutas, ativos, lojas_permitidas, hoje, calcular):
         except ValueError as e:
             item['erro'] = str(e)
             continue
+        item['aviso'] = ' '.join(item['resumo'].get('avisos') or [])
         if not ativo or ativo.get('concluido'):
             item['acao'] = 'novo'
         elif ativo['data_inicio'] <= fim:
@@ -831,8 +852,12 @@ SQL_REAL_VENDAS = """
      GROUP BY 1, 2, 3
 """
 
+# Parcela do ads em UNIDADES: no ML o coletor grava vendas_diretas/indiretas =
+# direct/indirect_units_quantity e vendas = units_quantity (nala-coletor-ml,
+# coletar_ads.py); o denominador é SUM(quantidade) do snapshot, também unidade.
 SQL_REAL_ADS = """
-    SELECT loja, codigo_anuncio, data, SUM(gasto_ads), SUM(vendas)
+    SELECT loja, codigo_anuncio, data, SUM(gasto_ads),
+           SUM(COALESCE(vendas_diretas + vendas_indiretas, vendas))
       FROM fact_ads_performance
      WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
        AND codigo_anuncio = ANY(%(anuncios)s)
@@ -1192,6 +1217,7 @@ def tabela_previa(itens, nomes):
             'Comissão usada': (f"{_pct(ins.get('comissao'), 2)} — {ins.get('comissao_origem')}"
                                if ins else ''),
             'Por que recusou': it['erro'],
+            'Aviso': it.get('aviso', ''),
         })
     return pd.DataFrame(linhas)
 
