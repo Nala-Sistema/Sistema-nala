@@ -286,10 +286,10 @@ class VendasEOrdem(unittest.TestCase):
         vendas = [_vend(LPT, 'MLB1', 'A', rec_sem=400, rec_base=4000),    # 1000/sem → -60%
                   _vend(LPT, 'MLB2', 'B', rec_sem=2500, rec_base=4000),   # +150%
                   _vend(LPT, 'MLB3', 'C', rec_sem=0, rec_base=900),       # irrelevante
-                  _vend(LPT, 'MLB4', 'D', rec_sem=900, rec_base=4000)]    # -10%: nada
+                  _vend(LPT, 'MLB4', 'D', rec_sem=900, rec_base=4000)]    # -10% (≥ R$ 500/sem): laranja
         por_an, _ = sd.agregar_vendas(vendas)
         s = sd.sinais_vendas(por_an, sd.janelas(HOJE))
-        self.assertEqual(sorted(x['anuncio'] for x in s), ['MLB1', 'MLB2'])
+        self.assertEqual(sorted(x['anuncio'] for x in s), ['MLB1', 'MLB2', 'MLB4'])
         q = next(x for x in s if x['anuncio'] == 'MLB1')
         self.assertIn('semana 28/09–04/10', q['numero'])
         self.assertAlmostEqual(q['em_jogo'], 600)
@@ -635,7 +635,7 @@ class Ciente(unittest.TestCase):
         df = st.data_editor.call_args.args[0]
         self.assertEqual(list(df['Anúncio']), ['MLB1'])     # o silenciado saiu
         self.assertEqual(list(df.columns[:1]), ['Ciente'])
-        self.assertTrue(any('Silenciados (1)' in str(c.args[0])
+        self.assertTrue(any('Em acompanhamento (1)' in str(c.args[0])
                             for c in st.expander.call_args_list))
         st.file_uploader.assert_called()                    # gestora sobe Excel
         st = self._render('DIRETOR', silenciado)
@@ -983,8 +983,14 @@ class FullGalpao(unittest.TestCase):
                      'foto': [(S_LPT, 'E1', date(2026, 10, 4), 0, 0, 0, 50)]}
             s, _ = sd.montar_sinais(dados, HOJE, mkt)
             regras = {x['regra'] for x in s}
-            self.assertIn('ads_espiral', regras, mkt)         # tinha estoque (galpão)
+            # Full zerado a semana toda (galpão só ajuda a vender): a causa é o Full,
+            # não o ads (regra de 09/10, caso Shopee-LPT K10-L-0388)
+            self.assertNotIn('ads_espiral', regras, mkt)
             self.assertNotIn('full_ruptura', regras, mkt)
+            # com Full a semana toda, a espiral acende
+            full_ok = [(S_LPT, 'E1', date(2026, 9, 28) + timedelta(days=i), 5, 50) for i in range(7)]
+            s, _ = sd.montar_sinais({**dados, 'estoque_semana': full_ok}, HOJE, mkt)
+            self.assertIn('ads_espiral', {x['regra'] for x in s}, mkt)
 
     def test_texto_da_ruptura_mostra_os_dias_com_full(self):
         vendas = [_vend(NALA, 'MLB7', 'X', rec_sem=150, rec_base=3200)]
@@ -1939,6 +1945,360 @@ class CienteComBanco(unittest.TestCase):
         real = self.cur.fetchall()
         self.cur.execute(q, ('pg_temp.sinal_ciente',))
         self.assertEqual(real, self.cur.fetchall())
+
+
+# ============================================================
+# Pacote de ajustes v2 (Etapa 1, 12/10/2026) — sem banco
+# ============================================================
+
+def _vendas_j(linhas):
+    por_an, _ = sd.agregar_vendas(linhas)
+    return por_an
+
+
+def _queda(linhas, **kw):
+    return sd.sinais_vendas(_vendas_j(linhas), sd.janelas(HOJE), **kw)
+
+
+class AlarmeFalso(unittest.TestCase):
+    def test_motivo_novo_no_codigo_no_excel_e_no_sql(self):
+        self.assertEqual(sd.MOTIVOS['alarme_falso'], 'Alarme falso / não serve')
+        self.assertEqual(sd._motivo_excel('Alarme falso / não serve'), 'alarme_falso')
+        self.assertEqual(sd._motivo_excel('alarme_falso'), 'alarme_falso')
+        # nota opcional (só "Outro" exige)
+        self.assertEqual(sd.validar_ciente('alarme_falso', '', HOJE, HOJE), [])
+        self.assertTrue(sd.validar_ciente('outro', '', HOJE, HOJE))
+        xlsx = sd.excel_sinais([], {}, HOJE)
+        from openpyxl import load_workbook
+        ws = load_workbook(io.BytesIO(xlsx))['Sinais']
+        listas = [dv.formula1 for dv in ws.data_validations.dataValidation]
+        self.assertTrue(any('Alarme falso / não serve' in x for x in listas))
+        for arq in ('sinais_ciente_alarme_falso.sql', 'sinais_ciente_alarme_falso_DESFAZER.sql'):
+            self.assertTrue(os.path.exists(os.path.join(RAIZ, 'sql', arq)), arq)
+        ddl = open(os.path.join(RAIZ, 'sql', 'sinais_ciente_alarme_falso.sql'),
+                   encoding='utf-8').read()
+        self.assertIn('v_sinal_alarme_falso', ddl)
+        self.assertIn("'alarme_falso', 'outro'", ddl)
+
+    def test_silencia_como_os_outros_motivos(self):
+        sinal = sd._sinal(LPT, 'VENDAS', 'MLB1', {'A'}, 'x', 's', 100, regra='vendas_queda',
+                          medida=-0.3)
+        ativos, sil = sd.aplicar_cientes(
+            [sinal], [_ciente(LPT, 'vendas_queda', 'MLB1', motivo='alarme_falso', medida=-0.3)],
+            HOJE)
+        self.assertEqual((ativos, len(sil)), ([], 1))
+
+
+class FaixasDeQueda(unittest.TestCase):
+    def _cor(self, base_sem, sem):
+        s = _queda([_vend(LPT, 'MLB1', 'A', rec_sem=sem, rec_base=base_sem * 4)])
+        return [x['cor'] for x in s if x['regra'] == 'vendas_queda']
+
+    def test_anuncio_de_500_ou_mais_por_semana(self):
+        self.assertEqual(self._cor(1000, 950), [])             # -5%: nada
+        self.assertEqual(self._cor(1000, 900), ['laranja'])    # -10%
+        self.assertEqual(self._cor(1000, 850), ['laranja'])
+        self.assertEqual(self._cor(1000, 800), ['vermelho'])   # -20%
+        self.assertEqual(self._cor(1000, 100), ['vermelho'])
+
+    def test_faixa_do_meio_so_a_regua_de_50_sem_cor(self):
+        self.assertEqual(self._cor(300, 160), [])              # -47%
+        self.assertEqual(self._cor(300, 140), [''])            # -53%
+        self.assertEqual(self._cor(499, 400), [])              # -20% mas abaixo de R$ 500/sem
+
+    def test_abaixo_de_250_por_semana_nao_acende(self):
+        self.assertEqual(self._cor(240, 0), [])
+
+    def test_faixa_e_do_tamanho_da_base_nao_da_semana_atual(self):
+        # base 1000/sem; a semana caiu para 100 (< 250): continua faixa alta, vermelho
+        self.assertEqual(self._cor(1000, 100), ['vermelho'])
+        # base 400/sem; a semana subiu para 600 (> 500): segue a faixa do meio
+        self.assertEqual(self._cor(400, 600), [])
+
+    def test_casos_de_01_a_07_10_acendem_e_o_k100_vira_informativo(self):
+        vendas = [_vend(LPT, 'MLB-351', 'K-L-0351', rec_sem=1500, rec_base=8000),    # -25%
+                  _vend(LPT, 'MLB-386', 'L-0386', rec_sem=816, rec_base=4800),       # -32%
+                  _vend(LPT, 'MLB-389', 'K100-L-0389', rec_sem=1560, rec_base=12000)]  # -48%
+        roas = {(LPT, 'MLB-389'): (date(2026, 10, 2), 9.9, 12)}
+        s = {x['anuncio']: x for x in _queda(vendas, roas_subiu=roas)}
+        self.assertEqual((s['MLB-351']['cor'], s['MLB-351']['informativo']), ('vermelho', False))
+        self.assertEqual((s['MLB-386']['cor'], s['MLB-386']['informativo']), ('vermelho', False))
+        k = s['MLB-389']
+        self.assertTrue(k['informativo'])
+        self.assertIn('depois que o ROAS objetivo subiu de 9,9 para 12 em 02/10', k['numero'])
+        self.assertIn('-48%', k['numero'])
+
+    def test_subida_de_roas_depois_da_semana_nao_explica_a_queda(self):
+        # L-0386: o ROAS subiu na foto de 08/10, a semana 01-07/10 terminou antes: alerta
+        vendas = [_vend(LPT, 'MLB-386', 'L-0386', rec_sem=816, rec_base=4800)]
+        roas = {(LPT, 'MLB-386'): (date(2026, 10, 8), 8.5, 12)}
+        j = sd.janelas(date(2026, 10, 8))
+        s = sd.sinais_vendas(_vendas_j(vendas), j, roas_subiu=roas)
+        self.assertEqual((s[0]['cor'], s[0]['informativo']), ('vermelho', False))
+        j = sd.janelas(date(2026, 10, 12))                       # quatro dias depois: explica
+        s = sd.sinais_vendas(_vendas_j(vendas), j, roas_subiu=roas)
+        self.assertTrue(s[0]['informativo'])
+
+    def test_visitas_mesmas_faixas_e_junto_da_venda(self):
+        vendas = [_vend(LPT, 'MLB1', 'A', rec_sem=900, rec_base=4000)]
+        por_an = _vendas_j(vendas)
+        v = sd.sinais_visitas([(LPT, 'MLB1', 85, 100 * 4)], por_an, sd.janelas(HOJE))
+        self.assertEqual([x['cor'] for x in v], ['laranja'])   # visitas -15%
+        v = sd.sinais_visitas([(LPT, 'MLB1', 70, 100 * 4)], por_an, sd.janelas(HOJE))
+        self.assertEqual([x['cor'] for x in v], ['vermelho'])
+        self.assertEqual(sd.sinais_visitas([(LPT, 'MLB1', 95, 400)], por_an, sd.janelas(HOJE)), [])
+        # anúncio pequeno (250 a 500): só -50%
+        pequeno = _vendas_j([_vend(LPT, 'MLB2', 'B', rec_sem=300, rec_base=1200)])
+        self.assertEqual(sd.sinais_visitas([(LPT, 'MLB2', 70, 400)], pequeno, sd.janelas(HOJE)), [])
+        # a variação aparece no texto da venda
+        var = sd.variacao_visitas([(LPT, 'MLB1', 70, 400)])
+        s = _queda(vendas, visitas=var)
+        self.assertIn('visitas -30%', s[0]['numero'])
+
+
+class Amarelo(unittest.TestCase):
+    VENDAS = [_vend(LPT, 'MLB1', 'A', rec_sem=570, rec_base=2400)]      # 600/sem, -5%
+
+    def _amarelos(self, perf, vendas=None):
+        s = _queda(vendas or self.VENDAS, performance=perf)
+        return [x for x in s if x['cor'] == 'amarelo']
+
+    def test_abaixo_do_projetado_acende_amarelo_mesmo_sem_queda(self):
+        perf = {(LPT, 'MLB1'): {'performance': 82.0, 'proj_fat': 8200.0, 'meta_fat': 10000.0}}
+        a = self._amarelos(perf)
+        self.assertEqual(len(a), 1)
+        self.assertIn('performance do mês 82% da meta', a[0]['numero'])
+        self.assertAlmostEqual(a[0]['em_jogo'], 1800.0)
+        self.assertFalse(a[0]['informativo'])
+
+    def test_no_projetado_ou_sem_meta_ou_pequeno_nao_acende(self):
+        ok = {(LPT, 'MLB1'): {'performance': 100.0, 'proj_fat': 1, 'meta_fat': 1}}
+        self.assertEqual(self._amarelos(ok), [])
+        self.assertEqual(self._amarelos({}), [])                       # sem meta: não inventa
+        self.assertEqual(self._amarelos(None), [])
+        sem_perf = {(LPT, 'MLB1'): {'performance': None, 'proj_fat': 0, 'meta_fat': 0}}
+        self.assertEqual(self._amarelos(sem_perf), [])
+        pequeno = [_vend(LPT, 'MLB1', 'A', rec_sem=380, rec_base=1600)]  # 400/sem (< 500)
+        ruim = {(LPT, 'MLB1'): {'performance': 40.0, 'proj_fat': 1, 'meta_fat': 2}}
+        self.assertEqual(self._amarelos(ruim, pequeno), [])
+
+    def test_laranja_e_vermelho_tem_prioridade_sobre_o_amarelo(self):
+        vendas = [_vend(LPT, 'MLB1', 'A', rec_sem=500, rec_base=2400)]    # -17%: laranja
+        ruim = {(LPT, 'MLB1'): {'performance': 40.0, 'proj_fat': 1, 'meta_fat': 2}}
+        s = _queda(vendas, performance=ruim)
+        self.assertEqual([x['cor'] for x in s], ['laranja'])
+
+    def test_corte_e_o_do_modulo_performance(self):
+        fonte = open(os.path.join(RAIZ, 'performance.py'), encoding='utf-8').read()
+        corpo = fonte[fonte.index('def _cor_performance'):fonte.index('def _bg_performance')]
+        self.assertIn(f'val >= {int(sd.PERF_CORTE_AMARELO)}', corpo)   # 🟢 começa em 100
+
+    def test_meta_de_sku_da_shopee_so_vale_para_o_anuncio_unico(self):
+        perf = {(S_LPT, 'K-L-0351'): {'performance': 50.0, 'proj_fat': 1, 'meta_fat': 2},
+                (S_LPT, '22196121009'): {'performance': 60.0, 'proj_fat': 1, 'meta_fat': 2}}
+        por_an = _vendas_j([_vend(S_LPT, '111', 'K-L-0351', rec_sem=1, rec_base=1),
+                            _vend(S_LPT, '22196121009', 'X', rec_sem=1, rec_base=1),
+                            _vend(S_LPT, '1', 'L-0320', rec_sem=1, rec_base=1),
+                            _vend(S_LPT, '2', 'L-0320', rec_sem=1, rec_base=1)])
+        out = sd._performance_por_anuncio(perf, por_an)
+        self.assertEqual(out[(S_LPT, '111')]['performance'], 50.0)           # SKU, anúncio único
+        self.assertEqual(out[(S_LPT, '22196121009')]['performance'], 60.0)   # direto
+        perf[(S_LPT, 'L-0320')] = {'performance': 30.0, 'proj_fat': 1, 'meta_fat': 2}
+        out = sd._performance_por_anuncio(perf, por_an)
+        self.assertNotIn((S_LPT, '1'), out)                                  # 2 anúncios: não inventa
+
+    def test_ler_performance_corta_em_d1_e_usa_o_modelo_da_loja(self):
+        try:
+            import performance_utils as pu
+        except Exception:  # noqa: BLE001
+            self.skipTest('performance_utils não importa neste ambiente')
+        import pandas as pd
+        df = pd.DataFrame([{'codigo_anuncio': 'MLB1', 'meta_qtd': 10, 'performance': 80.0,
+                            'proj_fat': 800.0, 'meta_fat': 1000.0},
+                           {'codigo_anuncio': 'MLB2', 'meta_qtd': 0, 'performance': None,
+                            'proj_fat': 0.0, 'meta_fat': 0.0}])
+        with mock.patch.object(pu, 'buscar_meta_loja',
+                               return_value={'modelo_projecao': 'Início Forte'}), \
+             mock.patch.object(pu, 'construir_tabela_performance', return_value=df) as c:
+            out = sd.ler_performance(object(), date(2026, 10, 8), [LPT])
+        self.assertEqual(list(out), [(LPT, 'MLB1')])
+        args, kw = c.call_args
+        self.assertEqual(args[4], 'Início Forte')
+        self.assertEqual((kw['dias_vendas_override'], kw['dias_mes_override']), (7, 31))
+        self.assertEqual(kw['data_fim'], date(2026, 10, 7))                  # D-1, nunca hoje
+        with mock.patch.object(pu, 'construir_tabela_performance') as c:     # 2 dias: não projeta
+            self.assertEqual(sd.ler_performance(object(), date(2026, 10, 3), [LPT]), {})
+        c.assert_not_called()
+
+    def test_realizado_do_modulo_corta_em_data_fim_sem_mudar_o_padrao(self):
+        try:
+            import performance_utils as pu
+        except Exception:  # noqa: BLE001
+            self.skipTest('performance_utils não importa neste ambiente')
+        import pandas as pd
+        chamadas = []
+        with mock.patch.object(pu, '_raw_query',
+                               side_effect=lambda e, q, p=None: chamadas.append(p) or pd.DataFrame()):
+            pu.buscar_realizados_mes(None, LPT, '2026-10', 'MERCADO LIVRE')
+            pu.buscar_realizados_mes(None, LPT, '2026-10', 'MERCADO LIVRE',
+                                     data_fim=date(2026, 10, 7))
+        self.assertEqual(chamadas[0][2], date(2026, 10, 31))                 # tela: mês inteiro
+        self.assertEqual(chamadas[2][2], date(2026, 10, 7))                  # Sinais: até D-1
+
+
+class Informativos(unittest.TestCase):
+    def test_ads_config_e_informativo(self):
+        config = [(LPT, 'MLB1 camp', 'MLB1 camp', date(2026, 10, 4), HOJE, 9.9, 12, 10, 10)]
+        s = sd.sinais_ads({}, config, {}, {}, sd.janelas(HOJE))
+        self.assertTrue(s[0]['informativo'])
+
+    def test_roas_que_subiu_vira_mapa_por_anuncio_e_a_espiral_nao_acende(self):
+        linhas = [(LPT, 'MLB-389 K100', 'MLB-389 K100', date(2026, 10, 2), 9.9, 12, 'MLB389')]
+        self.assertEqual(sd.roas_que_subiu(linhas)[(LPT, 'MLB389')][1:], (9.9, 12))
+        dados = {'vendas': [_vend(LPT, 'MLB389', 'K100-L-0389', rec_sem=1560, rec_base=12000)],
+                 'ads': [(LPT, 'MLB389', 5, 400, 0, 0, 0, 0, 0, 0, 0)],
+                 'config': [], 'ponte': [(LPT, 'MLB389', 'E1', 'K100-L-0389', True)],
+                 'estoque_semana': [(LPT, 'E1', date(2026, 9, 28) + timedelta(days=i), 9, 9)
+                                    for i in range(7)],
+                 'foto': [(LPT, 'E1', date(2026, 10, 4), 9, 0, 0, 9)],
+                 'roas_subiu': linhas}
+        s, _ = sd.montar_sinais(dados, HOJE)
+        regras = {x['regra'] for x in s}
+        self.assertNotIn('ads_espiral', regras)
+        q = next(x for x in s if x['regra'] == 'vendas_queda')
+        self.assertTrue(q['informativo'])
+        sem_roas, _ = sd.montar_sinais({**dados, 'roas_subiu': []}, HOJE)   # sem a subida: espiral
+        self.assertIn('ads_espiral', {x['regra'] for x in sem_roas})
+
+    def test_informativo_sai_da_lista_de_alertas_da_tela(self):
+        s = [sd._sinal(LPT, 'VENDAS', 'MLB1', {'A'}, 'a', 's', 10, regra='vendas_queda',
+                       informativo=True),
+             sd._sinal(LPT, 'VENDAS', 'MLB2', {'B'}, 'b', 's', 20, regra='vendas_queda')]
+        df = sd.tabela_sinais(s, {})
+        self.assertIn('ℹ️', df['Tipo'][0])
+        self.assertNotIn('ℹ️', df['Tipo'][1])
+
+
+class RuidoDeAds(unittest.TestCase):
+    def _ads(self, ads, vendas, dias_est, **kw):
+        por_an, _ = sd.agregar_vendas(vendas)
+        return sd.sinais_ads(ads, [], por_an, dias_est, sd.janelas(HOJE), **kw)
+
+    def test_ads_sem_venda_so_com_gasto_de_20_ou_mais(self):
+        for gasto, esperado in ((19.9, 0), (20.0, 1), (45.0, 1)):
+            ads = {(LPT, 'MLB1'): _ads(gasto_recente=gasto, dias_com_gasto=3, unid_recente=0)}
+            s = self._ads(ads, [], {})
+            self.assertEqual(len([x for x in s if x['regra'] == 'ads_sem_venda']), esperado, gasto)
+
+    def test_espiral_exige_gasto_de_20_por_semana_na_base(self):
+        vendas = [_vend(LPT, 'MLB1', 'L-0303', rec_sem=300, rec_base=4000)]
+        pouco = {(LPT, 'MLB1'): _ads(gasto_sem=0.5, gasto_base=12)}       # R$ 3/sem
+        self.assertEqual(self._ads(pouco, vendas, {(LPT, 'MLB1'): 7}), [])
+        ok = {(LPT, 'MLB1'): _ads(gasto_sem=5, gasto_base=100)}           # R$ 25/sem
+        self.assertEqual([x['regra'] for x in self._ads(ok, vendas, {(LPT, 'MLB1'): 7})],
+                         ['ads_espiral'])
+
+    def test_espiral_nao_acende_com_ruptura_de_full(self):
+        vendas = [_vend(S_LPT, 'I1', 'K10-L-0388', rec_sem=300, rec_base=4000)]
+        ads = {(S_LPT, 'I1'): _ads(gasto_sem=5, gasto_base=400)}
+        k = (S_LPT, 'I1')
+        s = self._ads(ads, vendas, {k: 7}, dias_full={k: 3}, em_full={k})
+        self.assertEqual(s, [])                                           # Full faltou 4 dias
+        s = self._ads(ads, vendas, {k: 7}, dias_full={k: 7}, em_full={k})
+        self.assertEqual([x['regra'] for x in s], ['ads_espiral'])
+        s = self._ads(ads, vendas, {k: 7}, dias_full={}, em_full=set())   # fora do Full
+        self.assertEqual([x['regra'] for x in s], ['ads_espiral'])
+
+
+class FamiliaERajadas(unittest.TestCase):
+    def test_venda_que_migrou_para_outra_variacao_nao_e_queda(self):
+        # caso ML-LPT L-0413: um anúncio cai, o outro do mesmo SKU sobe
+        vendas = [_vend(LPT, 'MLB-A', 'L-0413', rec_sem=355, rec_base=1346 * 4),
+                  _vend(LPT, 'MLB-B', 'L-0413', rec_sem=1837, rec_base=838 * 4)]
+        self.assertEqual([x for x in _queda(vendas) if x['regra'] == 'vendas_queda'], [])
+        # a família inteira caiu: a queda continua
+        caiu = [_vend(LPT, 'MLB-A', 'L-0413', rec_sem=355, rec_base=1346 * 4),
+                _vend(LPT, 'MLB-B', 'L-0413', rec_sem=300, rec_base=838 * 4)]
+        self.assertEqual(len([x for x in _queda(caiu) if x['regra'] == 'vendas_queda']), 2)
+        # o outro anúncio é de outra loja: continua queda
+        outra = [_vend(LPT, 'MLB-A', 'L-0413', rec_sem=355, rec_base=1346 * 4),
+                 _vend(NALA, 'MLB-B', 'L-0413', rec_sem=1837, rec_base=838 * 4)]
+        self.assertEqual(len([x for x in _queda(outra) if x['regra'] == 'vendas_queda']), 1)
+
+    def test_irmao_estavel_nao_esconde_a_queda_do_anuncio(self):
+        # R$ 2.000/sem que zera ao lado de irmão de R$ 20.000/sem estável: continua queda
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=20000, rec_base=80000)]
+        q = [x for x in _queda(vendas) if x['regra'] == 'vendas_queda']
+        self.assertEqual([x['anuncio'] for x in q], ['MLB-A'])
+        # irmão que ganhou metade da perda (1.000 de 2.000): migrou
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=21000, rec_base=80000)]
+        self.assertEqual([x for x in _queda(vendas) if x['regra'] == 'vendas_queda'], [])
+        # irmão que ganhou menos da metade: continua queda
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=20900, rec_base=80000)]
+        self.assertEqual(len([x for x in _queda(vendas) if x['regra'] == 'vendas_queda']), 1)
+
+    def test_dias_base_sao_dias_distintos_entre_os_skus_do_anuncio(self):
+        d = [date(2026, 9, 3) + timedelta(days=i) for i in range(6)]
+        # 2 SKUs vendendo nos MESMOS 6 dias: 6 dias (não 12) -> abaixo do mínimo, não julga
+        linhas = [('L', 'I1', 'A', 0, 4000, 0, 0, 0, None, 0, d),
+                  ('L', 'I1', 'B', 0, 4000, 0, 0, 0, None, 0, d)]
+        por_an, _ = sd.agregar_vendas(linhas)
+        self.assertEqual(por_an[('L', 'I1')]['dias_base'], 6)
+        self.assertEqual(sd.sinais_vendas(por_an, sd.janelas(HOJE)), [])
+        # SKUs em dias diferentes: a união passa o mínimo
+        d2 = [date(2026, 9, 12) + timedelta(days=i) for i in range(6)]
+        linhas = [('L', 'I1', 'A', 0, 4000, 0, 0, 0, None, 0, d),
+                  ('L', 'I1', 'B', 0, 4000, 0, 0, 0, None, 0, d2)]
+        por_an, _ = sd.agregar_vendas(linhas)
+        self.assertEqual(por_an[('L', 'I1')]['dias_base'], 12)
+        self.assertEqual(len(sd.sinais_vendas(por_an, sd.janelas(HOJE))), 1)
+
+    def test_kit_e_item_da_mesma_peca_sao_familia(self):
+        comp = {'K2-L-0320': {'L-0320': 2}}
+        vendas = [_vend(LPT, 'MLB-K', 'K2-L-0320', rec_sem=100, rec_base=4000),
+                  _vend(LPT, 'MLB-I', 'L-0320', rec_sem=2400, rec_base=4000)]
+        s = [x for x in _queda(vendas, comp=comp) if x['regra'] == 'vendas_queda']
+        self.assertEqual(s, [])
+        s = [x for x in _queda(vendas) if x['regra'] == 'vendas_queda']   # sem a composição
+        self.assertEqual([x['anuncio'] for x in s], ['MLB-K'])
+
+    def test_venda_em_rajadas_nao_julga_alta_nem_queda(self):
+        # caso Shopee Lithouse(Nala) LNE-60005-PN (28-29/09): 4 dias de venda nos 28 da base
+        raj = [(S_NALA, '23093206063', 'LNE-60005-PN', 0, 2184, 0, 0, 0, None, 0, 4)]
+        self.assertEqual(_queda(raj), [])
+        raj = [(S_NALA, '23093206063', 'LNE-60005-PN', 2200, 2184, 0, 0, 0, None, 0, 4)]
+        self.assertEqual(_queda(raj), [])                                  # a "alta" do outro dia
+        reg = [(S_NALA, '23093206063', 'LNE-60005-PN', 0, 2184, 0, 0, 0, None, 0, 20)]
+        self.assertEqual(len(_queda(reg)), 1)                              # venda diária: queda real
+        self.assertEqual(len(_queda([_vend(LPT, 'MLB1', 'A', rec_sem=0, rec_base=4000)])), 1)
+
+    def test_sql_traz_os_dias_com_venda_na_base(self):
+        for q in (sd.SQL_VENDAS_ANUNCIO, sd.SQL_VENDAS_ANUNCIO_SHOPEE):
+            self.assertIn('COUNT(DISTINCT', q)
+            self.assertIn('AS dias_base', q)
+        self.assertIn(sd.SQL_ROAS_SUBIU, sd.TODAS_AS_SQL)
+
+
+class EmAcompanhamento(unittest.TestCase):
+    def test_mostra_o_numero_no_ciente_e_o_de_agora(self):
+        sinal = sd._sinal(LPT, 'VENDAS', 'MLB1', {'A'}, 'x', 's', 100, regra='vendas_queda',
+                          medida=-0.30)
+        linha = _ciente(LPT, 'vendas_queda', 'MLB1', medida=-0.25, id_=3)
+        ativos, sil = sd.aplicar_cientes([sinal], [linha], HOJE)
+        cientes = [dict(zip(sd.CIENTE_COLS, linha))]
+        df = sd.tabela_silenciados(sil, cientes, HOJE, {}, ativos)
+        self.assertEqual(df['Número no ciente'][0], '-25%')
+        self.assertEqual(df['Número agora'][0], '-30%')
+        self.assertEqual(df['Hoje'][0], 'ainda dispara')
+
+    def test_sem_o_sinal_hoje_o_numero_de_agora_e_traco(self):
+        linha = _ciente(LPT, 'vendas_queda', 'MLB1', medida=-0.25, id_=3)
+        cientes = [dict(zip(sd.CIENTE_COLS, linha))]
+        df = sd.tabela_silenciados([], cientes, HOJE, {}, [])
+        self.assertEqual(df['Número agora'][0], '—')
 
 
 if __name__ == '__main__':

@@ -889,6 +889,14 @@ def _area_logada(engine):
             importlib.reload(sinais_dia)
         sinais_dia.render(engine)
 
+    elif modulo == 'plano_escala':
+        mostrar_badge_leitura('plano_escala')
+        mostrar_badge_filtro_loja()
+        import plano_escala
+        if _is_dev_environment() or st.session_state.get('_force_reload_modules', False):
+            importlib.reload(plano_escala)
+        plano_escala.render(engine)
+
     elif modulo == 'ads':
         mostrar_badge_filtro_loja()
         from analise_ads import modulo_ads

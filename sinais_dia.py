@@ -216,7 +216,34 @@ DIAS_ATRASO_API = 0
 SEMANAS_BASE = 4                 # base = média semanal das 4 semanas anteriores
 QUEDA_VENDA = 0.50               # semana < 50% da média semanal → queda
 ALTA_VENDA = 2.0                 # semana > 2× a média semanal → alta
-RECEITA_MIN_RELEVANTE = 1000.0   # R$ nas 4 semanas de base: anúncio "relevante"
+RECEITA_MIN_RELEVANTE = 1000.0   # R$ nas 4 semanas de base: anúncio "relevante" (R$ 250/sem)
+
+# Faixas de queda de venda/visitas (decisão do Thiago, 09/10/2026, sobre a proposta
+# do [ANALISTA PERFORMANCE]; calibragem de 2 semanas com a Larissa). A faixa vem da
+# média semanal da BASE (rec_base ÷ 4), nunca da semana atual; semana × média das 4
+# semanas (o sábado vende ~25% menos: nunca diária).
+#   média da base ≥ RECEITA_SEM_FAIXA_ALTA/sem : laranja (−10%), vermelho (−20%) e
+#                                                amarelo (fora do projetado, abaixo)
+#   RECEITA_MIN_RELEVANTE/4 a FAIXA_ALTA/sem   : só a régua de QUEDA_VENDA (−50%)
+#   abaixo de RECEITA_MIN_RELEVANTE/4 por sem  : não acende
+RECEITA_SEM_FAIXA_ALTA = 500.0
+QUEDA_LARANJA = 0.10             # semana ≥ 10% abaixo da média semanal da base
+QUEDA_VERMELHO = 0.20            # semana ≥ 20% abaixo
+# AMARELO = "saiu do projetado": performance do mês (projeção do módulo Performance ÷
+# meta do anúncio em dim_metas_anuncio) abaixo deste corte. É o corte do módulo:
+# performance.py _cor_performance deixa de ser 🟢 (verde) abaixo de 100%.
+PERF_CORTE_AMARELO = 100.0
+MIGRACAO_MIN_GANHO = 0.5         # irmãos ganharam ≥ 50% do que o anúncio perdeu: a venda migrou
+MIN_DIAS_MES_PROJECAO = 3        # menos dias fechados no mês: não projeta
+# Venda em rajadas (caso Shopee Lithouse(Nala) LNE-60005-PN, 28–29/09: alta e queda
+# em dias seguidos): só julga alta/queda o anúncio com venda em pelo menos tantos
+# dos 28 dias da base. Calibrar com a Larissa.
+MIN_DIAS_VENDA_BASE = 8
+# Ruído de ads (8–9/10: ads_sem_venda 19 acesos com < R$ 20 em jogo; espiral com
+# R$ 3/sem na ML-Nala L-0303)
+MIN_GASTO_SEM_VENDA = 20.0       # R$ gastos nos dias seguidos sem venda de ads
+MIN_GASTO_BASE_ESPIRAL = 20.0    # R$/sem de gasto na base para falar em "espiral"
+DIAS_ROAS_SUBIU = 14             # ROAS objetivo subiu nesta janela → queda é informativo
 
 JANELA_RITMO_FULL = 7            # venda recente (dias, terminando em D-3)
 JANELA_PISO_FULL = 30            # piso: média de 30 dias (terminando em D-3)
@@ -247,6 +274,7 @@ DIAS_SELO_VENCIDO = 7            # mostra "voltou: venceu" por 7 dias
 MOTIVOS = {'falta_fornecedor': 'Falta no fornecedor',
            'proposital': 'Decisão proposital',
            'em_andamento': 'Já em andamento',
+           'alarme_falso': 'Alarme falso / não serve',
            'outro': 'Outro'}
 
 REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
@@ -345,7 +373,9 @@ SQL_VENDAS_ANUNCIO = """
            SUM(quantidade) FILTER (WHERE data_venda >= %(piso_ini)s)           AS qtd_30,
            SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %(piso_ini)s)  AS rec_30,
            SUM(margem_total) FILTER (WHERE data_venda >= %(piso_ini)s)         AS margem_30,
-           COUNT(DISTINCT numero_pedido) FILTER (WHERE data_venda >= %(piso_ini)s) AS pedidos_30
+           COUNT(DISTINCT numero_pedido) FILTER (WHERE data_venda >= %(piso_ini)s) AS pedidos_30,
+           ARRAY_AGG(DISTINCT data_venda) FILTER (WHERE data_venda >= %(base_ini)s
+                                                    AND data_venda <= %(base_fim)s)  AS dias_base
       FROM fact_vendas_snapshot
      WHERE marketplace_origem = %(marketplace)s
        AND loja_origem = ANY(%(lojas)s)
@@ -366,7 +396,9 @@ SQL_VENDAS_ANUNCIO_SHOPEE = """
            SUM(f.quantidade) FILTER (WHERE f.data_venda >= %(piso_ini)s)           AS qtd_30,
            SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %(piso_ini)s)  AS rec_30,
            SUM(f.margem_total) FILTER (WHERE f.data_venda >= %(piso_ini)s)         AS margem_30,
-           COUNT(DISTINCT f.numero_pedido) FILTER (WHERE f.data_venda >= %(piso_ini)s) AS pedidos_30
+           COUNT(DISTINCT f.numero_pedido) FILTER (WHERE f.data_venda >= %(piso_ini)s) AS pedidos_30,
+           ARRAY_AGG(DISTINCT f.data_venda) FILTER (WHERE f.data_venda >= %(base_ini)s
+                                                      AND f.data_venda <= %(base_fim)s)  AS dias_base
       FROM fact_vendas_snapshot f
       LEFT JOIN fact_pedidos_itens_marketplace i
              ON i.marketplace = f.marketplace_origem AND i.loja = f.loja_origem
@@ -452,6 +484,29 @@ SQL_CONFIG_MUDOU = """
      WHERE a.k = 1 AND a.dia = %(hoje)s
        AND (a.roas_objetivo IS DISTINCT FROM b.roas_objetivo
             OR a.orcamento_diario IS DISTINCT FROM b.orcamento_diario)
+"""
+
+# ROAS objetivo que SUBIU nos últimos DIAS_ROAS_SUBIU dias: a última subida de cada
+# campanha (foto do dia anterior × foto do dia). Explica a queda de venda que vem
+# depois (a gestora apertou o ROAS de propósito) — vira informativo, não espiral.
+SQL_ROAS_SUBIU = """
+    WITH c AS (
+        SELECT DISTINCT ON (loja, id_campanha, data_captura::date)
+               loja, id_campanha, campanha, data_captura::date AS dia,
+               roas_objetivo, detalhe->>'item_id' AS item_id
+          FROM fact_ads_campanha_config
+         WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
+           AND data_captura >= %(ini_roas)s AND data_captura < %(amanha)s
+         ORDER BY loja, id_campanha, data_captura::date, data_captura DESC),
+    l AS (
+        SELECT c.*, lag(roas_objetivo) OVER (PARTITION BY loja, id_campanha ORDER BY dia) AS antes
+          FROM c),
+    s AS (
+        SELECT l.*, row_number() OVER (PARTITION BY loja, id_campanha ORDER BY dia DESC) AS k
+          FROM l
+         WHERE antes > 0 AND roas_objetivo > antes AND dia >= %(roas_desde)s)
+    SELECT loja, id_campanha, campanha, dia, antes, roas_objetivo, item_id
+      FROM s WHERE k = 1
 """
 
 SQL_EXPERIENCIA = """
@@ -615,7 +670,7 @@ FONTES_FRESCOR = ('Vendas', 'Estoque', 'Ads', 'Config. de ads', 'Experiência')
 TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
                 SQL_VENDAS_ANUNCIO_SHOPEE, SQL_EXISTE_VIEWS_SHOPEE, SQL_VIEWS_SHOPEE, SQL_PONTE,
                 SQL_ESTOQUE_FOTO, SQL_ESTOQUE_SEMANA, SQL_ADS, SQL_CONFIG_MUDOU,
-                SQL_EXPERIENCIA, SQL_EXISTE_VISITAS, SQL_VISITAS, SQL_FRESCOR,
+                SQL_ROAS_SUBIU, SQL_EXPERIENCIA, SQL_EXISTE_VISITAS, SQL_VISITAS, SQL_FRESCOR,
                 SQL_EXISTE_HISTORICO, SQL_HISTORICO, SQL_HISTORICO_DIAS, SQL_GRAVAR_HISTORICO,
                 SQL_EXISTE_CIENTE, SQL_CIENTES_ABERTOS, SQL_FECHAR_ABERTO,
                 SQL_INSERIR_CIENTE, SQL_REATIVAR)
@@ -627,7 +682,9 @@ def params(hoje, lojas, mkt=MARKETPLACE):
               'amanha': hoje + timedelta(days=1),
               'ini_hist': hoje - timedelta(days=DIAS_HISTORICO),
               'dias_ref': DIAS_REF_EXPERIENCIA, 'janela_views': JANELA_VIEWS_SHOPEE,
-              'ano_mes': p['ontem'].strftime('%Y-%m')})
+              'ano_mes': p['ontem'].strftime('%Y-%m'),
+              'ini_roas': hoje - timedelta(days=DIAS_ROAS_SUBIU + 16),
+              'roas_desde': hoje - timedelta(days=DIAS_ROAS_SUBIU)})
     return p
 
 
@@ -659,6 +716,7 @@ FONTES = {
     'estoque_semana': SQL_ESTOQUE_SEMANA,
     'ads': SQL_ADS,
     'config': SQL_CONFIG_MUDOU,
+    'roas_subiu': SQL_ROAS_SUBIU,
     'experiencia': SQL_EXPERIENCIA,
     'frescor': SQL_FRESCOR,
 }
@@ -765,7 +823,10 @@ def objeto_campanha(anuncio, campanha, dia):
 
 def agregar_vendas(vendas):
     """[(loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30
-    [, pedidos_30])] -> (por_anuncio, por_anuncio_sku).
+    [, pedidos_30 [, dias_base]])] -> (por_anuncio, por_anuncio_sku).
+    dias_base = as DATAS com venda na base (lista) ou a contagem; o anúncio fica com
+    o nº de dias DISTINTOS entre os SKUs (não a soma); None quando a linha não traz.
+    Serve a MIN_DIAS_VENDA_BASE.
     por_anuncio[(loja, anuncio)]: R$ somados (R$ pode somar), SKUs, e
     unidades/margem por unidade SÓ quando o anúncio vendeu um SKU único.
     margem_30_tot e pedidos_30 servem à margem POR PEDIDO (Shopee): R$ ÷
@@ -777,12 +838,19 @@ def agregar_vendas(vendas):
     for linha in vendas:
         loja, anuncio, sku, rs, rb, qr, q30, r30, m30 = linha[:9]
         ped30 = linha[9] if len(linha) > 9 else 0
+        dias_base = linha[10] if len(linha) > 10 else None
         por_sku[(loja, anuncio, sku)] = {'qtd_ritmo': _f(qr), 'qtd_30': _f(q30),
                                          'rec_30': _f(r30)}
         a = an.setdefault((loja, anuncio), {'rec_sem': 0.0, 'rec_base': 0.0, 'rec_30': 0.0,
                                             'skus': set(), 'qtd_30': 0.0, 'margem_30': None,
-                                            'margem_30_tot': None, 'pedidos_30': 0.0})
+                                            'margem_30_tot': None, 'pedidos_30': 0.0,
+                                            'dias_base': None})
         a['pedidos_30'] += _f(ped30)
+        if isinstance(dias_base, int):
+            a['dias_base'] = max(a['dias_base'] or 0, dias_base)
+        elif dias_base is not None:
+            a.setdefault('_dias', set()).update(dias_base)
+            a['dias_base'] = max(a['dias_base'] or 0, len(a['_dias']))
         if m30 is not None:
             a['margem_30_tot'] = (a['margem_30_tot'] or 0.0) + float(m30)
         a['rec_sem'] += _f(rs)
@@ -810,46 +878,142 @@ def _periodo_semanas(j):
 
 
 def _sinal(loja, tipo, anuncio, skus, numero, sugestao, em_jogo, urgente=False,
-           familia='', regra='', objeto=None, medida=None, periodo=''):
+           familia='', regra='', objeto=None, medida=None, periodo='', cor='',
+           informativo=False):
     """regra + loja + objeto = a chave do Ciente; medida = o número que diz se
-    o sinal piorou depois do ciente (ver piorou())."""
+    o sinal piorou depois do ciente (ver piorou()). cor = faixa da queda
+    ('vermelho', 'laranja', 'amarelo' ou ''); informativo = não pede resposta
+    (mostra a causa; fica na tela até o Ciente ou DIAS_ROAS_SUBIU dias)."""
     return {'loja': loja, 'tipo': tipo, 'anuncio': anuncio or '',
             'skus': tuple(sorted(skus or ())), 'numero': numero,
             'sugestao': sugestao, 'em_jogo': float(em_jogo or 0),
             'urgente': urgente, 'familia': familia, 'regra': regra,
             'objeto': objeto if objeto is not None else (anuncio or ''),
             'medida': None if medida is None else float(medida), 'voltou': '',
-            'periodo': periodo}
+            'periodo': periodo, 'cor': cor, 'informativo': informativo}
 
 
 def _rel(a):
     return a['rec_base'] >= RECEITA_MIN_RELEVANTE
 
 
-def sinais_vendas(por_anuncio, j):
+def faixa_queda(sem, base_sem, tamanho=None):
+    """Faixa da queda da semana contra a média semanal da base. 'vermelho' /
+    'laranja' (anúncio de R$ RECEITA_SEM_FAIXA_ALTA/sem ou mais), '' (faixa do meio:
+    só a régua de QUEDA_VENDA, sem cor) ou None (não é queda para o tamanho).
+    tamanho = R$/sem da base que define a faixa (padrão: a própria base; as visitas
+    usam a receita do anúncio)."""
+    tamanho = base_sem if tamanho is None else tamanho
+    if tamanho >= RECEITA_SEM_FAIXA_ALTA:
+        if sem <= (1 - QUEDA_VERMELHO) * base_sem:
+            return 'vermelho'
+        if sem <= (1 - QUEDA_LARANJA) * base_sem:
+            return 'laranja'
+        return None
+    return '' if sem < QUEDA_VENDA * base_sem else None
+
+
+def venda_migrou(chave, por_anuncio, comp, base_sem):
+    """A venda foi para outro anúncio da mesma peça/loja (outra cor, variação)?
+    Verdade quando os irmãos (anúncios que dividem peça com ele na mesma loja)
+    GANHARAM pelo menos MIGRACAO_MIN_GANHO do que ele perdeu. Irmão estável não
+    prova migração (anúncio de R$ 2.000/sem que zera ao lado de irmão de R$ 20.000/sem
+    estável continua queda). Sem irmão: falso."""
+    loja, _anuncio = chave
+    pecas = set()
+    for sku in por_anuncio[chave]['skus']:
+        pecas.update(p for p, _q in ep.pecas_do_sku(sku, comp))
+    if not pecas:
+        return False
+    irmaos = []
+    for (l, an), x in por_anuncio.items():
+        if l != loja or (l, an) == chave:
+            continue
+        if any(p in pecas for sku in x['skus'] for p, _q in ep.pecas_do_sku(sku, comp)):
+            irmaos.append(x)
+    if not irmaos:
+        return False
+    perda = base_sem - por_anuncio[chave]['rec_sem']
+    ganho = sum(x['rec_sem'] - x['rec_base'] / SEMANAS_BASE for x in irmaos)
+    return perda > 0 and ganho >= MIGRACAO_MIN_GANHO * perda
+
+
+def _txt_roas(v):
+    return _dec(float(v)).removesuffix(',0')
+
+
+def sinais_vendas(por_anuncio, j, performance=None, comp=None, roas_subiu=None,
+                  visitas=None):
+    """Alta e queda de venda por anúncio, semana × média semanal da base.
+    performance: {(loja, anuncio): {'performance', 'proj_fat', 'meta_fat'}} (módulo
+    Performance; só o anúncio com meta cadastrada entra, e só ele pode ficar
+    amarelo). comp: composição de kits (família por peça). roas_subiu:
+    {(loja, anuncio): (dia, antes, agora)} — a queda vira informativo. visitas:
+    {(loja, anuncio): variação de visitas}, mostrada junto da venda."""
     out = []
-    for (loja, anuncio), a in por_anuncio.items():
+    performance = performance or {}
+    comp = comp or {}
+    roas_subiu = roas_subiu or {}
+    visitas = visitas or {}
+    for chave, a in por_anuncio.items():
+        loja, anuncio = chave
         if not _rel(a):
             continue
+        if a.get('dias_base') is not None and a['dias_base'] < MIN_DIAS_VENDA_BASE:
+            continue                    # venda em rajadas: a janela deslizante engana
         base_sem = a['rec_base'] / SEMANAS_BASE
         sem = a['rec_sem']
         periodo = f"{j['sem_ini']:%d/%m}–{j['fim']:%d/%m}"
-        if sem < QUEDA_VENDA * base_sem:
+        var = sem / base_sem - 1
+        vis = f"; visitas {_pct(visitas[chave])}" if visitas.get(chave) is not None else ''
+        cor = faixa_queda(sem, base_sem)
+        if cor is not None and venda_migrou(chave, por_anuncio, comp, base_sem):
+            cor = None                  # vendendo as outras cores/variações
+        if cor is not None:
+            rotulo = f"Queda {cor}" if cor else "Queda"
+            txt = (f"{rotulo}: semana {periodo} {_brl(sem)} × média {_brl(base_sem)}/sem "
+                   f"({_pct(var)}){vis}")
+            sug = "Ver Full/estoque, preço, posição e se o ads foi mexido"
+            info = False
+            # a foto de config do dia D traz o que a gestora mudou em D-1: só explica a
+            # queda a subida cuja foto é até o último dia da semana (rise depois da
+            # semana não causou a queda dela)
+            if chave in roas_subiu and pd.Timestamp(roas_subiu[chave][0]).date() <= j['fim']:
+                dia, antes, agora = roas_subiu[chave]
+                txt = (f"Venda {_pct(var)} (semana {periodo} {_brl(sem)} × média "
+                       f"{_brl(base_sem)}/sem) depois que o ROAS objetivo subiu de "
+                       f"{_txt_roas(antes)} para {_txt_roas(agora)} em "
+                       f"{pd.Timestamp(dia):%d/%m}{vis}")
+                sug = ("Informativo: a queda veio depois de subir o ROAS objetivo "
+                       "(escolha da gestora). Acompanhar; não pede resposta")
+                info = True
             out.append(_sinal(
-                loja, 'VENDAS', anuncio, a['skus'],
-                f"Queda: semana {periodo} {_brl(sem)} × média {_brl(base_sem)}/sem "
-                f"({_pct(sem / base_sem - 1)})",
-                "Ver Full/estoque, preço, posição e se o ads foi mexido",
-                base_sem - sem, regra='vendas_queda', medida=sem / base_sem - 1,
-                periodo=_periodo_semanas(j)))
-        elif sem > ALTA_VENDA * base_sem:
+                loja, 'VENDAS', anuncio, a['skus'], txt, sug, base_sem - sem,
+                regra='vendas_queda', medida=var, periodo=_periodo_semanas(j),
+                cor=cor, informativo=info))
+            continue
+        if sem > ALTA_VENDA * base_sem:
             out.append(_sinal(
                 loja, 'VENDAS', anuncio, a['skus'],
                 f"Alta: semana {periodo} {_brl(sem)} × média {_brl(base_sem)}/sem "
-                f"({_pct(sem / base_sem - 1)})",
+                f"({_pct(var)})",
                 "Garantir Full para o novo ritmo; campanha não travar no orçamento",
-                sem - base_sem, regra='vendas_alta', medida=sem / base_sem - 1,
+                sem - base_sem, regra='vendas_alta', medida=var,
                 periodo=_periodo_semanas(j)))
+            continue
+        p = performance.get(chave)
+        if (base_sem >= RECEITA_SEM_FAIXA_ALTA and p and p.get('performance') is not None
+                and p['performance'] < PERF_CORTE_AMARELO):
+            falta = max(_f(p.get('meta_fat')) - _f(p.get('proj_fat')), 0.0)
+            out.append(_sinal(
+                loja, 'VENDAS', anuncio, a['skus'],
+                f"Amarelo, fora do projetado: performance do mês {p['performance']:.0f}% "
+                f"da meta (projeção {_brl(_f(p.get('proj_fat')))} × meta "
+                f"{_brl(_f(p.get('meta_fat')))}); semana {periodo} {_brl(sem)} × média "
+                f"{_brl(base_sem)}/sem ({_pct(var)}){vis}",
+                "Ver o ritmo do mês contra a meta do anúncio (estoque, preço, ads)",
+                falta, regra='vendas_queda', medida=var, periodo=_periodo_semanas(j),
+                cor='amarelo'))
     return out
 
 
@@ -987,11 +1151,13 @@ def _roas(v, mkt):
 
 
 def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
-               mkt=MARKETPLACE, lojas_com_estoque=None, dias_full=None):
+               mkt=MARKETPLACE, lojas_com_estoque=None, dias_full=None, em_full=None):
     """ads: {(loja, anuncio): dict}; config: linhas de SQL_CONFIG_MUDOU.
     com_estoque=False (a leitura do estoque da semana falhou) ou loja fora de
     lojas_com_estoque (sem estoque no banco, ex. Shopee hoje): a espiral não é
-    julgada, porque sem estoque não dá para separar espiral de ruptura."""
+    julgada, porque sem estoque não dá para separar espiral de ruptura.
+    em_full: {(loja, anuncio)} dos anúncios no Full; se o Full faltou em algum dia da
+    semana a espiral não acende (a causa é a ruptura)."""
     out = []
     for loja, idc, camp, d_antes, d_agora, r0, r1, o0, o1, *resto in config:
         item_id = resto[0] if resto else None
@@ -1007,7 +1173,7 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
             "Mudou ontem: " + '; '.join(partes) + f" (foto de {pd.Timestamp(d_antes):%d/%m} → hoje)",
             "Acompanhar venda e TACOS nos próximos 3 dias", a.get('rec_30', 0.0),
             regra='ads_config', objeto=objeto_campanha(anuncio, camp, d_agora),
-            periodo=f"foto {_d(d_antes)} → {_d(d_agora)}"))
+            periodo=f"foto {_d(d_antes)} → {_d(d_agora)}", informativo=True))
 
     semana = 7
     for (loja, anuncio), d in ads.items():
@@ -1017,7 +1183,9 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
                                                'margem_30_tot': None, 'pedidos_30': 0.0,
                                                'sku_unico': False})
         # gasto com zero venda de ads há N dias
-        if int(d.get('dias_com_gasto') or 0) >= DIAS_GASTO_SEM_VENDA and _f(d.get('unid_recente')) == 0:
+        if (int(d.get('dias_com_gasto') or 0) >= DIAS_GASTO_SEM_VENDA
+                and _f(d.get('unid_recente')) == 0
+                and _f(d.get('gasto_recente')) >= MIN_GASTO_SEM_VENDA):
             out.append(_sinal(
                 loja, 'ADS', anuncio, a['skus'],
                 f"{DIAS_GASTO_SEM_VENDA} dias com gasto e zero venda de ads "
@@ -1063,7 +1231,7 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
         gasto_base_sem = _f(d.get('gasto_base')) / SEMANAS_BASE
         rec_base_sem = a['rec_base'] / SEMANAS_BASE
         if (com_estoque and (lojas_com_estoque is None or loja in lojas_com_estoque)
-                and gasto_base_sem > 0 and _rel(a)
+                and gasto_base_sem >= MIN_GASTO_BASE_ESPIRAL and _rel(a)
                 and _f(d.get('gasto_sem')) < ESPIRAL_QUEDA_GASTO * gasto_base_sem
                 and a['rec_sem'] < ESPIRAL_QUEDA_VENDA * rec_base_sem):
             tacos_sem = _f(d.get('gasto_sem')) / a['rec_sem'] if a['rec_sem'] else None
@@ -1071,6 +1239,9 @@ def sinais_ads(ads, config, por_anuncio, dias_estoque, j, com_estoque=True,
             dias = dias_estoque.get((loja, anuncio), 0)
             queda = rec_base_sem - a['rec_sem']
             if dias >= semana:
+                if ((loja, anuncio) in (em_full or ())
+                        and (dias_full or {}).get((loja, anuncio), 0) < semana):
+                    continue            # Full faltou na semana: a causa é a ruptura, não o ads
                 out.append(_sinal(
                     loja, 'ADS', anuncio, a['skus'],
                     f"Espiral: gasto de ads {_brl(_f(d.get('gasto_sem')))} × média "
@@ -1182,8 +1353,9 @@ def sinais_visitas(visitas, por_anuncio, j):
         sem = _f(vs)
         if base_sem <= 0:
             continue
-        if sem < QUEDA_VENDA * base_sem:
-            txt, sug, regra = ("Queda de visitas",
+        cor = faixa_queda(sem, base_sem, a['rec_base'] / SEMANAS_BASE)
+        if cor is not None:
+            txt, sug, regra = ("Queda de visitas" + (f" {cor}" if cor else ''),
                                "Ver posição, preço, ads e se o anúncio foi pausado", 'visitas_queda')
         elif sem > ALTA_VENDA * base_sem:
             txt, sug, regra = ("Alta de visitas",
@@ -1194,7 +1366,7 @@ def sinais_visitas(visitas, por_anuncio, j):
             loja, 'VISITAS', anuncio, a['skus'],
             f"{txt}: semana {sem:.0f} × média {base_sem:.0f}/sem ({_pct(sem / base_sem - 1)})",
             sug, a['rec_base'] / SEMANAS_BASE, regra=regra, medida=sem / base_sem - 1,
-            periodo=_periodo_semanas(j)))
+            periodo=_periodo_semanas(j), cor=cor or ''))
     return out
 
 
@@ -1269,6 +1441,83 @@ def _bloco(nome, erros, padrao, f, *args, **kw):
         return padrao
 
 
+def roas_que_subiu(linhas):
+    """{(loja, anuncio): (dia, antes, agora)} da SQL_ROAS_SUBIU (a subida mais
+    recente de cada anúncio)."""
+    out = {}
+    for loja, idc, camp, dia, antes, agora, item_id in linhas or []:
+        anuncio = item_id or anuncio_da_campanha(idc, camp)
+        if not anuncio:
+            continue
+        atual = out.get((loja, anuncio))
+        if atual is None or pd.Timestamp(dia) > pd.Timestamp(atual[0]):
+            out[(loja, anuncio)] = (dia, antes, agora)
+    return out
+
+
+def variacao_visitas(linhas):
+    """{(loja, anuncio): semana ÷ média semanal da base − 1} das visitas do ML."""
+    out = {}
+    for loja, anuncio, vs, vb in linhas or []:
+        base = _f(vb) / SEMANAS_BASE
+        if base > 0:
+            out[(loja, anuncio)] = _f(vs) / base - 1
+    return out
+
+
+def _performance_por_anuncio(performance, por_anuncio):
+    """A performance do módulo Performance na chave do Sinais. ML/Amazon: o
+    código do anúncio é o mesmo. Shopee: as metas vêm tanto por item_id quanto por
+    SKU; a meta por SKU só vale para o anúncio que é o ÚNICO daquele SKU na loja
+    (com dois anúncios do mesmo SKU a meta é da soma, não de um deles)."""
+    if not performance:
+        return {}
+    por_sku = {}
+    for (loja, anuncio), a in por_anuncio.items():
+        for sku in a['skus']:
+            por_sku.setdefault((loja, sku), set()).add(anuncio)
+    out = {}
+    for (loja, anuncio), a in por_anuncio.items():
+        p = performance.get((loja, anuncio))
+        if p is None and len(a['skus']) == 1:
+            sku = next(iter(a['skus']))
+            if por_sku.get((loja, sku)) == {anuncio}:
+                p = performance.get((loja, sku))
+        if p is not None:
+            out[(loja, anuncio)] = p
+    return out
+
+
+def ler_performance(engine, hoje, lojas, mkt=MARKETPLACE):
+    """{(loja, codigo_anuncio): {'performance', 'proj_fat', 'meta_fat'}} do módulo
+    Performance (construir_tabela_performance), só dos anúncios com meta em
+    dim_metas_anuncio. A conta é a do módulo; aqui só se fixa o DIA: realizado até D-1
+    (DIAS_ATRASO_API), nunca "hoje". Mês com menos de MIN_DIAS_MES_PROJECAO dias
+    fechados não projeta (projetar 2 dias é ruído)."""
+    import calendar
+    import performance_utils as pu
+    fim = janelas(hoje)['fim']
+    out = {}
+    if fim.day < MIN_DIAS_MES_PROJECAO and fim.month == hoje.month:
+        return out
+    ano_mes = fim.strftime('%Y-%m')
+    dias_mes = calendar.monthrange(fim.year, fim.month)[1]
+    for loja in lojas:
+        meta = pu.buscar_meta_loja(engine, loja, ano_mes)
+        modelo = (meta or {}).get('modelo_projecao') or 'Linear'
+        df = pu.construir_tabela_performance(
+            engine, loja, mkt, ano_mes, modelo, dias_vendas_override=fim.day,
+            dias_mes_override=dias_mes, data_fim=fim)
+        if df is None or df.empty:
+            continue
+        for r in df.itertuples():
+            if r.performance is not None and not pd.isna(r.performance) and r.meta_qtd > 0:
+                out[(loja, r.codigo_anuncio)] = {'performance': float(r.performance),
+                                                 'proj_fat': float(r.proj_fat),
+                                                 'meta_fat': float(r.meta_fat)}
+    return out
+
+
 def montar_sinais(dados, hoje, mkt=MARKETPLACE):
     """(sinais, erros_por_bloco), a partir do que ler_tudo leu. Fonte que não
     veio (erro de leitura) só deixa de gerar os seus sinais; bloco que quebra
@@ -1285,7 +1534,11 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
 
     sinais = []
     if 'vendas' in dados and 'vendas' not in erros:
-        sinais += _bloco('vendas', erros, [], sinais_vendas, por_anuncio, j)
+        sinais += _bloco('vendas', erros, [], sinais_vendas, por_anuncio, j,
+                         performance=_performance_por_anuncio(dados.get('performance'), por_anuncio),
+                         comp=comp, roas_subiu=roas_que_subiu(dados.get('roas_subiu')),
+                         visitas=(None if mkt == SHOPEE
+                                  else variacao_visitas(dados.get('visitas'))))
     if 'foto' in dados and 'ponte' in dados and 'vendas' in dados and 'full' not in erros:
         sinais += _bloco('full', erros, [], sinais_full, dados['foto'], ponte, por_sku, ads, j,
                          mkt)
@@ -1298,7 +1551,8 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
                          por_anuncio, dias_est, j,
                          com_estoque='estoque_semana' in dados and 'ponte' in dados,
                          mkt=mkt, lojas_com_estoque={r[0] for r in dados.get('foto') or []},
-                         dias_full=dias_full)
+                         dias_full=dias_full,
+                         em_full={(l, a) for l, a, _e, _s, f in ponte if f})
     if 'experiencia' in dados and 'experiencia' not in erros:
         sinais += _bloco('experiencia', erros, [], sinais_experiencia,
                          dados['experiencia'], ponte, comp, por_anuncio)
@@ -1311,6 +1565,13 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
                              por_anuncio, j)
 
     sinais = unir_rupturas(sinais)
+
+    # Queda que veio depois de subir o ROAS objetivo é informativo (escolha da
+    # gestora): a espiral do mesmo anúncio não acende.
+    por_roas = {(s['loja'], s['anuncio']) for s in sinais
+                if s['regra'] == 'vendas_queda' and s['informativo']}
+    sinais = [s for s in sinais
+              if not (s['regra'] == 'ads_espiral' and (s['loja'], s['anuncio']) in por_roas)]
 
     # Espiral/ruptura explicam a queda: o sinal genérico de VENDAS do mesmo
     # anúncio sai, para não ocupar duas linhas das 10.
@@ -1517,7 +1778,9 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
     for sn in sinais:
         produto = ' / '.join(nomes.get(x) or '(sem cadastro)' for x in sn['skus'])
         ws.append([sn['loja'], sn['regra'], sn['objeto'], sn['tipo'],
-                   REGRAS.get(sn['regra'], sn['regra']), ', '.join(sn['skus']), produto,
+                   REGRAS.get(sn['regra'], sn['regra'])
+                   + (' (informativo)' if sn.get('informativo') else ''),
+                   ', '.join(sn['skus']), produto,
                    sn['anuncio'], sn['numero'], sn.get('periodo', ''),
                    sn.get('desde_txt', '—'), round(sn['em_jogo'], 2), None, None, None, None])
     ultima = max(len(sinais) + 1, 2)
@@ -1770,7 +2033,8 @@ def reler_vendas_upload(conn, dados, sinais, hoje, lojas, mkt):
         hoje_l = ultimo + timedelta(days=1)
         vendas = _ler(conn, fontes(mkt)['vendas'], params(hoje_l, [loja], mkt))
         por_an, _ = agregar_vendas(vendas)
-        novos = sinais_vendas(por_an, janelas(hoje_l))
+        novos = sinais_vendas(por_an, janelas(hoje_l),
+                              comp=ep.agrupar_composicao(dados.get('composicao') or []))
         sinais = [x for x in sinais
                   if not (x['loja'] == loja and x['regra'] in REGRAS_DE_VENDA)] + novos
         ate[loja] = ultimo
@@ -1897,7 +2161,9 @@ def lojas_visiveis(lojas_ml, restricao):
 ROTULO_FONTE = {
     'resumo': 'resumo de vendas', 'metas': 'metas', 'vendas': 'vendas por anúncio',
     'ponte': 'anúncios × estoque', 'foto': 'foto do Full', 'estoque_semana': 'estoque da semana',
-    'ads': 'ads', 'config': 'mudanças de ROAS/orçamento', 'experiencia': 'experiência de compra',
+    'ads': 'ads', 'config': 'mudanças de ROAS/orçamento',
+    'roas_subiu': 'subidas de ROAS objetivo', 'performance': 'projeção do mês (Performance)',
+    'experiencia': 'experiência de compra',
     'frescor': 'datas de chegada', 'composicao': 'composição de kits', 'visitas': 'visitas',
     'ciente': 'cientes registrados', 'historico': 'histórico dos sinais',
 }
@@ -1907,6 +2173,7 @@ ROTULO_BLOCO = {'vendas': 'VENDAS', 'full': 'FULL', 'ads': 'ADS',
                 'historico': '"APARECE DESDE"'}
 
 ICONE = {'VENDAS': '📉', 'FULL': '📦', 'ADS': '📣', 'EXPERIÊNCIA': '⭐', 'VISITAS': '👀'}
+ICONE_COR = {'vermelho': '🟥', 'laranja': '🟧', 'amarelo': '🟨'}
 
 
 def tabela_sinais(sinais, nomes):
@@ -1914,8 +2181,9 @@ def tabela_sinais(sinais, nomes):
         return ' / '.join(nomes.get(s) or '(sem cadastro)' for s in skus) if skus else ''
     return pd.DataFrame({
         'Loja': [s['loja'] for s in sinais],
-        'Tipo': [('🔴 ' if s['urgente'] else '') + ICONE.get(s['tipo'], '') + ' ' + s['tipo']
-                 for s in sinais],
+        'Tipo': [('🔴 ' if s['urgente'] else '') + ICONE_COR.get(s.get('cor'), '')
+                 + ('ℹ️ ' if s.get('informativo') else '')
+                 + ICONE.get(s['tipo'], '') + ' ' + s['tipo'] for s in sinais],
         'SKU': [', '.join(s['skus']) for s in sinais],
         'Produto': [produto(s['skus']) for s in sinais],
         'Anúncio': ['(por SKU)' if s['anuncio'].startswith('SKU:') else s['anuncio']
@@ -1941,7 +2209,7 @@ def cientes_silenciando(cientes_loja, ativos, hoje):
 def tabela_silenciados(silenciados, cientes_loja, hoje, nomes, ativos=()):
     """Cientes que estão calando algo, com o motivo à vista; diz se o sinal
     ainda dispara hoje."""
-    disparando = {(x['regra'], x['objeto']) for x in silenciados}
+    disparando = {(x['regra'], x['objeto']): x for x in silenciados}
     linhas = []
     for c in cientes_silenciando(cientes_loja, ativos, hoje):
         linhas.append({
@@ -1954,6 +2222,9 @@ def tabela_silenciados(silenciados, cientes_loja, hoje, nomes, ativos=()):
             'Quando': f"{pd.Timestamp(c['criado_em']):%d/%m %H:%M}",
             'Hoje': ('ainda dispara' if (c['regra'], c['objeto']) in disparando
                      else 'não disparou hoje'),
+            'Número no ciente': texto_medida(c['regra'], c['medida_no_ciente']),
+            'Número agora': (texto_medida(c['regra'], disparando[(c['regra'], c['objeto'])]['medida'])
+                             if (c['regra'], c['objeto']) in disparando else '—'),
             'No ciente': c['texto_no_ciente'] or '',
         })
     return pd.DataFrame(linhas)
@@ -2028,6 +2299,10 @@ def _ler_pacote(_engine, hoje, lojas, mkt=MARKETPLACE, com_nomes=True):
                             if x[0] in lojas]
             except Exception:  # noqa: BLE001
                 pass
+        try:
+            dados['performance'] = ler_performance(_engine, hoje, list(lojas), mkt)
+        except Exception as e:  # noqa: BLE001 — sem projeção só não há o amarelo
+            erros['performance'] = e
         sinais, erros_bloco = montar_sinais(dados, hoje, mkt)
         upload_ate = {}
         try:
@@ -2368,7 +2643,9 @@ def _render_silenciados(st, loja, ctx):
     df = tabela_silenciados(sil, ctx['cientes'], ctx['hoje'], ctx['nomes'], ativos)
     if df.empty:
         return
-    with st.expander(f"🔕 Silenciados ({len(df)})"):
+    with st.expander(f"👁 Em acompanhamento ({len(df)})"):
+        st.caption("Sinais com Ciente: saem da lista de alertas e ficam aqui, com o número "
+                   "do dia do Ciente × o de agora, até o fim do silêncio.")
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not ctx['pode']:
             return
@@ -2440,7 +2717,10 @@ def _render_loja(st, loja, ativos, ctx):
     import streamlit
     versao = streamlit.session_state.get('sin_versao', 0)
     try:
-        top, resto = sinais_da_loja(ativos, loja)
+        alertas = [x for x in ativos if not x.get('informativo')]
+        infos = sorted((x for x in ativos if x['loja'] == loja and x.get('informativo')),
+                       key=lambda x: -x['em_jogo'])
+        top, resto = sinais_da_loja(alertas, loja)
         if not top:
             st.success("Nenhum sinal hoje.")
             marcados = []
@@ -2450,6 +2730,13 @@ def _render_loja(st, loja, ativos, ctx):
                 with st.expander(f"Mais {len(resto)} sinais (menor R$ em jogo)"):
                     marcados += _editor(st, resto, nomes, f"sin_ed_resto_{loja}_{versao}",
                                         ctx['pode'])
+        if infos:
+            with st.expander(f"ℹ️ Informativos ({len(infos)}): não pedem resposta", expanded=True):
+                st.caption("A causa já é conhecida (ex.: ROAS objetivo subiu de propósito). "
+                           "Ficam aqui até o Ciente ou até a causa sair da janela de "
+                           f"{DIAS_ROAS_SUBIU} dias.")
+                marcados += _editor(st, infos, nomes, f"sin_ed_info_{loja}_{versao}",
+                                    ctx['pode'])
     except Exception:  # noqa: BLE001
         st.error("Tabela de sinais indisponível agora para esta loja.")
         return

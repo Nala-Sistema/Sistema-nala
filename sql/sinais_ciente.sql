@@ -39,6 +39,9 @@
 -- DESFAZER: sql/sinais_ciente_DESFAZER.sql (recusa rodar se houver ciente
 --   gravado, para não apagar o registro de intenção das gestoras).
 --
+-- 12/10/2026: o motivo 'alarme_falso' entrou na CHECK deste arquivo. Em produção a
+-- tabela já existe: lá a mudança vai por sql/sinais_ciente_alarme_falso.sql.
+--
 -- ATENÇÃO aos testes: tests/test_sinais_dia.py LÊ o CREATE TABLE e o CREATE
 -- UNIQUE INDEX DESTE arquivo para criar a TEMP. Mudou aqui, muda lá.
 -- =============================================================================
@@ -78,7 +81,7 @@ CREATE TABLE public.sinal_ciente (
         'full_ruptura', 'ads_config', 'ads_sem_venda', 'ads_custo', 'ads_espiral',
         'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta')),
     CONSTRAINT sinal_ciente_motivo_valido CHECK (motivo IN (
-        'falta_fornecedor', 'proposital', 'em_andamento', 'outro')),
+        'falta_fornecedor', 'proposital', 'em_andamento', 'alarme_falso', 'outro')),
     CONSTRAINT sinal_ciente_nota_no_outro CHECK (
         motivo <> 'outro' OR nullif(btrim(nota), '') IS NOT NULL),
     CONSTRAINT sinal_ciente_prazo CHECK (
