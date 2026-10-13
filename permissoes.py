@@ -24,7 +24,7 @@ import pandas as pd
 MODULOS = [
     'inicio', 'performance', 'skus', 'vendas', 'tags',
     'compras', 'config', 'calculadora', 'ia', 'kanban',
-    'tabela_preco', 'ads', 'analise_produtos', 'sinais',
+    'tabela_preco', 'ads', 'analise_produtos', 'sinais', 'plano_escala',
 ]
 
 # Mapa de permissões por perfil
@@ -45,6 +45,7 @@ PERMISSOES = {
         'ads':               'completo',
         'analise_produtos':  'completo',
         'sinais':            'completo',
+        'plano_escala':      'completo',
     },
     'CONTROLADORIA': {
         'inicio':            'completo',
@@ -61,6 +62,7 @@ PERMISSOES = {
         'ads':               'completo',
         'analise_produtos':  'completo',
         'sinais':            'completo',
+        'plano_escala':      'completo',
     },
     'DIRETOR': {
         'inicio':            'leitura',
@@ -77,6 +79,7 @@ PERMISSOES = {
         'ads':               'leitura',
         'analise_produtos':  'leitura',
         'sinais':            'leitura',
+        'plano_escala':      'leitura',
     },
     'COMPRAS': {
         'inicio':            'completo',
@@ -93,6 +96,7 @@ PERMISSOES = {
         'ads':               'completo',
         'analise_produtos':  'completo',
         'sinais':            'completo',
+        'plano_escala':      'leitura',
     },
     'GESTOR': {
         'inicio':            'parcial',      # filtrado por loja
@@ -109,6 +113,7 @@ PERMISSOES = {
         'ads':               'parcial',      # filtrado por marketplace
         'analise_produtos':  'parcial',      # filtrado por loja
         'sinais':            'parcial',      # filtrado por loja; sem loja = não vê nada
+        'plano_escala':      'parcial',      # filtrado por loja; sem loja = não vê nada
     },
 }
 
@@ -135,6 +140,7 @@ MENU_MODULOS = {
     '📦 SKUs':                  'skus',
     '💰 Vendas':                'vendas',
     '📡 Sinais do Dia':         'sinais',
+    '🚀 Plano de Escala':       'plano_escala',
     '📈 Análise de Produtos':   'analise_produtos',
     '🏷️ Tags':                 'tags',
     '🛒 Compras':               'compras',
