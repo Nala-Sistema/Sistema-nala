@@ -233,6 +233,7 @@ QUEDA_VERMELHO = 0.20            # semana ≥ 20% abaixo
 # meta do anúncio em dim_metas_anuncio) abaixo deste corte. É o corte do módulo:
 # performance.py _cor_performance deixa de ser 🟢 (verde) abaixo de 100%.
 PERF_CORTE_AMARELO = 100.0
+MIGRACAO_MIN_GANHO = 0.5         # irmãos ganharam ≥ 50% do que o anúncio perdeu: a venda migrou
 MIN_DIAS_MES_PROJECAO = 3        # menos dias fechados no mês: não projeta
 # Venda em rajadas (caso Shopee Lithouse(Nala) LNE-60005-PN, 28–29/09: alta e queda
 # em dias seguidos): só julga alta/queda o anúncio com venda em pelo menos tantos
@@ -373,8 +374,8 @@ SQL_VENDAS_ANUNCIO = """
            SUM(valor_venda_efetivo) FILTER (WHERE data_venda >= %(piso_ini)s)  AS rec_30,
            SUM(margem_total) FILTER (WHERE data_venda >= %(piso_ini)s)         AS margem_30,
            COUNT(DISTINCT numero_pedido) FILTER (WHERE data_venda >= %(piso_ini)s) AS pedidos_30,
-           COUNT(DISTINCT data_venda) FILTER (WHERE data_venda >= %(base_ini)s
-                                                AND data_venda <= %(base_fim)s)  AS dias_base
+           ARRAY_AGG(DISTINCT data_venda) FILTER (WHERE data_venda >= %(base_ini)s
+                                                    AND data_venda <= %(base_fim)s)  AS dias_base
       FROM fact_vendas_snapshot
      WHERE marketplace_origem = %(marketplace)s
        AND loja_origem = ANY(%(lojas)s)
@@ -396,8 +397,8 @@ SQL_VENDAS_ANUNCIO_SHOPEE = """
            SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %(piso_ini)s)  AS rec_30,
            SUM(f.margem_total) FILTER (WHERE f.data_venda >= %(piso_ini)s)         AS margem_30,
            COUNT(DISTINCT f.numero_pedido) FILTER (WHERE f.data_venda >= %(piso_ini)s) AS pedidos_30,
-           COUNT(DISTINCT f.data_venda) FILTER (WHERE f.data_venda >= %(base_ini)s
-                                                  AND f.data_venda <= %(base_fim)s)  AS dias_base
+           ARRAY_AGG(DISTINCT f.data_venda) FILTER (WHERE f.data_venda >= %(base_ini)s
+                                                      AND f.data_venda <= %(base_fim)s)  AS dias_base
       FROM fact_vendas_snapshot f
       LEFT JOIN fact_pedidos_itens_marketplace i
              ON i.marketplace = f.marketplace_origem AND i.loja = f.loja_origem
@@ -823,8 +824,9 @@ def objeto_campanha(anuncio, campanha, dia):
 def agregar_vendas(vendas):
     """[(loja, anuncio, sku, rec_sem, rec_base, qtd_ritmo, qtd_30, rec_30, margem_30
     [, pedidos_30 [, dias_base]])] -> (por_anuncio, por_anuncio_sku).
-    dias_base = dias distintos com venda na base (somados entre os SKUs do anúncio;
-    None quando a linha não traz); serve a MIN_DIAS_VENDA_BASE.
+    dias_base = as DATAS com venda na base (lista) ou a contagem; o anúncio fica com
+    o nº de dias DISTINTOS entre os SKUs (não a soma); None quando a linha não traz.
+    Serve a MIN_DIAS_VENDA_BASE.
     por_anuncio[(loja, anuncio)]: R$ somados (R$ pode somar), SKUs, e
     unidades/margem por unidade SÓ quando o anúncio vendeu um SKU único.
     margem_30_tot e pedidos_30 servem à margem POR PEDIDO (Shopee): R$ ÷
@@ -844,8 +846,11 @@ def agregar_vendas(vendas):
                                             'margem_30_tot': None, 'pedidos_30': 0.0,
                                             'dias_base': None})
         a['pedidos_30'] += _f(ped30)
-        if dias_base is not None:
-            a['dias_base'] = (a['dias_base'] or 0) + int(dias_base)
+        if isinstance(dias_base, int):
+            a['dias_base'] = max(a['dias_base'] or 0, dias_base)
+        elif dias_base is not None:
+            a.setdefault('_dias', set()).update(dias_base)
+            a['dias_base'] = max(a['dias_base'] or 0, len(a['_dias']))
         if m30 is not None:
             a['margem_30_tot'] = (a['margem_30_tot'] or 0.0) + float(m30)
         a['rec_sem'] += _f(rs)
@@ -908,17 +913,12 @@ def faixa_queda(sem, base_sem, tamanho=None):
     return '' if sem < QUEDA_VENDA * base_sem else None
 
 
-def _limiar_faixa(base_sem):
-    """Quanto a família pode ter caído sem que a queda do anúncio seja "real"."""
-    if base_sem >= RECEITA_SEM_FAIXA_ALTA:
-        return QUEDA_LARANJA
-    return QUEDA_VENDA
-
-
 def venda_migrou(chave, por_anuncio, comp, base_sem):
     """A venda foi para outro anúncio da mesma peça/loja (outra cor, variação)?
-    Verdade quando o conjunto (este anúncio + os que dividem peça com ele na
-    mesma loja) NÃO caiu pela régua do tamanho do anúncio. Sem irmão: falso."""
+    Verdade quando os irmãos (anúncios que dividem peça com ele na mesma loja)
+    GANHARAM pelo menos MIGRACAO_MIN_GANHO do que ele perdeu. Irmão estável não
+    prova migração (anúncio de R$ 2.000/sem que zera ao lado de irmão de R$ 20.000/sem
+    estável continua queda). Sem irmão: falso."""
     loja, _anuncio = chave
     pecas = set()
     for sku in por_anuncio[chave]['skus']:
@@ -933,9 +933,9 @@ def venda_migrou(chave, por_anuncio, comp, base_sem):
             irmaos.append(x)
     if not irmaos:
         return False
-    sem = por_anuncio[chave]['rec_sem'] + sum(x['rec_sem'] for x in irmaos)
-    base = (por_anuncio[chave]['rec_base'] + sum(x['rec_base'] for x in irmaos)) / SEMANAS_BASE
-    return sem > (1 - _limiar_faixa(base_sem)) * base
+    perda = base_sem - por_anuncio[chave]['rec_sem']
+    ganho = sum(x['rec_sem'] - x['rec_base'] / SEMANAS_BASE for x in irmaos)
+    return perda > 0 and ganho >= MIGRACAO_MIN_GANHO * perda
 
 
 def _txt_roas(v):

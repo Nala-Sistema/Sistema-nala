@@ -2225,6 +2225,37 @@ class FamiliaERajadas(unittest.TestCase):
                  _vend(NALA, 'MLB-B', 'L-0413', rec_sem=1837, rec_base=838 * 4)]
         self.assertEqual(len([x for x in _queda(outra) if x['regra'] == 'vendas_queda']), 1)
 
+    def test_irmao_estavel_nao_esconde_a_queda_do_anuncio(self):
+        # R$ 2.000/sem que zera ao lado de irmão de R$ 20.000/sem estável: continua queda
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=20000, rec_base=80000)]
+        q = [x for x in _queda(vendas) if x['regra'] == 'vendas_queda']
+        self.assertEqual([x['anuncio'] for x in q], ['MLB-A'])
+        # irmão que ganhou metade da perda (1.000 de 2.000): migrou
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=21000, rec_base=80000)]
+        self.assertEqual([x for x in _queda(vendas) if x['regra'] == 'vendas_queda'], [])
+        # irmão que ganhou menos da metade: continua queda
+        vendas = [_vend(LPT, 'MLB-A', 'L-1', rec_sem=0, rec_base=8000),
+                  _vend(LPT, 'MLB-B', 'L-1', rec_sem=20900, rec_base=80000)]
+        self.assertEqual(len([x for x in _queda(vendas) if x['regra'] == 'vendas_queda']), 1)
+
+    def test_dias_base_sao_dias_distintos_entre_os_skus_do_anuncio(self):
+        d = [date(2026, 9, 3) + timedelta(days=i) for i in range(6)]
+        # 2 SKUs vendendo nos MESMOS 6 dias: 6 dias (não 12) -> abaixo do mínimo, não julga
+        linhas = [('L', 'I1', 'A', 0, 4000, 0, 0, 0, None, 0, d),
+                  ('L', 'I1', 'B', 0, 4000, 0, 0, 0, None, 0, d)]
+        por_an, _ = sd.agregar_vendas(linhas)
+        self.assertEqual(por_an[('L', 'I1')]['dias_base'], 6)
+        self.assertEqual(sd.sinais_vendas(por_an, sd.janelas(HOJE)), [])
+        # SKUs em dias diferentes: a união passa o mínimo
+        d2 = [date(2026, 9, 12) + timedelta(days=i) for i in range(6)]
+        linhas = [('L', 'I1', 'A', 0, 4000, 0, 0, 0, None, 0, d),
+                  ('L', 'I1', 'B', 0, 4000, 0, 0, 0, None, 0, d2)]
+        por_an, _ = sd.agregar_vendas(linhas)
+        self.assertEqual(por_an[('L', 'I1')]['dias_base'], 12)
+        self.assertEqual(len(sd.sinais_vendas(por_an, sd.janelas(HOJE))), 1)
+
     def test_kit_e_item_da_mesma_peca_sao_familia(self):
         comp = {'K2-L-0320': {'L-0320': 2}}
         vendas = [_vend(LPT, 'MLB-K', 'K2-L-0320', rec_sem=100, rec_base=4000),
