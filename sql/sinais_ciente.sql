@@ -42,6 +42,9 @@
 -- 12/10/2026: o motivo 'alarme_falso' entrou na CHECK deste arquivo. Em produção a
 -- tabela já existe: lá a mudança vai por sql/sinais_ciente_alarme_falso.sql.
 --
+-- 12/10/2026: a regra 'full_parado' entrou na CHECK deste arquivo ([FULL POR LOJA]).
+-- Em produção a tabela já existe: lá a mudança vai por sql/full_por_loja.sql.
+--
 -- ATENÇÃO aos testes: tests/test_sinais_dia.py LÊ o CREATE TABLE e o CREATE
 -- UNIQUE INDEX DESTE arquivo para criar a TEMP. Mudou aqui, muda lá.
 -- =============================================================================
@@ -79,7 +82,7 @@ CREATE TABLE public.sinal_ciente (
     CONSTRAINT sinal_ciente_regra_valida CHECK (regra IN (
         'vendas_queda', 'vendas_alta', 'full_cobertura', 'full_zerado_ads', 'full_envio',
         'full_ruptura', 'ads_config', 'ads_sem_venda', 'ads_custo', 'ads_espiral',
-        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta')),
+        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta', 'full_parado')),
     CONSTRAINT sinal_ciente_motivo_valido CHECK (motivo IN (
         'falta_fornecedor', 'proposital', 'em_andamento', 'alarme_falso', 'outro')),
     CONSTRAINT sinal_ciente_nota_no_outro CHECK (

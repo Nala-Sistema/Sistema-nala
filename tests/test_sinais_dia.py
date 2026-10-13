@@ -630,7 +630,10 @@ class Ciente(unittest.TestCase):
         conn.cursor.assert_not_called()
 
     def test_tela_gestora_marca_ciente_diretor_so_ve(self):
-        silenciado = [_ciente(LPT, 'vendas_queda', 'MLB2', medida=-1.0)]
+        # a tela usa a data REAL (datetime.now): o silêncio tem de valer depois de hoje,
+        # senão o teste quebra sozinho quando o calendário passa da data fixa
+        silenciado = [_ciente(LPT, 'vendas_queda', 'MLB2', medida=-1.0,
+                              ate=date.today() + timedelta(days=30))]
         st = self._render('GESTOR', silenciado)
         df = st.data_editor.call_args.args[0]
         self.assertEqual(list(df['Anúncio']), ['MLB1'])     # o silenciado saiu

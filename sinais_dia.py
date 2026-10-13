@@ -284,7 +284,8 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'ads_custo': 'Custo de ads > margem', 'ads_espiral': 'Espiral de ads',
           'exp_anuncio': 'Experiência piorou', 'exp_familia': 'Experiência da família',
           'visitas_queda': 'Visitas/visualizações caíram',
-          'visitas_alta': 'Visitas/visualizações subiram'}
+          'visitas_alta': 'Visitas/visualizações subiram',
+          'full_parado': 'Full parado'}
 
 # Regras que comparam janelas de VENDA: suspensas na loja com carga pendente.
 REGRAS_DE_VENDA = ('vendas_queda', 'vendas_alta', 'ads_espiral', 'full_ruptura', 'ads_custo',
@@ -1035,6 +1036,28 @@ def estoques(ponte):
     return out
 
 
+def venda_do_estoque(loja, e, por_sku):
+    """Venda de um estoque_id: cada anúncio dele × cada SKU dele (mesmo
+    produto). Devolve qtd_ritmo, qtd_30, rec_30, venda/dia = max(ritmo ÷ 7,
+    30d ÷ 30) e o anúncio que vende (o de maior venda em 30d, senão o primeiro).
+    Usada aqui e na aba Full por loja (full_por_loja.py): a regra é uma só."""
+    vend = {}
+    for a in e['anuncios']:
+        for s in e['skus']:
+            v = por_sku.get((loja, a, s))
+            if v:
+                vend[a] = vend.get(a, {'qtd_ritmo': 0.0, 'qtd_30': 0.0, 'rec_30': 0.0})
+                for k in vend[a]:
+                    vend[a][k] += v[k]
+    qtd_ritmo = sum(v['qtd_ritmo'] for v in vend.values())
+    qtd_30 = sum(v['qtd_30'] for v in vend.values())
+    rec_30 = sum(v['rec_30'] for v in vend.values())
+    return {'qtd_ritmo': qtd_ritmo, 'qtd_30': qtd_30, 'rec_30': rec_30,
+            'dia': max(qtd_ritmo / JANELA_RITMO_FULL, qtd_30 / JANELA_PISO_FULL),
+            'anuncio': (max(vend, key=lambda a: vend[a]['qtd_30']) if vend
+                        else sorted(e['anuncios'])[0])}
+
+
 def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j, mkt=MARKETPLACE):
     """Cobertura do Full POR estoque_id. foto: [(loja, eid, data, full, transf,
     recebidas[, galpao])]; ponte já mapeada. Mesma regra no ML e na Shopee:
@@ -1048,22 +1071,9 @@ def sinais_full(foto, ponte, por_sku, ads_por_anuncio, j, mkt=MARKETPLACE):
         e = est.get((loja, eid))
         if not e or not e['em_full']:
             continue
-        # venda do estoque: cada anúncio dele × cada SKU dele (mesmo produto)
-        vend = {}
-        for a in e['anuncios']:
-            for s in e['skus']:
-                v = por_sku.get((loja, a, s))
-                if v:
-                    vend[a] = vend.get(a, {'qtd_ritmo': 0.0, 'qtd_30': 0.0, 'rec_30': 0.0})
-                    for k in vend[a]:
-                        vend[a][k] += v[k]
-        qtd_ritmo = sum(v['qtd_ritmo'] for v in vend.values())
-        qtd_30 = sum(v['qtd_30'] for v in vend.values())
-        rec_30 = sum(v['rec_30'] for v in vend.values())
-        dia = max(qtd_ritmo / JANELA_RITMO_FULL, qtd_30 / JANELA_PISO_FULL)
-        # o anúncio que vende (o de maior venda em 30d), senão qualquer um
-        anuncio = (max(vend, key=lambda a: vend[a]['qtd_30']) if vend
-                   else sorted(e['anuncios'])[0])
+        v = venda_do_estoque(loja, e, por_sku)
+        qtd_ritmo, qtd_30, rec_30, dia, anuncio = (v['qtd_ritmo'], v['qtd_30'], v['rec_30'],
+                                                   v['dia'], v['anuncio'])
         ads_ontem = sum(_f(ads_por_anuncio.get((loja, a), {}).get('gasto_ontem'))
                         for a in e['anuncios'])
         full, transf, recebidas = int(full), int(transf), int(recebidas)
@@ -1637,7 +1647,7 @@ def piorou(regra, agora, antes):
         return antes > 0 and agora <= 0
     if regra in ('full_zerado_ads', 'ads_sem_venda'):   # gasto de ads
         return agora > antes and agora >= PIORA_FATOR_GASTO * antes
-    if regra in ('full_ruptura', 'ads_espiral', 'ads_custo'):  # R$
+    if regra in ('full_ruptura', 'ads_espiral', 'ads_custo', 'full_parado'):  # R$
         return agora > antes and agora >= PIORA_FATOR_RS * antes
     if regra in ('vendas_queda', 'visitas_queda'):      # variação (−0,55 = −55%)
         return agora <= antes - PIORA_QUEDA_PP or (agora <= -1.0 < antes)
@@ -1962,6 +1972,21 @@ def reativar_ciente(conn, id_ciente, usuario, lojas_permitidas, mkt=MARKETPLACE)
 def pode_dar_ciente():
     from permissoes import get_nivel_acesso
     return get_nivel_acesso('sinais') in ('completo', 'parcial')
+
+
+def filtrar_sinais(sinais, texto, nomes):
+    """Filtro por texto (A3): fica o sinal cujo SKU, nome do produto, anúncio,
+    texto ou sugestão contém TODAS as palavras digitadas (sem diferenciar
+    maiúscula). Texto vazio = tudo."""
+    palavras = (texto or '').lower().split()
+    if not palavras:
+        return list(sinais)
+
+    def alvo(s):
+        partes = list(s['skus']) + [nomes.get(x) or '' for x in s['skus']]
+        partes += [s['anuncio'], s['numero'], s['sugestao'], s.get('familia') or '']
+        return ' '.join(partes).lower()
+    return [s for s in sinais if all(p in alvo(s) for p in palavras)]
 
 
 def sinais_da_loja(sinais, loja, limite=MAX_SINAIS_POR_LOJA):
@@ -2490,12 +2515,20 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
     except Exception:  # noqa: BLE001
         st.error("Excel indisponível agora; os sinais abaixo seguem valendo.")
 
+    filtro = st.text_input("🔎 Filtrar sinais (SKU, produto, anúncio ou texto)",
+                           key=f"sin_filtro_{sigla}",
+                           help="Mostra só os sinais que contêm todas as palavras. O Excel "
+                                "continua com todos.")
+    ativos_tela = filtrar_sinais(ativos, filtro, nomes)
+    if filtro.strip():
+        st.caption(f"Filtro ativo: {len(ativos_tela)} de {len(ativos)} sinais.")
+
     t = time.perf_counter()
     fragmento = _como_fragmento(_render_loja_seguro)
     for loja in lojas:
         st.markdown("---")
         st.subheader(loja)
-        fragmento(st, loja, ativos, {**base_ctx,
+        fragmento(st, loja, ativos_tela, {**base_ctx,
                                      'cientes': [c for c in cientes if c['loja'] == loja]})
     tempos.append(('Tela (4 lojas)' if len(lojas) == 4 else f'Tela ({len(lojas)} lojas)',
                    time.perf_counter() - t))
@@ -2756,7 +2789,7 @@ def render(engine):
     st.caption("Painel diário: o que mudou ontem em cada loja, ordenado pelo R$ em jogo. "
                "Marque \"Ciente\" para responder a um sinal e silenciá-lo até uma data; "
                "os limiares estão em calibragem.")
-    aba_ml, aba_shopee = st.tabs(["Mercado Livre", "Shopee"])
+    aba_ml, aba_shopee, aba_full = st.tabs(["Mercado Livre", "Shopee", "Full por loja"])
     with aba_ml:
         try:
             _render_mercado_livre(st, engine)
@@ -2768,4 +2801,11 @@ def render(engine):
             _render_marketplace(st, engine, SHOPEE)
         except Exception:  # noqa: BLE001
             st.error("Os sinais da Shopee não carregaram agora. Tente de novo em instantes; "
+                     "se persistir, avise o time do sistema.")
+    with aba_full:
+        try:
+            import full_por_loja
+            full_por_loja.render(st, engine)
+        except Exception:  # noqa: BLE001
+            st.error("A aba Full por loja não carregou agora. Tente de novo em instantes; "
                      "se persistir, avise o time do sistema.")
