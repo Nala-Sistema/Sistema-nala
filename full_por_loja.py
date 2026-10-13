@@ -245,15 +245,22 @@ def sinais_parado(itens):
 
 
 def resumo_por_loja(itens, lojas):
-    """[(mkt, loja)] -> linhas do quadro do topo (R$ parado por loja)."""
+    """[(mkt, loja)] -> linhas do quadro do topo (R$ parado por loja). Soma só os
+    parados que aparecem na lista "Full parado" (com ou sem Ciente); o parado
+    escondido por "Full acabando" no mesmo anúncio vem à parte, com rótulo
+    (ressalva 1 do auditor ao aa61f45: topo e lista têm de bater)."""
     linhas = []
     for mkt, loja in lojas:
         da_loja = [i for i in itens if i['mkt'] == mkt and i['loja'] == loja]
-        parados = [i for i in da_loja if i['parado']]
+        parados = [i for i in da_loja if i['parado'] and not i['parado_suprimido']]
+        suprimidos = [i for i in da_loja if i['parado'] and i['parado_suprimido']]
         linhas.append({
             'Loja': loja,
             'R$ parado no Full (custo)': sd._brl(sum(i['rs_parado'] or 0 for i in parados)),
             'Estoques parados': len(parados),
+            'Fora da lista: anúncio com Full acabando (R$)': (
+                f"{len(suprimidos)} · {sd._brl(sum(i['rs_parado'] or 0 for i in suprimidos))}"
+                if suprimidos else '—'),
             'Sem venda em 30 dias': sum(1 for i in parados if i['venda_dia'] == 0),
             'Sem custo cadastrado': sum(1 for i in parados if not i['custo']),
             'Full acabando': sum(1 for i in da_loja if i['acabando']),

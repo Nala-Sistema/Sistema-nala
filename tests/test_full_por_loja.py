@@ -125,9 +125,22 @@ class ParadoEAcabando(unittest.TestCase):
         itens = fpl.avaliar(ML, foto, ponte, por_sku, {'L-0321': 5, 'L-0320': 5}, {LPT: 21})
         fpl.suprimir_parado_com_acabando(itens)
         self.assertEqual(fpl.sinais_parado(itens), [])
-        # o R$ parado do topo continua contando o estoque
+        # topo bate com a lista: o suprimido sai da soma e aparece à parte
         r = fpl.resumo_por_loja(itens, [(ML, LPT)])[0]
-        self.assertEqual(r['Estoques parados'], 1)
+        self.assertEqual(r['Estoques parados'], 0)
+        self.assertEqual(r['R$ parado no Full (custo)'], sd._brl(0))
+        self.assertTrue(r['Fora da lista: anúncio com Full acabando (R$)'].startswith('1 · '))
+
+    def test_topo_soma_o_que_a_lista_mostra(self):
+        ponte = [(LPT, 'MLB9', 'E9', 'L-9', True)]
+        itens = fpl.avaliar(ML, [(LPT, 'E9', FOTO_DIA, 10, 0, 0, 0)], ponte, {}, {'L-9': 3},
+                            {LPT: 21})
+        fpl.suprimir_parado_com_acabando(itens)
+        r = fpl.resumo_por_loja(itens, [(ML, LPT)])[0]
+        lista = fpl.sinais_parado(itens)
+        self.assertEqual(r['Estoques parados'], len(lista))
+        self.assertEqual(r['R$ parado no Full (custo)'], sd._brl(sum(s['em_jogo'] for s in lista)))
+        self.assertEqual(r['Fora da lista: anúncio com Full acabando (R$)'], '—')
 
     def test_sinal_parado_chave_do_ciente(self):
         ponte = [(LPT, 'MLB9', 'E9', 'L-9', True)]
