@@ -341,13 +341,18 @@ def auto_copiar_metas_mes_anterior(engine, loja, marketplace, ano_mes):
 # QUERIES — VENDAS REALIZADAS (com desconto de devoluções)
 # ============================================================
 
-def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None):
+def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None, data_fim=None):
     """
     Busca vendas realizadas por anúncio no mês, descontando devoluções.
     Para Amazon: agrupa por codigo_anuncio + logistica.
     Para outros: COALESCE(codigo_anuncio, sku) como fallback.
+
+    data_fim (opcional): corta o realizado nesse dia (Sinais do Dia compara só
+    dias fechados). None = o mês inteiro, como a tela de Performance sempre fez.
     """
     primeiro, ultimo = get_primeiro_ultimo_dia(ano_mes)
+    if data_fim is not None:
+        ultimo = min(ultimo, data_fim)
     is_amazon = marketplace and 'AMAZON' in marketplace.upper()
 
     if is_amazon:
@@ -663,7 +668,8 @@ def buscar_resumo_geral(engine, ano_mes):
 # ============================================================
 
 def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_projecao='Linear',
-                                 dias_vendas_override=None, dias_mes_override=None):
+                                 dias_vendas_override=None, dias_mes_override=None,
+                                 data_fim=None):
     """
     Constrói o DataFrame completo de performance para uma loja/mês.
 
@@ -681,7 +687,7 @@ def construir_tabela_performance(engine, loja, marketplace, ano_mes, modelo_proj
         dias_vendas, dias_mes = get_dias_vendas(ano_mes, data_ref=ultima_data)
 
     # 1. Realizados do mês
-    df_real = buscar_realizados_mes(engine, loja, ano_mes, marketplace)
+    df_real = buscar_realizados_mes(engine, loja, ano_mes, marketplace, data_fim=data_fim)
 
     # 2. Metas do mês
     df_metas = buscar_metas_anuncio(engine, loja, ano_mes)
