@@ -887,6 +887,8 @@ def _area_logada(engine):
         import sinais_dia
         if _is_dev_environment() or st.session_state.get('_force_reload_modules', False):
             importlib.reload(sinais_dia)
+            import full_por_loja
+            importlib.reload(full_por_loja)
         sinais_dia.render(engine)
 
     elif modulo == 'plano_escala':

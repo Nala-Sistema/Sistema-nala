@@ -38,6 +38,9 @@
 --   (d) dispara o workflow "Sinais do Dia - historico diario" à mão.
 -- DESFAZER: sql/sinais_historico_DESFAZER.sql.
 --
+-- 12/10/2026: a regra 'full_parado' entrou na CHECK deste arquivo ([FULL POR LOJA]).
+-- Em produção a tabela já existe: lá a mudança vai por sql/full_por_loja.sql.
+--
 -- ATENÇÃO aos testes: tests/test_sinais_dia.py LÊ o CREATE TABLE e o CREATE
 -- INDEX DESTE arquivo para criar a TEMP. Mudou aqui, muda lá.
 -- =============================================================================
@@ -71,7 +74,7 @@ CREATE TABLE public.sinal_historico (
     CONSTRAINT sinal_historico_regra_valida CHECK (regra IN (
         'vendas_queda', 'vendas_alta', 'full_cobertura', 'full_zerado_ads', 'full_envio',
         'full_ruptura', 'ads_config', 'ads_sem_venda', 'ads_custo', 'ads_espiral',
-        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta'))
+        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta', 'full_parado'))
 );
 
 CREATE INDEX ix_sinal_historico_loja_data ON public.sinal_historico (marketplace, loja, data);
