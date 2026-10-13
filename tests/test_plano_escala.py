@@ -161,6 +161,26 @@ class TestMargemDoSistema(unittest.TestCase):
         with self.assertRaises(ValueError):
             pe.prever(pe.montar_rodadas(10, 100.0, 120.0), f)
 
+    def test_frete_observado_acompanha_a_faixa_da_taxa_fixa(self):
+        # ressalva 1 do auditor: vende hoje a R$ 25 (faixa R$ 4,50) com frete
+        # observado R$ 4,80; planejado a R$ 45 (faixa R$ 6,50) -> R$ 6,80
+        f = pe.margem_ml(10, 0.1, 0.1, 4.8, None, preco_ref_abaixo=25.0)
+        self.assertAlmostEqual(f(45.0), round(45 - 45 * 0.2 - 6.8 - 10, 2))
+        self.assertAlmostEqual(f(25.0), round(25 - 25 * 0.2 - 4.8 - 10, 2))
+        self.assertAlmostEqual(f(60.0), round(60 - 60 * 0.2 - 7.05 - 10, 2))
+
+    def test_insumos_guardam_o_preco_de_referencia_do_frete(self):
+        obs = pe.agregar_observado([('ML-Nala', 'MLB1', 'S', 'UD', False, 10, 250.0, 25.0, 48.0)])
+        i = pe.resolver_insumos('ML-Nala', 'MLB1', 'S', 'UD', obs)
+        self.assertAlmostEqual(i['preco_ref_abaixo'], 25.0)
+        rod, _ = pe.calcular_plano({'loja': 'ML-Nala', 'venda_concorrente': 100,
+                                    'meta_propria': None, 'preco_concorrente': 52.94,
+                                    'preco_meta': 50.0, 'precos_mao': {}},
+                                   {'custo': 10}, 0.1, i)
+        # rodada 1 a R$ 45 (52,94 x 0,85): frete 4,80 + (6,50 - 4,50)
+        self.assertAlmostEqual(rod[0]['margem_unit'],
+                               round(rod[0]['preco'] * 0.8 - 6.8 - 10, 2), delta=0.01)
+
     def test_extra_da_loja(self):
         a = pe.margem_ml(10, 0.1, 0.1, 6.0, None)(40.0)
         b = pe.margem_ml(10, 0.1, 0.1, 6.0, None, extra=6.0)(40.0)
@@ -440,6 +460,18 @@ class TestCadastro(unittest.TestCase):
                           self._ativo(date(2026, 9, 1), concluido=True))
         self.assertEqual(it[0]['acao'], 'novo')
 
+    def test_preco_a_mao_em_rodada_inexistente_avisa(self):
+        # ressalva 3 do auditor: não descartar calado
+        obs = pe.agregar_observado([('ML-LPT', 'MLB3873776447', 'L-0308', 'UD', False, 10,
+                                     360.0, 45.0, 68.0)])
+        calc = pe.calculadora({'L-0308': {'nome': 'Suporte', 'categoria': 'UD', 'custo': 15.9}},
+                              {'ML-LPT': 0.11}, obs)
+        it = pe.previa([self._bruta(precos_mao='1=33,90; 30=50,00')], {}, {'ML-LPT'},
+                       self.HOJE, calc)
+        self.assertEqual(it[0]['acao'], 'novo')
+        self.assertIn('30', it[0]['aviso'])
+        self.assertIn('ignorado', pe.tabela_previa(it, {})['Aviso'][0])
+
     def test_linha_vazia_e_ignorada(self):
         vazia = {c: None for c, _ in pe.COLUNAS}
         vazia['produto'] = 'sobra do modelo'
@@ -496,6 +528,8 @@ class TestSqlEDdl(unittest.TestCase):
             self.assertIn('%(marketplace)s', sql)
             self.assertIn('<= %(fim)s', sql)
         self.assertIn('logistica = ANY', pe.SQL_OBSERVADO)       # sem FLEX
+        # ressalva 2: parcela do ads em UNIDADES (diretas + indiretas)
+        self.assertIn('vendas_diretas + vendas_indiretas', pe.SQL_REAL_ADS)
 
 
 class TestPermissao(unittest.TestCase):
