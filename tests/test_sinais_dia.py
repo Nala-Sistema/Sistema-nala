@@ -1170,14 +1170,34 @@ class MontagemUnicaEJob(unittest.TestCase):
               'upload_ate': {}}
         with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT, NALA]), \
              mock.patch.object(sd, '_ler_pacote', return_value=ok) as lp:
-            sinais, n = sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
-        self.assertEqual((len(sinais), n), (1, 2))
+            sinais, n, sem_proj = sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
+        self.assertEqual((len(sinais), n, sem_proj), (1, 2, False))
         self.assertIs(lp.call_args.kwargs['com_nomes'], False)
         ruim = dict(ok, erros={'ads': 'x'})
         with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
              mock.patch.object(sd, '_ler_pacote', return_value=ruim):
             with self.assertRaises(sd._LeituraIncompleta):
                 sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
+
+    def test_job_grava_sem_a_projecao_mas_nao_sem_fonte_obrigatoria(self):
+        # 13–14/10: o job não lê a projeção do Performance (sem sqlalchemy no Actions
+        # e sem GRANT em dim_metas_anuncio) e não gravou nada. Sem ela só sai o amarelo.
+        base = {'dados': {'frescor': []}, 'erros_bloco': {}, 'upload_ate': {},
+                'sinais': [sd._sinal(LPT, 'VENDAS', 'MLB1', [], 'x', 's', 1,
+                                     regra='vendas_queda')]}
+        so_proj = dict(base, erros={'performance': 'No module named sqlalchemy'})
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=so_proj):
+            sinais, n, sem_proj = sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
+        self.assertEqual((len(sinais), n, sem_proj), (1, 1, True))
+        for erros, bloco in (({'performance': 'x', 'vendas': 'x'}, {}),
+                             ({'ads': 'x'}, {}),
+                             ({'performance': 'x'}, {'vendas': 'x'})):
+            ruim = dict(base, erros=erros, erros_bloco=bloco)
+            with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+                 mock.patch.object(sd, '_ler_pacote', return_value=ruim):
+                with self.assertRaises(sd._LeituraIncompleta):
+                    sd.sinais_hoje_para_historico(None, HOJE, sd.MARKETPLACE)
 
     def test_gravar_historico_upsert_numa_transacao(self):
         conn = mock.MagicMock()
@@ -1200,7 +1220,7 @@ class JobHistorico(unittest.TestCase):
 
     def _rodar(self, argv=(), agora=datetime(2026, 10, 6, 12, 5), efeito=None):
         saida = []
-        with mock.patch.object(self.job, 'gravar_dia', side_effect=efeito or (lambda e, d, m: (7, 4))):
+        with mock.patch.object(self.job, 'gravar_dia', side_effect=efeito or (lambda e, d, m: (7, 4, False))):
             cod = self.job.main(list(argv), agora=agora, engine=object(), saida=saida.append)
         return cod, '\n'.join(saida)
 
@@ -1230,6 +1250,37 @@ class JobHistorico(unittest.TestCase):
         for proibido in ('R$', 'L-0320', 'ML-LPT', 'senha', 'Traceback'):
             self.assertNotIn(proibido, txt)
 
+    def _rodar_job_inteiro(self, erros):
+        """main -> gravar_dia -> sinais_hoje_para_historico de verdade; só a leitura
+        (_ler_pacote) e a escrita (gravar_historico) são falsas."""
+        pacote = {'dados': {'frescor': []}, 'erros': erros, 'erros_bloco': {},
+                  'upload_ate': {},
+                  'sinais': [sd._sinal(LPT, 'VENDAS', 'MLB1', [], 'x', 's', 1,
+                                       regra='vendas_queda')]}
+        engine = mock.MagicMock()
+        saida = []
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=pacote), \
+             mock.patch.object(sd, 'gravar_historico', return_value=1) as grava:
+            cod = self.job.main([], agora=datetime(2026, 10, 14, 12, 5), engine=engine,
+                                saida=saida.append)
+        return cod, '\n'.join(saida), grava
+
+    def test_job_inteiro_nao_grava_dia_pela_metade(self):
+        cod, txt, grava = self._rodar_job_inteiro({'vendas': 'x', 'performance': 'x'})
+        self.assertEqual(cod, 1)
+        grava.assert_not_called()
+        self.assertIn('falhou (_LeituraIncompleta)', txt)
+
+    def test_job_inteiro_grava_quando_so_a_projecao_falha(self):
+        cod, txt, grava = self._rodar_job_inteiro({'performance': 'x'})
+        self.assertEqual(cod, 0)
+        self.assertEqual(grava.call_count, 2)                 # ML e Shopee
+        self.assertIn('14/10/2026 Mercado Livre: gravou 1 sinais em 1 lojas. Sem a projeção '
+                      'do Performance: amarelo fora.', txt)
+        for proibido in ('R$', 'MLB', 'ML-', 'sqlalchemy'):
+            self.assertNotIn(proibido, txt)
+
     def test_antes_das_10h_nao_grava(self):
         cod, txt = self._rodar(agora=datetime(2026, 10, 6, 9, 0),
                                efeito=lambda e, d, m: self.fail('não devia gravar'))
@@ -1239,7 +1290,7 @@ class JobHistorico(unittest.TestCase):
     def test_backfill(self):
         dias = []
         cod, _t = self._rodar(['--desde', '2026-10-03', '--ate', '2026-10-04'],
-                              efeito=lambda e, d, m: dias.append((d, m)) or (1, 1))
+                              efeito=lambda e, d, m: dias.append((d, m)) or (1, 1, False))
         self.assertEqual(cod, 0)
         self.assertEqual(dias, [(date(2026, 10, 3), sd.MARKETPLACE), (date(2026, 10, 3), sd.SHOPEE),
                                 (date(2026, 10, 4), sd.MARKETPLACE), (date(2026, 10, 4), sd.SHOPEE)])
@@ -1260,6 +1311,11 @@ class JobHistorico(unittest.TestCase):
         self.assertIn('contents: read', wf)
         self.assertNotIn('pull_request', wf)
         self.assertIn('secrets.SINAIS_HIST_DB_URL', wf)
+        # backfill pelo formulário: entra por variável, nunca colado no comando
+        self.assertIn('DESDE: ${{ inputs.desde }}', wf)
+        self.assertIn('ATE: ${{ inputs.ate }}', wf)
+        self.assertNotRegex(wf, r'run:[^\n]*\$\{\{\s*inputs')
+        self.assertEqual(len(re.findall(r'\$\{\{\s*inputs\.', wf)), 2)
         usos = re.findall(r'uses:\s*(\S+)', wf)
         self.assertEqual(len(usos), 2)
         for u in usos:                                       # por SHA, não por tag

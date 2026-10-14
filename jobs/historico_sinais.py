@@ -10,7 +10,8 @@ Roda:
   - todo dia às 12h de Brasília no GitHub Actions do repo Sistema-nala
     (.github/workflows/sinais_historico.yml); não grava antes das 10h de
     Brasília (as coletas do dia podem não ter rodado);
-  - backfill (o Mestre, na máquina do Thiago):
+  - backfill pelo GitHub (Actions > "Sinais do Dia - historico diario" > Run
+    workflow, campos desde/ate em AAAA-MM-DD), que roda o mesmo que:
         python jobs/historico_sinais.py --desde 2026-09-06 --ate 2026-10-06
     Ressalvas do backfill: usa a venda como está hoje (já sem os cancelamentos
     posteriores) e a ligação anúncio × estoque atual; foto de estoque, ads,
@@ -70,14 +71,14 @@ def dias_para_gravar(agora, desde=None, ate=None):
 
 
 def gravar_dia(engine, dia, mkt):
-    """(sinais gravados, lojas lidas) de um dia num marketplace."""
-    sinais, n_lojas = sd.sinais_hoje_para_historico(engine, dia, mkt)
+    """(sinais gravados, lojas lidas, sem_projecao) de um dia num marketplace."""
+    sinais, n_lojas, sem_projecao = sd.sinais_hoje_para_historico(engine, dia, mkt)
     conn = engine.raw_connection()
     try:
         n = sd.gravar_historico(conn, sinais, dia, mkt)
     finally:
         conn.close()
-    return n, n_lojas
+    return n, n_lojas, sem_projecao
 
 
 def main(argv=None, agora=None, engine=None, saida=print):
@@ -103,14 +104,15 @@ def main(argv=None, agora=None, engine=None, saida=print):
     for dia in dias:
         for mkt in MARKETPLACES:
             try:
-                n, n_lojas = gravar_dia(engine, dia, mkt)
+                n, n_lojas, sem_projecao = gravar_dia(engine, dia, mkt)
             except Exception as e:  # noqa: BLE001 — só o TIPO: repo público
                 saida(f"{dia:%d/%m/%Y} {sd.MARKETPLACES[mkt]['aba']}: falhou "
                       f"({type(e).__name__}). Nada gravado deste dia/marketplace.")
                 return 1
             total += n
             saida(f"{dia:%d/%m/%Y} {sd.MARKETPLACES[mkt]['aba']}: gravou {n} sinais em "
-                  f"{n_lojas} lojas.")
+                  f"{n_lojas} lojas."
+                  + (" Sem a projeção do Performance: amarelo fora." if sem_projecao else ""))
     saida(f"Pronto: {total} sinais em {len(dias)} dia(s).")
     return 0
 

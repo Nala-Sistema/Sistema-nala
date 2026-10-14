@@ -300,6 +300,11 @@ EXCEL_MAX_LINHAS = 5000
 
 # v1.3: histórico lido pela tela (dias para trás)
 DIAS_HISTORICO = 60
+# Fontes cuja falha NÃO impede o job de gravar o dia. A projeção do Performance
+# só dá o amarelo; o job (Actions, pandas + psycopg2, usuário sinais_historico) não
+# a lê, e por isso não gravou nada em 13 e 14/10. Sem ela o histórico só perde o
+# amarelo. Qualquer outra fonte em erro continua barrando o dia inteiro.
+FONTES_OPCIONAIS_HISTORICO = frozenset({'performance'})
 
 MAX_SINAIS_POR_LOJA = 10
 TTL_LEITURA_S = 600              # leitura do dia em memória por 10 min
@@ -2124,15 +2129,18 @@ def gravar_historico(conn, sinais, dia, mkt):
 
 
 def sinais_hoje_para_historico(engine, hoje, mkt):
-    """(sinais do dia, nº de lojas) com a montagem da tela, para o job. Leitura
-    com fonte em erro levanta (_LeituraIncompleta): o histórico não grava dia
-    pela metade. Não lê nomes de produto (o usuário do job não lê dim_produtos)."""
+    """(sinais do dia, nº de lojas, sem_projecao) com a montagem da tela, para o
+    job. Leitura com fonte obrigatória em erro levanta (_LeituraIncompleta): o
+    histórico não grava dia pela metade. Só a projeção do Performance
+    (FONTES_OPCIONAIS_HISTORICO) pode faltar: grava sem o amarelo e
+    sem_projecao=True. Não lê nomes de produto (o usuário do job não lê
+    dim_produtos)."""
     lojas = _ler_lojas_ml(engine, mkt)
     pacote = _ler_pacote(engine, hoje, tuple(lojas), mkt, com_nomes=False)
-    if pacote['erros'] or pacote['erros_bloco']:
+    if set(pacote['erros']) - FONTES_OPCIONAIS_HISTORICO or pacote['erros_bloco']:
         raise _LeituraIncompleta(pacote)
     sinais, _p, _u = sinais_da_loja_hoje(pacote, lojas, hoje)
-    return sinais, len(lojas)
+    return sinais, len(lojas), bool(set(pacote['erros']) & FONTES_OPCIONAIS_HISTORICO)
 
 
 def suspender_venda_pendente(sinais, pendentes):
