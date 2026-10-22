@@ -380,6 +380,7 @@ class Permissao(unittest.TestCase):
              mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
              mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
              mock.patch.object(sd, 'ler_cientes', return_value=None), \
+             mock.patch.object(sd, 'ler_plano', return_value=None), \
              mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
              mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
              mock.patch.object(sd, 'sinais_vendas', side_effect=[KeyError('x')]):
@@ -394,6 +395,7 @@ class Permissao(unittest.TestCase):
              mock.patch.object(sd, '_ler', return_value=[(LPT,), (NALA,)]), \
              mock.patch.object(sd, 'ler_tudo', return_value=(dados, {})), \
              mock.patch.object(sd, 'ler_cientes', return_value=None), \
+             mock.patch.object(sd, 'ler_plano', return_value=None), \
              mock.patch.object(sd.ep, 'ler_contagens', return_value=[]), \
              mock.patch.object(sd.ep, 'ler_nomes', return_value={}), \
              mock.patch.object(sd, 'tabela_sinais', side_effect=tabela_que_quebra_na_lpt):
@@ -429,10 +431,10 @@ class Sql(unittest.TestCase):
     def test_todo_parametro_da_sql_existe(self):
         p = sd.params(HOJE, [LPT])
         escrita = (sd.SQL_FECHAR_ABERTO, sd.SQL_INSERIR_CIENTE, sd.SQL_REATIVAR,
-                   sd.SQL_GRAVAR_HISTORICO)
+                   sd.SQL_GRAVAR_HISTORICO, sd.SQL_DECIDIR_ACAO)
         p_escrita = {'marketplace', 'loja', 'regra', 'objeto', 'motivo', 'nota',
                      'silenciar_ate', 'medida', 'texto', 'usuario', 'id', 'lojas',
-                     'data', 'em_jogo'}
+                     'data', 'em_jogo', 'id_acao', 'prazo'}
         for sql in sd.TODAS_AS_SQL:
             for nome in re.findall(r'%\((\w+)\)s', sql):
                 self.assertIn(nome, p_escrita if sql in escrita else p, nome)
