@@ -282,6 +282,14 @@ MOTIVOS = {'falta_fornecedor': 'Falta no fornecedor',
 # encerra a ação (não volta quando o silêncio vence); "Já em andamento" e
 # "Outro" voltam pela data, como qualquer sinal.
 MOTIVOS_ENCERRAM_ACAO = ('feito', 'proposital', 'alarme_falso')
+MOTIVOS_SO_ACAO = ('feito',)     # "Feito" não serve para os outros sinais (auditor R2)
+
+
+def motivos_para(regras):
+    """Os motivos que o formulário/Excel oferecem para estes sinais: "Feito" só
+    quando TODOS são ação da análise de ads."""
+    so_acao = bool(regras) and all(r == 'ads_acao' for r in regras)
+    return [m for m in MOTIVOS if so_acao or m not in MOTIVOS_SO_ACAO]
 PRAZO_ACAO_MAX = 60              # igual ao gatilho de ads_acao_decisao
 PRAZO_ACAO_PADRAO = 7            # quando o "checar em" do analista já passou
 
@@ -1882,10 +1890,12 @@ def aplicar_cientes(sinais, cientes, hoje):
     return ativos, silenciados
 
 
-def validar_ciente(motivo, nota, ate, hoje):
+def validar_ciente(motivo, nota, ate, hoje, regra=None):
     erros = []
     if motivo not in MOTIVOS:
         erros.append("Escolha o motivo.")
+    elif motivo in MOTIVOS_SO_ACAO and regra != 'ads_acao':
+        erros.append(f'"{MOTIVOS[motivo]}" vale só para {REGRAS["ads_acao"]}.')
     if motivo == 'outro' and not (nota or '').strip():
         erros.append('Motivo "Outro" pede uma nota.')
     if ate is None or ate < hoje:
@@ -1907,7 +1917,7 @@ def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE
     if not (usuario or '').strip():
         erros.append("Usuário não identificado.")
     for s, motivo, nota, ate in itens:
-        for e in validar_ciente(motivo, nota, ate, hoje):
+        for e in validar_ciente(motivo, nota, ate, hoje, s['regra']):
             erros.append(f"{s['loja']} · {s['objeto']}: {e}")
         if len(s['objeto']) > 120:
             erros.append(f"Chave do sinal longa demais: {s['objeto'][:40]}…")
@@ -1973,12 +1983,21 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
     ultima = max(len(sinais) + 1, 2)
     col = {c: get_column_letter(i + 1) for i, c in enumerate(COLUNAS_EXCEL)}
     dv_status = DataValidation(type='list', formula1='"Ciente"', allow_blank=True)
-    dv_motivo = DataValidation(type='list', formula1='"' + ','.join(MOTIVOS.values()) + '"',
-                               allow_blank=True)
+    # "Feito" só aparece na lista das linhas de ação da análise de ads (auditor R2)
+    dv_motivo = DataValidation(
+        type='list', formula1='"' + ','.join(MOTIVOS[m] for m in motivos_para(['x'])) + '"',
+        allow_blank=True)
+    dv_motivo_acao = DataValidation(
+        type='list', formula1='"' + ','.join(MOTIVOS[m] for m in motivos_para(['ads_acao'])) + '"',
+        allow_blank=True)
     ws.add_data_validation(dv_status)
     ws.add_data_validation(dv_motivo)
+    ws.add_data_validation(dv_motivo_acao)
     dv_status.add(f"{col['Status']}2:{col['Status']}{ultima}")
-    dv_motivo.add(f"{col['Motivo']}2:{col['Motivo']}{ultima}")
+    for r, sn in enumerate(sinais, start=2):
+        (dv_motivo_acao if sn['regra'] == 'ads_acao' else dv_motivo).add(f"{col['Motivo']}{r}")
+    if not sinais:
+        dv_motivo.add(f"{col['Motivo']}2")
     livre = PatternFill('solid', fgColor='FFF2CC')
     for nome in EDITAVEIS_EXCEL:
         for r in range(2, ultima + 1):
@@ -2009,7 +2028,8 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
              f"{hoje:%d/%m/%Y}"], [],
             ["Preencha só as colunas amarelas (Status, Motivo, Nota, Silenciar até)."],
             ['Status: "Ciente" para responder ao sinal; vazio = linha ignorada.'],
-            ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota.'],
+            ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota. "Feito" só '
+             'nas linhas de ' + REGRAS['ads_acao'] + '.'],
             [f"Silenciar até: dd/mm/aaaa, de hoje até {DIAS_SILENCIO_MAX} dias; vazio = "
              f"{DIAS_SILENCIO_PADRAO} dias."],
             ["Não mude Loja, Regra e Objeto: são a chave do sinal."],
@@ -2115,7 +2135,7 @@ def previa_excel(linhas, sinais_hoje, lojas_permitidas, hoje):
             recusa('"Silenciar até" ilegível (use dd/mm/aaaa)')
             continue
         nota = str(d.get('Nota') or '').strip()
-        erros = validar_ciente(motivo, nota, ate, hoje)
+        erros = validar_ciente(motivo, nota, ate, hoje, regra)
         if erros:
             recusa(' '.join(erros))
             continue
@@ -2309,7 +2329,10 @@ def sinais_hoje_para_historico(engine, hoje, mkt):
     dim_produtos)."""
     lojas = _ler_lojas_ml(engine, mkt)
     pacote = _ler_pacote(engine, hoje, tuple(lojas), mkt, com_nomes=False)
-    if set(pacote['erros']) - FONTES_OPCIONAIS_HISTORICO or pacote['erros_bloco']:
+    # As ações da análise de ads podem faltar na LEITURA e na MONTAGEM (auditor R4):
+    # o dia grava sem elas.
+    if (set(pacote['erros']) - FONTES_OPCIONAIS_HISTORICO
+            or set(pacote['erros_bloco']) - FONTES_OPCIONAIS_HISTORICO):
         raise _LeituraIncompleta(pacote)
     sinais, _p, _u = sinais_da_loja_hoje(pacote, lojas, hoje)
     # Sem as ações da análise de ads o dia grava sem elas (aviso só da projeção).
@@ -2845,15 +2868,16 @@ def _render_form_ciente(st, loja, marcados, ctx):
     hoje = ctx['hoje']
     with st.form(key=f"sin_form_{loja}"):
         st.markdown(f"**Ciente em {len(marcados)} sinal(is) da {loja}**")
-        motivo = st.selectbox("Motivo", list(MOTIVOS), format_func=MOTIVOS.get,
-                              key=f"sin_mot_{loja}")
+        motivo = st.selectbox("Motivo", motivos_para([x['regra'] for x in marcados]),
+                              format_func=MOTIVOS.get, key=f"sin_mot_{loja}")
         nota = st.text_input("Nota (obrigatória em \"Outro\")", key=f"sin_nota_{loja}")
         ate = st.date_input("Silenciar até", value=hoje + timedelta(days=DIAS_SILENCIO_PADRAO),
                             min_value=hoje, max_value=hoje + timedelta(days=DIAS_SILENCIO_MAX),
                             format="DD/MM/YYYY", key=f"sin_ate_{loja}")
         if not st.form_submit_button("Registrar ciente"):
             return
-    erros = validar_ciente(motivo, nota, ate, hoje)
+    erros = sorted({e for r in {x['regra'] for x in marcados}
+                    for e in validar_ciente(motivo, nota, ate, hoje, r)})
     if erros:
         st.error(' '.join(erros))
         return

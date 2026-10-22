@@ -126,6 +126,52 @@ class CienteDaAcao(unittest.TestCase):
                                            HOJE, [LPT]), 1)
 
 
+class FeitoSoNaAcao(unittest.TestCase):
+    """Auditor R2: o motivo "Feito" vale só para o sinal 'ads_acao'."""
+
+    def test_validar(self):
+        ate = HOJE + timedelta(days=7)
+        self.assertEqual(sd.validar_ciente('feito', '', ate, HOJE, 'ads_acao'), [])
+        self.assertTrue(sd.validar_ciente('feito', '', ate, HOJE, 'ads_custo'))
+        self.assertTrue(sd.validar_ciente('feito', '', ate, HOJE))
+        self.assertEqual(sd.validar_ciente('proposital', '', ate, HOJE, 'ads_custo'), [])
+
+    def test_lista_do_formulario(self):
+        self.assertIn('feito', sd.motivos_para(['ads_acao', 'ads_acao']))
+        self.assertNotIn('feito', sd.motivos_para(['ads_acao', 'vendas_queda']))
+        self.assertNotIn('feito', sd.motivos_para([]))
+        self.assertEqual(len(sd.motivos_para(['vendas_queda'])), len(sd.MOTIVOS) - 1)
+
+    def test_gravar_recusa_feito_em_outro_sinal(self):
+        outro = sd._sinal(LPT, 'ADS', 'MLB1', ('A',), 'x', 'y', 10, regra='ads_custo')
+        conn = mock.MagicMock()
+        with self.assertRaises(ValueError):
+            sd.gravar_cientes(conn, [(outro, 'feito', '', HOJE)], 'Larissa', HOJE, [LPT],
+                              lojas_acao={LPT})
+        conn.cursor.assert_not_called()
+
+    def test_excel_lista_por_linha_e_previa(self):
+        import openpyxl
+        acao = sd.sinais_acoes([_acao(7, marcada=True, prazo=date(2026, 10, 30))], HOJE)[0]
+        outro = sd._sinal(LPT, 'ADS', 'MLB1', ('A',), 'x', 'y', 10, regra='ads_custo')
+        wb = openpyxl.load_workbook(__import__('io').BytesIO(
+            sd.excel_sinais([acao, outro], {}, HOJE)))
+        ws = wb['Sinais']
+        col = sd.COLUNAS_EXCEL.index('Motivo')
+        letra = openpyxl.utils.get_column_letter(col + 1)
+        listas = {}
+        for dv in ws.data_validations.dataValidation:
+            for rng in str(dv.sqref).split():
+                listas[rng] = dv.formula1
+        self.assertIn('Feito', listas[f'{letra}2'])          # linha da ação
+        self.assertNotIn('Feito', listas[f'{letra}3'])       # linha do outro sinal
+        linhas = [{'_linha': 3, 'Loja': LPT, 'Regra': 'ads_custo', 'Objeto': outro['objeto'],
+                   'Status': 'Ciente', 'Motivo': 'Feito', 'Nota': '', 'Silenciar até': None}]
+        itens, previa = sd.previa_excel(linhas, [acao, outro], [LPT], HOJE)
+        self.assertEqual(itens, [])
+        self.assertIn('❌', previa['Resultado'].iloc[0])
+
+
 class Caixinha(unittest.TestCase):
     def test_prazo_padrao(self):
         self.assertEqual(sd.prazo_padrao(_acao(1, checar=date(2026, 10, 25)), HOJE), date(2026, 10, 25))
@@ -176,6 +222,28 @@ class LeituraDoDia(unittest.TestCase):
             sinais, n, sem_projecao = sd.sinais_hoje_para_historico(mock.MagicMock(), HOJE,
                                                                    sd.MARKETPLACE)
         self.assertEqual((sinais, n, sem_projecao), ([], 1, False))
+
+    def test_job_grava_o_dia_quando_a_montagem_das_acoes_quebra(self):
+        # auditor R4: sinais_acoes quebrar na MONTAGEM (erros_bloco) não para o job
+        pacote = {'erros': {}, 'erros_bloco': {'acoes': "KeyError('prazo')"}, 'sinais': [],
+                  'dados': {'frescor': []}, 'upload_ate': {}}
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=pacote):
+            self.assertEqual(sd.sinais_hoje_para_historico(mock.MagicMock(), HOJE,
+                                                           sd.MARKETPLACE), ([], 1, False))
+        # o bloco de qualquer OUTRA regra continua barrando o dia
+        pacote['erros_bloco'] = {'vendas': 'x'}
+        with mock.patch.object(sd, '_ler_lojas_ml', return_value=[LPT]), \
+             mock.patch.object(sd, '_ler_pacote', return_value=pacote):
+            with self.assertRaises(sd._LeituraIncompleta):
+                sd.sinais_hoje_para_historico(mock.MagicMock(), HOJE, sd.MARKETPLACE)
+
+    def test_montagem_real_com_acao_quebrada_cai_so_no_bloco_acoes(self):
+        quebrada = _acao(6, marcada=True, prazo=date(2026, 10, 30))
+        del quebrada['prazo']
+        sinais, erros = sd.montar_sinais({'acoes': [quebrada]}, HOJE)
+        self.assertEqual(list(erros), ['acoes'])
+        self.assertEqual(sinais, [])
 
     def test_job_sem_a_projecao_continua_avisando(self):
         pacote = {'erros': {'performance': 'x'}, 'erros_bloco': {}, 'sinais': [],
