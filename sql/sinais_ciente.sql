@@ -47,6 +47,8 @@
 --
 -- ATENÇÃO aos testes: tests/test_sinais_dia.py LÊ o CREATE TABLE e o CREATE
 -- UNIQUE INDEX DESTE arquivo para criar a TEMP. Mudou aqui, muda lá.
+-- 22/10/2026: a regra 'ads_acao' e o motivo 'feito' entraram nas CHECKs deste arquivo
+-- ([HISTÓRICO E AÇÕES] etapa 2). Em produção a mudança vai por sql/ads_acoes.sql.
 -- =============================================================================
 
 BEGIN;
@@ -82,9 +84,10 @@ CREATE TABLE public.sinal_ciente (
     CONSTRAINT sinal_ciente_regra_valida CHECK (regra IN (
         'vendas_queda', 'vendas_alta', 'full_cobertura', 'full_zerado_ads', 'full_envio',
         'full_ruptura', 'ads_config', 'ads_sem_venda', 'ads_custo', 'ads_espiral',
-        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta', 'full_parado')),
+        'exp_anuncio', 'exp_familia', 'visitas_queda', 'visitas_alta', 'full_parado',
+        'ads_acao')),
     CONSTRAINT sinal_ciente_motivo_valido CHECK (motivo IN (
-        'falta_fornecedor', 'proposital', 'em_andamento', 'alarme_falso', 'outro')),
+        'falta_fornecedor', 'proposital', 'em_andamento', 'alarme_falso', 'outro', 'feito')),
     CONSTRAINT sinal_ciente_nota_no_outro CHECK (
         motivo <> 'outro' OR nullif(btrim(nota), '') IS NOT NULL),
     CONSTRAINT sinal_ciente_prazo CHECK (
