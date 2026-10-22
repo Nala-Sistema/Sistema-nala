@@ -2932,8 +2932,10 @@ def _render_plano(st, loja, plano, ctx, decide, versao):
             if not decide:
                 st.caption(f"Só {resp} marca as ações desta loja.")
             return
-        df.insert(0, 'Vou executar', False)
-        df.insert(1, 'Prazo', [prazo_padrao(a, hoje) for a in plano])
+        # já marcadas aparecem marcadas e com o prazo gravado (desmarcar não muda nada)
+        df.insert(0, 'Vou executar', [bool(a['vai_executar']) for a in plano])
+        df.insert(1, 'Prazo', [pd.Timestamp(a['prazo']).date() if a['vai_executar']
+                               else prazo_padrao(a, hoje) for a in plano])
         travadas = [i for i, a in enumerate(plano) if a['vai_executar']]
         ed = st.data_editor(
             df, key=f"sin_plano_{loja}_{versao}", hide_index=True, use_container_width=True,
