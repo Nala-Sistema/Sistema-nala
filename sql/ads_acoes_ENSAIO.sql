@@ -555,13 +555,13 @@ BEGIN
     VALUES ('MERCADO LIVRE', 'ML-LPT', 'ads_acao', 'acao:ensaio', 'feito', hoje + 7, 'ensaio');
     BEGIN
         INSERT INTO public.sinal_historico (data, marketplace, loja, regra, objeto)
-        VALUES (hoje, 'MERCADO LIVRE', 'ML-LPT', 'regra_que_nao_existe', 'x');
+        VALUES (hoje, 'MERCADO LIVRE', 'ML-LPT', 'regra_x', 'x');
         RAISE EXCEPTION 'ENSAIO FALHOU: T7 sinal_historico aceitou regra inválida';
     EXCEPTION WHEN check_violation THEN NULL;
     END;
     BEGIN
         INSERT INTO public.sinal_ciente (marketplace, loja, regra, objeto, motivo, silenciar_ate, criado_por)
-        VALUES ('MERCADO LIVRE', 'ML-LPT', 'ads_acao', 'acao:ensaio2', 'motivo_que_nao_existe', hoje + 7, 'ensaio');
+        VALUES ('MERCADO LIVRE', 'ML-LPT', 'ads_acao', 'acao:ensaio2', 'motivo_x', hoje + 7, 'ensaio');
         RAISE EXCEPTION 'ENSAIO FALHOU: T7 sinal_ciente aceitou motivo inválido';
     EXCEPTION WHEN check_violation THEN NULL;
     END;
