@@ -2863,17 +2863,17 @@ def _editor(st, sinais, nomes, chave, pode):
     return [sinais[i] for i in range(len(sinais)) if bool(ed['Ciente'].iloc[i])]
 
 
-def _render_form_ciente(st, loja, marcados, ctx):
+def _render_form_ciente(st, loja, marcados, ctx, chave=''):
     import streamlit
     hoje = ctx['hoje']
-    with st.form(key=f"sin_form_{loja}"):
+    with st.form(key=f"sin_form_{loja}{chave}"):
         st.markdown(f"**Ciente em {len(marcados)} sinal(is) da {loja}**")
         motivo = st.selectbox("Motivo", motivos_para([x['regra'] for x in marcados]),
-                              format_func=MOTIVOS.get, key=f"sin_mot_{loja}")
-        nota = st.text_input("Nota (obrigatória em \"Outro\")", key=f"sin_nota_{loja}")
+                              format_func=MOTIVOS.get, key=f"sin_mot_{loja}{chave}")
+        nota = st.text_input("Nota (obrigatória em \"Outro\")", key=f"sin_nota_{loja}{chave}")
         ate = st.date_input("Silenciar até", value=hoje + timedelta(days=DIAS_SILENCIO_PADRAO),
                             min_value=hoje, max_value=hoje + timedelta(days=DIAS_SILENCIO_MAX),
-                            format="DD/MM/YYYY", key=f"sin_ate_{loja}")
+                            format="DD/MM/YYYY", key=f"sin_ate_{loja}{chave}")
         if not st.form_submit_button("Registrar ciente"):
             return
     erros = sorted({e for r in {x['regra'] for x in marcados}
@@ -2910,6 +2910,11 @@ def _render_acoes(st, loja, ativos, ctx, versao):
                    "\"Alarme falso\" encerram a ação; \"Já em andamento\" volta na data.")
         marcados = _editor(st, em_execucao, nomes, f"sin_ed_acao_{loja}_{versao}",
                            ctx['pode'] and decide)
+        if marcados and ctx.get('com_ciente'):
+            # o formulário das ações fica logo abaixo delas (no teste de 22/10 ele
+            # aparecia no fim do bloco, depois do plano, e parecia não abrir)
+            _render_form_ciente(st, loja, marcados, ctx, chave='_acao')
+            marcados = []
     plano = (ctx.get('plano') or {}).get(loja) or []
     if plano:
         _render_plano(st, loja, plano, ctx, decide, versao)
