@@ -275,7 +275,23 @@ MOTIVOS = {'falta_fornecedor': 'Falta no fornecedor',
            'proposital': 'Decisão proposital',
            'em_andamento': 'Já em andamento',
            'alarme_falso': 'Alarme falso / não serve',
-           'outro': 'Outro'}
+           'outro': 'Outro',
+           'feito': 'Feito'}
+
+# Ação da análise de ads ([HISTÓRICO E AÇÕES] etapa 2): ciente com estes motivos
+# encerra a ação (não volta quando o silêncio vence); "Já em andamento" e
+# "Outro" voltam pela data, como qualquer sinal.
+MOTIVOS_ENCERRAM_ACAO = ('feito', 'proposital', 'alarme_falso')
+MOTIVOS_SO_ACAO = ('feito',)     # "Feito" não serve para os outros sinais (auditor R2)
+
+
+def motivos_para(regras):
+    """Os motivos que o formulário/Excel oferecem para estes sinais: "Feito" só
+    quando TODOS são ação da análise de ads."""
+    so_acao = bool(regras) and all(r == 'ads_acao' for r in regras)
+    return [m for m in MOTIVOS if so_acao or m not in MOTIVOS_SO_ACAO]
+PRAZO_ACAO_MAX = 60              # igual ao gatilho de ads_acao_decisao
+PRAZO_ACAO_PADRAO = 7            # quando o "checar em" do analista já passou
 
 REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'full_cobertura': 'Full acabando', 'full_zerado_ads': 'Full zerado com ads',
@@ -285,7 +301,8 @@ REGRAS = {'vendas_queda': 'Venda caiu', 'vendas_alta': 'Venda subiu',
           'exp_anuncio': 'Experiência piorou', 'exp_familia': 'Experiência da família',
           'visitas_queda': 'Visitas/visualizações caíram',
           'visitas_alta': 'Visitas/visualizações subiram',
-          'full_parado': 'Full parado'}
+          'full_parado': 'Full parado',
+          'ads_acao': 'Ação da análise de ads'}
 
 # Regras que comparam janelas de VENDA: suspensas na loja com carga pendente.
 REGRAS_DE_VENDA = ('vendas_queda', 'vendas_alta', 'ads_espiral', 'full_ruptura', 'ads_custo',
@@ -304,7 +321,7 @@ DIAS_HISTORICO = 60
 # só dá o amarelo; o job (Actions, pandas + psycopg2, usuário sinais_historico) não
 # a lê, e por isso não gravou nada em 13 e 14/10. Sem ela o histórico só perde o
 # amarelo. Qualquer outra fonte em erro continua barrando o dia inteiro.
-FONTES_OPCIONAIS_HISTORICO = frozenset({'performance'})
+FONTES_OPCIONAIS_HISTORICO = frozenset({'performance', 'acoes'})
 
 MAX_SINAIS_POR_LOJA = 10
 TTL_LEITURA_S = 600              # leitura do dia em memória por 10 min
@@ -671,6 +688,51 @@ SQL_GRAVAR_HISTORICO = """
            gravado_em = (now() AT TIME ZONE 'America/Sao_Paulo')
 """
 
+# ---- Ações da análise de ads ([HISTÓRICO E AÇÕES] etapa 2) ----------------
+# Tabelas de sql/ads_acoes.sql. A proposta (ads_acao) só o rodar_ciclo grava;
+# a caixinha (ads_acao_decisao) só o app grava, e o gatilho do banco só aceita
+# a responsável da loja (dim_loja_responsavel_ads) ou ADMIN.
+SQL_EXISTE_ACOES = "SELECT to_regclass('ads_acao_decisao') IS NOT NULL"
+
+# O plano do ciclo MAIS RECENTE de cada loja (pelo período, não pelo nome do
+# ciclo: a ML-Nala usa letras), com a decisão de cada ação. O teto de data
+# (amanha) deixa o backfill do histórico ver só o que existia naquele dia.
+SQL_ACOES = """
+    WITH ult AS (
+        SELECT DISTINCT ON (loja) loja, ciclo
+          FROM v_ads_acao_vigente
+         WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
+           AND gravado_em < %(amanha)s
+         ORDER BY loja, periodo_ini DESC, rodada_em DESC
+    )
+    SELECT a.id, a.loja, a.ciclo, a.periodo_ini, a.periodo_fim, a.ordem, a.objeto,
+           a.codigo_anuncio, a.sku, a.nome_produto, a.acao, a.dono, a.numero_esperado,
+           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em
+      FROM v_ads_acao_vigente a
+      JOIN ult u ON u.loja = a.loja AND u.ciclo = a.ciclo
+      LEFT JOIN ads_acao_decisao d ON d.id_acao = a.id AND d.decidido_em < %(amanha)s
+     WHERE a.marketplace = %(marketplace)s
+     ORDER BY a.loja, a.ordem
+"""
+
+SQL_RESPONSAVEIS = """
+    SELECT l.loja, u.username
+      FROM dim_loja_responsavel_ads r
+      JOIN dim_lojas l ON l.id = r.id_loja
+      JOIN dim_usuarios u ON u.id_usuario = r.id_usuario
+     WHERE l.marketplace = %(marketplace)s AND l.loja = ANY(%(lojas)s)
+"""
+
+SQL_DECIDIR_ACAO = """
+    INSERT INTO ads_acao_decisao (id_acao, vai_executar, prazo, decidido_por)
+    VALUES (%(id_acao)s, true, %(prazo)s, %(usuario)s)
+    ON CONFLICT (id_acao) DO NOTHING
+"""
+
+ACAO_COLS = ('id', 'loja', 'ciclo', 'periodo_ini', 'periodo_fim', 'ordem', 'objeto',
+             'codigo_anuncio', 'sku', 'nome_produto', 'acao', 'dono', 'numero_esperado',
+             'checar_em', 'vai_executar', 'prazo', 'decidido_por', 'decidido_em')
+
 FONTES_FRESCOR = ('Vendas', 'Estoque', 'Ads', 'Config. de ads', 'Experiência')
 
 TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
@@ -679,7 +741,8 @@ TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
                 SQL_ROAS_SUBIU, SQL_EXPERIENCIA, SQL_EXISTE_VISITAS, SQL_VISITAS, SQL_FRESCOR,
                 SQL_EXISTE_HISTORICO, SQL_HISTORICO, SQL_HISTORICO_DIAS, SQL_GRAVAR_HISTORICO,
                 SQL_EXISTE_CIENTE, SQL_CIENTES_ABERTOS, SQL_FECHAR_ABERTO,
-                SQL_INSERIR_CIENTE, SQL_REATIVAR)
+                SQL_INSERIR_CIENTE, SQL_REATIVAR, SQL_EXISTE_ACOES, SQL_ACOES,
+                SQL_RESPONSAVEIS, SQL_DECIDIR_ACAO)
 
 
 def params(hoje, lojas, mkt=MARKETPLACE):
@@ -745,6 +808,16 @@ def ler_cientes(conn, lojas, mkt=MARKETPLACE):
     return _ler(conn, SQL_CIENTES_ABERTOS, {'marketplace': mkt, 'lojas': list(lojas)})
 
 
+def ler_plano(conn, hoje, lojas, mkt=MARKETPLACE):
+    """(ações do ciclo mais recente de cada loja, {loja: responsável}) relidas a
+    cada carga (a caixinha muda a cada clique); None se a etapa 2 não existe."""
+    if not _ler(conn, SQL_EXISTE_ACOES, {})[0][0]:
+        return None
+    p = {'marketplace': mkt, 'lojas': list(lojas), 'amanha': hoje + timedelta(days=1)}
+    acoes = [dict(zip(ACAO_COLS, r)) for r in _ler(conn, SQL_ACOES, p)]
+    return acoes, dict(_ler(conn, SQL_RESPONSAVEIS, p))
+
+
 def ler_tudo(conn, hoje, lojas, mkt=MARKETPLACE):
     """{fonte: linhas} e {fonte: exceção}: a leitura do DIA (vai para a
     memória). Visitas só se a view existir (None = ainda não existe). Os
@@ -778,6 +851,13 @@ def ler_tudo(conn, hoje, lojas, mkt=MARKETPLACE):
             dados['visitas'] = None
     except Exception as e:  # noqa: BLE001
         erros['visitas'] = e
+    try:
+        if _ler(conn, SQL_EXISTE_ACOES, {})[0][0]:
+            dados['acoes'] = _ler(conn, SQL_ACOES, p)
+        else:
+            dados['acoes'] = None               # SQL da etapa 2 ainda não aplicado
+    except Exception as e:  # noqa: BLE001
+        erros['acoes'] = e
     # Fecha a transação de leitura já aqui: sem isto ela segura AccessShareLock
     # em ~10 tabelas até o close (auditor 06/10, R2). Uma ida e volta só.
     try:
@@ -1440,6 +1520,95 @@ def sinais_views_shopee(views, por_anuncio, j):
     return out
 
 
+def sinais_acoes(linhas, hoje):
+    """Um sinal 'ads_acao' por ação que a responsável marcou ("vou executar") no
+    plano do ciclo mais recente da loja. Chave do Ciente = 'acao:<id>'. Prazo
+    vencido = urgente e vermelho. Não tem R$ em jogo (fica na seção própria da
+    loja, fora das 10 vagas por R$)."""
+    out = []
+    for r in linhas or []:
+        a = r if isinstance(r, dict) else dict(zip(ACAO_COLS, r))
+        if not a['vai_executar']:
+            continue
+        prazo = pd.Timestamp(a['prazo']).date()
+        vencido = hoje > prazo
+        out.append(_sinal(
+            a['loja'], 'AÇÃO ADS', a['codigo_anuncio'] or '',
+            (a['sku'],) if a['sku'] else (),
+            f"{a['ciclo']} · {a['objeto']}: {a['acao']}",
+            f"Esperado: {a['numero_esperado']}. Prazo {prazo:%d/%m}"
+            + (" (vencido)" if vencido else "") + f". Dono: {a['dono']}.",
+            0, urgente=vencido, regra='ads_acao', objeto=f"acao:{a['id']}",
+            periodo=f"{pd.Timestamp(a['periodo_ini']):%d/%m}–{pd.Timestamp(a['periodo_fim']):%d/%m}",
+            cor='vermelho' if vencido else ''))
+    return out
+
+
+def lojas_das_acoes(lojas, responsaveis, usuario, role, ve_todas):
+    """(lojas em que o usuário VÊ as ações, lojas em que ele DECIDE e responde).
+    Decide: a responsável da loja (dim_loja_responsavel_ads) ou ADMIN. Vê: quem
+    decide e quem vê todas as lojas. A Larissa (GESTOR com as 14 lojas em
+    dim_usuario_lojas) NÃO vê as ações da Shopee: lá a responsável é a Patricia."""
+    decide = {l for l in lojas if role == 'ADMIN'
+              or (usuario and responsaveis.get(l) == usuario)}
+    ve = decide | ({l for l in lojas} if ve_todas else set())
+    return ve, decide
+
+
+def prazo_padrao(acao, hoje):
+    """Prazo sugerido na caixinha: o "checar em" do analista; se já passou, hoje + 7."""
+    c = pd.Timestamp(acao['checar_em']).date()
+    return c if hoje <= c <= hoje + timedelta(days=PRAZO_ACAO_MAX) \
+        else hoje + timedelta(days=PRAZO_ACAO_PADRAO)
+
+
+def tabela_plano(acoes, nomes):
+    return pd.DataFrame({
+        'Anúncio': [a['codigo_anuncio'] or '' for a in acoes],
+        'SKU': [a['sku'] or '' for a in acoes],
+        'Produto': [a['nome_produto'] or nomes.get(a['sku'] or '', '') or a['objeto']
+                    for a in acoes],
+        'Ação': [a['acao'] for a in acoes],
+        'Número esperado': [a['numero_esperado'] for a in acoes],
+        'Checar em': [f"{pd.Timestamp(a['checar_em']):%d/%m}" for a in acoes],
+        'Dono': [a['dono'] for a in acoes],
+        'Situação': [(f"✔ marcada por {a['decidido_por']} em "
+                      f"{pd.Timestamp(a['decidido_em']):%d/%m}, prazo "
+                      f"{pd.Timestamp(a['prazo']):%d/%m}") if a['vai_executar'] else ''
+                     for a in acoes],
+    })
+
+
+def gravar_decisoes(conn, itens, usuario, hoje, ids_permitidos):
+    """A ÚNICA gravação da caixinha. itens = [(id_acao, prazo)]. Valida antes de
+    tocar no banco (usuário, prazo hoje..hoje+60, ação de loja em que ele
+    decide); grava numa transação só; ação já decidida fica como estava (o
+    gatilho do banco confere a responsável de novo). Devolve quantas gravou."""
+    erros = []
+    if not (usuario or '').strip():
+        erros.append("Usuário não identificado.")
+    for id_acao, prazo in itens:
+        if id_acao not in ids_permitidos:
+            erros.append(f"Ação {id_acao}: sem permissão para decidir.")
+        if prazo is None or prazo < hoje or prazo > hoje + timedelta(days=PRAZO_ACAO_MAX):
+            erros.append(f"Ação {id_acao}: prazo entre hoje e {PRAZO_ACAO_MAX} dias.")
+    if erros:
+        raise ValueError(' '.join(erros))
+    cur = conn.cursor()
+    n = 0
+    try:
+        for id_acao, prazo in itens:
+            cur.execute(SQL_DECIDIR_ACAO, {'id_acao': id_acao, 'prazo': prazo, 'usuario': usuario})
+            n += cur.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+    return n
+
+
 def ads_por_anuncio(linhas):
     cols = ('gasto_sem', 'gasto_base', 'gasto_ontem', 'gasto_recente', 'dias_com_gasto',
             'unid_recente', 'gasto_30', 'unid_ads_30', 'cliques_30')
@@ -1595,6 +1764,8 @@ def montar_sinais(dados, hoje, mkt=MARKETPLACE):
     sinais = [s for s in sinais
               if not (s['regra'] == 'vendas_queda'
                       and (s['loja'], s['anuncio']) in explicados)]
+    if dados.get('acoes'):
+        sinais += _bloco('acoes', erros, [], sinais_acoes, dados['acoes'], hoje)
     return sinais, erros
 
 
@@ -1701,7 +1872,9 @@ def aplicar_cientes(sinais, cientes, hoje):
             continue
         ate = pd.Timestamp(c['silenciar_ate']).date()
         quando = f"{pd.Timestamp(c['criado_em']):%d/%m}"
-        if piorou(s['regra'], s['medida'], c['medida_no_ciente']):
+        if s['regra'] == 'ads_acao' and c['motivo'] in MOTIVOS_ENCERRAM_ACAO:
+            silenciados.append({**s, 'ciente': c})   # respondida: não volta pela data
+        elif piorou(s['regra'], s['medida'], c['medida_no_ciente']):
             ativos.append({**s, 'ciente_voltou': c['id'], 'voltou': (
                 f"🔁 piorou: {texto_medida(s['regra'], c['medida_no_ciente'])} → "
                 f"{texto_medida(s['regra'], s['medida'])} (ciente de {quando}, "
@@ -1717,10 +1890,12 @@ def aplicar_cientes(sinais, cientes, hoje):
     return ativos, silenciados
 
 
-def validar_ciente(motivo, nota, ate, hoje):
+def validar_ciente(motivo, nota, ate, hoje, regra=None):
     erros = []
     if motivo not in MOTIVOS:
         erros.append("Escolha o motivo.")
+    elif motivo in MOTIVOS_SO_ACAO and regra != 'ads_acao':
+        erros.append(f'"{MOTIVOS[motivo]}" vale só para {REGRAS["ads_acao"]}.')
     if motivo == 'outro' and not (nota or '').strip():
         erros.append('Motivo "Outro" pede uma nota.')
     if ate is None or ate < hoje:
@@ -1730,8 +1905,10 @@ def validar_ciente(motivo, nota, ate, hoje):
     return erros
 
 
-def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE):
-    """A ÚNICA gravação de ciente (formulário da tela e Excel).
+def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE,
+                   lojas_acao=()):
+    """A ÚNICA gravação de ciente (formulário da tela e Excel). Ciente de ação da
+    análise de ads ('ads_acao') só nas lojas_acao (a responsável da loja ou ADMIN).
     itens = [(sinal, motivo, nota, ate)]: cada um com o seu motivo/nota/data.
     Valida tudo antes de tocar no banco; grava numa transação só (ciente
     aberto na mesma chave é encerrado como 'substituido'). Medida e texto vêm
@@ -1740,7 +1917,7 @@ def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE
     if not (usuario or '').strip():
         erros.append("Usuário não identificado.")
     for s, motivo, nota, ate in itens:
-        for e in validar_ciente(motivo, nota, ate, hoje):
+        for e in validar_ciente(motivo, nota, ate, hoje, s['regra']):
             erros.append(f"{s['loja']} · {s['objeto']}: {e}")
         if len(s['objeto']) > 120:
             erros.append(f"Chave do sinal longa demais: {s['objeto'][:40]}…")
@@ -1749,6 +1926,11 @@ def gravar_cientes(conn, itens, usuario, hoje, lojas_permitidas, mkt=MARKETPLACE
     fora = sorted({s['loja'] for s, *_r in itens if s['loja'] not in lojas_permitidas})
     if fora:
         raise PermissionError(f"Sem permissão nas lojas: {', '.join(fora)}")
+    fora = sorted({s['loja'] for s, *_r in itens
+                   if s['regra'] == 'ads_acao' and s['loja'] not in lojas_acao})
+    if fora:
+        raise PermissionError("Ação da análise de ads: só a responsável da loja responde "
+                              f"({', '.join(fora)})")
     cur = conn.cursor()
     try:
         for s, motivo, nota, ate in itens:
@@ -1801,12 +1983,21 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
     ultima = max(len(sinais) + 1, 2)
     col = {c: get_column_letter(i + 1) for i, c in enumerate(COLUNAS_EXCEL)}
     dv_status = DataValidation(type='list', formula1='"Ciente"', allow_blank=True)
-    dv_motivo = DataValidation(type='list', formula1='"' + ','.join(MOTIVOS.values()) + '"',
-                               allow_blank=True)
+    # "Feito" só aparece na lista das linhas de ação da análise de ads (auditor R2)
+    dv_motivo = DataValidation(
+        type='list', formula1='"' + ','.join(MOTIVOS[m] for m in motivos_para(['x'])) + '"',
+        allow_blank=True)
+    dv_motivo_acao = DataValidation(
+        type='list', formula1='"' + ','.join(MOTIVOS[m] for m in motivos_para(['ads_acao'])) + '"',
+        allow_blank=True)
     ws.add_data_validation(dv_status)
     ws.add_data_validation(dv_motivo)
+    ws.add_data_validation(dv_motivo_acao)
     dv_status.add(f"{col['Status']}2:{col['Status']}{ultima}")
-    dv_motivo.add(f"{col['Motivo']}2:{col['Motivo']}{ultima}")
+    for r, sn in enumerate(sinais, start=2):
+        (dv_motivo_acao if sn['regra'] == 'ads_acao' else dv_motivo).add(f"{col['Motivo']}{r}")
+    if not sinais:
+        dv_motivo.add(f"{col['Motivo']}2")
     livre = PatternFill('solid', fgColor='FFF2CC')
     for nome in EDITAVEIS_EXCEL:
         for r in range(2, ultima + 1):
@@ -1837,7 +2028,8 @@ def excel_sinais(sinais, nomes, hoje, mkt=MARKETPLACE):
              f"{hoje:%d/%m/%Y}"], [],
             ["Preencha só as colunas amarelas (Status, Motivo, Nota, Silenciar até)."],
             ['Status: "Ciente" para responder ao sinal; vazio = linha ignorada.'],
-            ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota.'],
+            ["Motivo: " + ' / '.join(MOTIVOS.values()) + '. "Outro" pede Nota. "Feito" só '
+             'nas linhas de ' + REGRAS['ads_acao'] + '.'],
             [f"Silenciar até: dd/mm/aaaa, de hoje até {DIAS_SILENCIO_MAX} dias; vazio = "
              f"{DIAS_SILENCIO_PADRAO} dias."],
             ["Não mude Loja, Regra e Objeto: são a chave do sinal."],
@@ -1943,7 +2135,7 @@ def previa_excel(linhas, sinais_hoje, lojas_permitidas, hoje):
             recusa('"Silenciar até" ilegível (use dd/mm/aaaa)')
             continue
         nota = str(d.get('Nota') or '').strip()
-        erros = validar_ciente(motivo, nota, ate, hoje)
+        erros = validar_ciente(motivo, nota, ate, hoje, regra)
         if erros:
             recusa(' '.join(erros))
             continue
@@ -2137,10 +2329,14 @@ def sinais_hoje_para_historico(engine, hoje, mkt):
     dim_produtos)."""
     lojas = _ler_lojas_ml(engine, mkt)
     pacote = _ler_pacote(engine, hoje, tuple(lojas), mkt, com_nomes=False)
-    if set(pacote['erros']) - FONTES_OPCIONAIS_HISTORICO or pacote['erros_bloco']:
+    # As ações da análise de ads podem faltar na LEITURA e na MONTAGEM (auditor R4):
+    # o dia grava sem elas.
+    if (set(pacote['erros']) - FONTES_OPCIONAIS_HISTORICO
+            or set(pacote['erros_bloco']) - FONTES_OPCIONAIS_HISTORICO):
         raise _LeituraIncompleta(pacote)
     sinais, _p, _u = sinais_da_loja_hoje(pacote, lojas, hoje)
-    return sinais, len(lojas), bool(set(pacote['erros']) & FONTES_OPCIONAIS_HISTORICO)
+    # Sem as ações da análise de ads o dia grava sem elas (aviso só da projeção).
+    return sinais, len(lojas), 'performance' in pacote['erros']
 
 
 def suspender_venda_pendente(sinais, pendentes):
@@ -2199,13 +2395,15 @@ ROTULO_FONTE = {
     'experiencia': 'experiência de compra',
     'frescor': 'datas de chegada', 'composicao': 'composição de kits', 'visitas': 'visitas',
     'ciente': 'cientes registrados', 'historico': 'histórico dos sinais',
+    'acoes': 'ações da análise de ads', 'plano': 'plano de ação da análise de ads',
 }
 
 ROTULO_BLOCO = {'vendas': 'VENDAS', 'full': 'FULL', 'ads': 'ADS',
                 'experiencia': 'EXPERIÊNCIA', 'visitas': 'VISITAS', 'ciente': 'CIENTE',
                 'historico': '"APARECE DESDE"'}
 
-ICONE = {'VENDAS': '📉', 'FULL': '📦', 'ADS': '📣', 'EXPERIÊNCIA': '⭐', 'VISITAS': '👀'}
+ICONE = {'VENDAS': '📉', 'FULL': '📦', 'ADS': '📣', 'EXPERIÊNCIA': '⭐', 'VISITAS': '👀',
+         'AÇÃO ADS': '📋'}
 ICONE_COR = {'vermelho': '🟥', 'laranja': '🟧', 'amarelo': '🟨'}
 
 
@@ -2454,23 +2652,39 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
     sinais, nomes, parciais = pacote['sinais'], pacote['nomes'], pacote['parciais']
 
     t = time.perf_counter()
-    cientes_linhas, erro_ciente = None, False
+    cientes_linhas, erro_ciente, plano = None, False, None
     try:
         conn = engine.raw_connection()
         try:
             cientes_linhas = ler_cientes(conn, lojas, mkt)
+            try:
+                plano = ler_plano(conn, hoje, lojas, mkt)
+            except Exception:  # noqa: BLE001 — sem o plano, o resto da tela segue
+                conn.rollback()
+                erros = {**erros, 'plano': 'erro'}
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
         erro_ciente = True
         erros = {**erros, 'ciente': 'erro'}
-    tempos.append(('Cientes (relidos a cada carga)', time.perf_counter() - t))
+    tempos.append(('Cientes e plano de ação (relidos a cada carga)', time.perf_counter() - t))
     sinais, pendentes, upload_ate = sinais_da_loja_hoje(pacote, lojas, hoje)
     if dados.get('historico') is not None:
         sinais = _bloco('historico', erros_bloco, sinais, aparece_desde, sinais,
                         dados['historico'], dados.get('historico_dias'), hoje)
     ativos, silenciados = _bloco('ciente', erros_bloco, (sinais, []), aplicar_cientes,
                                  sinais, cientes_linhas or [], hoje)
+
+    # Ações da análise de ads: só quem decide a loja (ou vê todas) as enxerga.
+    import streamlit
+    from permissoes import _get_role, ve_todas_lojas
+    usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
+    acoes_plano, responsaveis = plano if plano else ([], {})
+    lojas_ver_acoes, lojas_acao = lojas_das_acoes(lojas, responsaveis, usuario, _get_role(),
+                                                  ve_todas_lojas())
+    ativos = [x for x in ativos if x['regra'] != 'ads_acao' or x['loja'] in lojas_ver_acoes]
+    silenciados = [x for x in silenciados
+                   if x['regra'] != 'ads_acao' or x['loja'] in lojas_ver_acoes]
 
     j = janelas(hoje)
     c_txt, c_bt = st.columns([5, 1])
@@ -2516,7 +2730,10 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
                 'j': j, 'hoje': hoje, 'engine': engine, 'lojas': lojas, 'pode': pode,
                 'com_ciente': com_ciente, 'silenciados': silenciados, 'ativos': ativos,
                 'lido_em': pacote['lido_em'], 'pendentes': pendentes, 'mkt': mkt,
-                'upload_ate': upload_ate}
+                'upload_ate': upload_ate, 'usuario': usuario,
+                'plano': {l: [a for a in acoes_plano if a['loja'] == l] for l in lojas},
+                'responsaveis': responsaveis, 'lojas_ver_acoes': lojas_ver_acoes,
+                'lojas_acao': lojas_acao}
 
     try:
         _render_excel(st, ativos, silenciados, nomes, base_ctx)
@@ -2614,7 +2831,8 @@ def _render_excel(st, ativos, silenciados, nomes, ctx):
             usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
             conn = ctx['engine'].raw_connection()
             try:
-                n = gravar_cientes(conn, itens, usuario, hoje, ctx['lojas'], mkt)
+                n = gravar_cientes(conn, itens, usuario, hoje, ctx['lojas'], mkt,
+                                   lojas_acao=ctx.get('lojas_acao', ()))
             except Exception:  # noqa: BLE001
                 st.error("Não consegui gravar agora; nada foi gravado. Tente de novo.")
                 return
@@ -2645,20 +2863,21 @@ def _editor(st, sinais, nomes, chave, pode):
     return [sinais[i] for i in range(len(sinais)) if bool(ed['Ciente'].iloc[i])]
 
 
-def _render_form_ciente(st, loja, marcados, ctx):
+def _render_form_ciente(st, loja, marcados, ctx, chave=''):
     import streamlit
     hoje = ctx['hoje']
-    with st.form(key=f"sin_form_{loja}"):
+    with st.form(key=f"sin_form_{loja}{chave}"):
         st.markdown(f"**Ciente em {len(marcados)} sinal(is) da {loja}**")
-        motivo = st.selectbox("Motivo", list(MOTIVOS), format_func=MOTIVOS.get,
-                              key=f"sin_mot_{loja}")
-        nota = st.text_input("Nota (obrigatória em \"Outro\")", key=f"sin_nota_{loja}")
+        motivo = st.selectbox("Motivo", motivos_para([x['regra'] for x in marcados]),
+                              format_func=MOTIVOS.get, key=f"sin_mot_{loja}{chave}")
+        nota = st.text_input("Nota (obrigatória em \"Outro\")", key=f"sin_nota_{loja}{chave}")
         ate = st.date_input("Silenciar até", value=hoje + timedelta(days=DIAS_SILENCIO_PADRAO),
                             min_value=hoje, max_value=hoje + timedelta(days=DIAS_SILENCIO_MAX),
-                            format="DD/MM/YYYY", key=f"sin_ate_{loja}")
+                            format="DD/MM/YYYY", key=f"sin_ate_{loja}{chave}")
         if not st.form_submit_button("Registrar ciente"):
             return
-    erros = validar_ciente(motivo, nota, ate, hoje)
+    erros = sorted({e for r in {x['regra'] for x in marcados}
+                    for e in validar_ciente(motivo, nota, ate, hoje, r)})
     if erros:
         st.error(' '.join(erros))
         return
@@ -2666,7 +2885,8 @@ def _render_form_ciente(st, loja, marcados, ctx):
     conn = ctx['engine'].raw_connection()
     try:
         n = gravar_cientes(conn, [(x, motivo, nota, ate) for x in marcados], usuario, hoje,
-                           ctx['lojas'], ctx.get('mkt', MARKETPLACE))
+                           ctx['lojas'], ctx.get('mkt', MARKETPLACE),
+                           lojas_acao=ctx.get('lojas_acao', ()))
     except Exception:  # noqa: BLE001
         st.error("Não consegui registrar o ciente agora; nada foi gravado. Tente de novo.")
         return
@@ -2674,6 +2894,88 @@ def _render_form_ciente(st, loja, marcados, ctx):
         conn.close()
     streamlit.session_state['sin_versao'] = streamlit.session_state.get('sin_versao', 0) + 1
     st.success(f"Ciente registrado em {n} sinal(is).")
+    st.rerun()
+
+
+def _render_acoes(st, loja, ativos, ctx, versao):
+    """Seção da loja: as ações marcadas (sinal 'ads_acao', respondidas no Ciente)
+    e o plano do ciclo com a caixinha. Devolve as ações marcadas para o Ciente."""
+    nomes, hoje = ctx['nomes'], ctx['hoje']
+    decide = loja in ctx.get('lojas_acao', ())
+    em_execucao = [x for x in ativos if x['loja'] == loja and x['regra'] == 'ads_acao']
+    marcados = []
+    if em_execucao:
+        st.markdown(f"**📋 Ações da análise de ads em execução ({len(em_execucao)})**")
+        st.caption("Responda no Ciente: \"Feito\", \"Decisão proposital\" (não vou fazer) ou "
+                   "\"Alarme falso\" encerram a ação; \"Já em andamento\" volta na data.")
+        marcados = _editor(st, em_execucao, nomes, f"sin_ed_acao_{loja}_{versao}",
+                           ctx['pode'] and decide)
+        if marcados and ctx.get('com_ciente'):
+            # o formulário das ações fica logo abaixo delas (no teste de 22/10 ele
+            # aparecia no fim do bloco, depois do plano, e parecia não abrir)
+            _render_form_ciente(st, loja, marcados, ctx, chave='_acao')
+            marcados = []
+    plano = (ctx.get('plano') or {}).get(loja) or []
+    if plano:
+        _render_plano(st, loja, plano, ctx, decide, versao)
+    return marcados
+
+
+def _render_plano(st, loja, plano, ctx, decide, versao):
+    import streamlit
+    hoje, nomes = ctx['hoje'], ctx['nomes']
+    a0 = plano[0]
+    resp = ctx.get('responsaveis', {}).get(loja, '(sem responsável cadastrada)')
+    abertas = [a for a in plano if not a['vai_executar']]
+    titulo = (f"📋 Plano de ação da análise de ads — {a0['ciclo']} "
+              f"({pd.Timestamp(a0['periodo_ini']):%d/%m}–{pd.Timestamp(a0['periodo_fim']):%d/%m})"
+              f" · {len(plano)} ações, {len(abertas)} sem decisão · responsável: {resp}")
+    with st.expander(titulo, expanded=decide and bool(abertas)):
+        df = tabela_plano(plano, nomes)
+        if not decide or not abertas:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            if not decide:
+                st.caption(f"Só {resp} marca as ações desta loja.")
+            return
+        # já marcadas aparecem marcadas e com o prazo gravado (desmarcar não muda nada)
+        df.insert(0, 'Vou executar', [bool(a['vai_executar']) for a in plano])
+        df.insert(1, 'Prazo', [pd.Timestamp(a['prazo']).date() if a['vai_executar']
+                               else prazo_padrao(a, hoje) for a in plano])
+        travadas = [i for i, a in enumerate(plano) if a['vai_executar']]
+        ed = st.data_editor(
+            df, key=f"sin_plano_{loja}_{versao}", hide_index=True, use_container_width=True,
+            disabled=[c for c in df.columns if c not in ('Vou executar', 'Prazo')],
+            column_config={
+                'Prazo': st.column_config.DateColumn(
+                    'Prazo', format="DD/MM/YYYY", min_value=hoje,
+                    max_value=hoje + timedelta(days=PRAZO_ACAO_MAX)),
+                'Vou executar': st.column_config.CheckboxColumn(
+                    'Vou executar', help="Marque as que você vai executar e clique OK. "
+                                         "As marcadas viram sinal com prazo.")})
+        st.caption("Ações já marcadas (✔ na Situação) não mudam por aqui.")
+        if not st.button("OK — registrar as marcadas", key=f"sin_plano_ok_{loja}_{versao}"):
+            return
+        itens = [(plano[i]['id'], pd.Timestamp(ed['Prazo'].iloc[i]).date())
+                 for i in range(len(plano))
+                 if bool(ed['Vou executar'].iloc[i]) and i not in travadas]
+        if not itens:
+            st.warning("Nenhuma ação nova marcada.")
+            return
+        conn = ctx['engine'].raw_connection()
+        try:
+            n = gravar_decisoes(conn, itens, ctx.get('usuario', ''), hoje,
+                                {a['id'] for a in abertas})
+        except ValueError as e:
+            st.error(str(e))
+            return
+        except Exception:  # noqa: BLE001
+            st.error("Não consegui registrar agora; nada foi gravado. Tente de novo.")
+            return
+        finally:
+            conn.close()
+    limpar_memoria()          # o sinal da ação nasce da leitura do dia
+    streamlit.session_state['sin_versao'] = versao + 1
+    st.success(f"{n} ação(ões) registrada(s): viram sinal com prazo.")
     st.rerun()
 
 
@@ -2758,7 +3060,7 @@ def _render_loja(st, loja, ativos, ctx):
     import streamlit
     versao = streamlit.session_state.get('sin_versao', 0)
     try:
-        alertas = [x for x in ativos if not x.get('informativo')]
+        alertas = [x for x in ativos if not x.get('informativo') and x['regra'] != 'ads_acao']
         infos = sorted((x for x in ativos if x['loja'] == loja and x.get('informativo')),
                        key=lambda x: -x['em_jogo'])
         top, resto = sinais_da_loja(alertas, loja)
@@ -2781,6 +3083,12 @@ def _render_loja(st, loja, ativos, ctx):
     except Exception:  # noqa: BLE001
         st.error("Tabela de sinais indisponível agora para esta loja.")
         return
+    if loja in ctx.get('lojas_ver_acoes', ()):
+        try:
+            marcados += _render_acoes(st, loja, ativos, ctx, versao)
+        except Exception:  # noqa: BLE001
+            st.error("Ações da análise de ads indisponíveis agora para esta loja; "
+                     "os sinais acima seguem valendo.")
     if ctx['com_ciente']:
         try:
             if marcados:

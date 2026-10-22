@@ -260,7 +260,8 @@ class GravarData(unittest.TestCase):
         self.assertEqual(fpl.DIAS_DATA_MAX, 90)
         for nome in ('sinal_ciente_regra_valida', 'sinal_historico_regra_valida'):
             bloco = re.search(nome + r' CHECK \(regra IN \((.*?)\)\)', texto, re.S).group(1)
-            self.assertEqual(set(re.findall(r"'(\w+)'", bloco)), set(sd.REGRAS))
+            # 'ads_acao' entrou depois, por sql/ads_acoes.sql (este arquivo já foi aplicado)
+            self.assertEqual(set(re.findall(r"'(\w+)'", bloco)), set(sd.REGRAS) - {'ads_acao'})
 
 
 class Sql(unittest.TestCase):
