@@ -715,6 +715,31 @@ SQL_ACOES = """
      ORDER BY a.loja, a.ordem
 """
 
+# Auditor R6 (decisão do Thiago, 26/10): ação MARCADA de um plano anterior fica na
+# tela até a gestora responder com um motivo que encerra (Feito / proposital /
+# alarme falso). Só a tela lê isto (precisa de sinal_ciente).
+SQL_ACOES_ABERTAS_ANTERIORES = """
+    WITH ult AS (
+        SELECT DISTINCT ON (loja) loja, ciclo
+          FROM v_ads_acao_vigente
+         WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
+           AND gravado_em < %(amanha)s
+         ORDER BY loja, periodo_ini DESC, rodada_em DESC
+    )
+    SELECT a.id, a.loja, a.ciclo, a.periodo_ini, a.periodo_fim, a.ordem, a.objeto,
+           a.codigo_anuncio, a.sku, a.nome_produto, a.acao, a.dono, a.numero_esperado,
+           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em
+      FROM v_ads_acao_vigente a
+      JOIN ads_acao_decisao d ON d.id_acao = a.id AND d.vai_executar
+     WHERE a.marketplace = %(marketplace)s AND a.loja = ANY(%(lojas)s)
+       AND NOT EXISTS (SELECT 1 FROM ult u WHERE u.loja = a.loja AND u.ciclo = a.ciclo)
+       AND NOT EXISTS (SELECT 1 FROM sinal_ciente s
+                        WHERE s.marketplace = a.marketplace AND s.loja = a.loja
+                          AND s.regra = 'ads_acao' AND s.objeto = 'acao:' || a.id
+                          AND s.encerrado_em IS NULL AND s.motivo = ANY(%(encerram)s))
+     ORDER BY a.loja, a.periodo_ini, a.ordem
+"""
+
 SQL_RESPONSAVEIS = """
     SELECT l.loja, u.username
       FROM dim_loja_responsavel_ads r
@@ -742,7 +767,7 @@ TODAS_AS_SQL = (SQL_LOJAS_ML, SQL_RESUMO, SQL_METAS, SQL_VENDAS_ANUNCIO,
                 SQL_EXISTE_HISTORICO, SQL_HISTORICO, SQL_HISTORICO_DIAS, SQL_GRAVAR_HISTORICO,
                 SQL_EXISTE_CIENTE, SQL_CIENTES_ABERTOS, SQL_FECHAR_ABERTO,
                 SQL_INSERIR_CIENTE, SQL_REATIVAR, SQL_EXISTE_ACOES, SQL_ACOES,
-                SQL_RESPONSAVEIS, SQL_DECIDIR_ACAO)
+                SQL_ACOES_ABERTAS_ANTERIORES, SQL_RESPONSAVEIS, SQL_DECIDIR_ACAO)
 
 
 def params(hoje, lojas, mkt=MARKETPLACE):
@@ -753,7 +778,8 @@ def params(hoje, lojas, mkt=MARKETPLACE):
               'dias_ref': DIAS_REF_EXPERIENCIA, 'janela_views': JANELA_VIEWS_SHOPEE,
               'ano_mes': p['ontem'].strftime('%Y-%m'),
               'ini_roas': hoje - timedelta(days=DIAS_ROAS_SUBIU + 16),
-              'roas_desde': hoje - timedelta(days=DIAS_ROAS_SUBIU)})
+              'roas_desde': hoje - timedelta(days=DIAS_ROAS_SUBIU),
+              'encerram': list(MOTIVOS_ENCERRAM_ACAO)})
     return p
 
 
@@ -809,13 +835,17 @@ def ler_cientes(conn, lojas, mkt=MARKETPLACE):
 
 
 def ler_plano(conn, hoje, lojas, mkt=MARKETPLACE):
-    """(ações do ciclo mais recente de cada loja, {loja: responsável}) relidas a
-    cada carga (a caixinha muda a cada clique); None se a etapa 2 não existe."""
+    """(ações do ciclo mais recente de cada loja, {loja: responsável}, ações MARCADAS
+    de planos anteriores ainda sem resposta que encerra) relidas a cada carga (a
+    caixinha muda a cada clique); None se a etapa 2 não existe. As anteriores
+    abertas só a tela lê (precisam de sinal_ciente, que o usuário do job não lê)."""
     if not _ler(conn, SQL_EXISTE_ACOES, {})[0][0]:
         return None
-    p = {'marketplace': mkt, 'lojas': list(lojas), 'amanha': hoje + timedelta(days=1)}
+    p = {'marketplace': mkt, 'lojas': list(lojas), 'amanha': hoje + timedelta(days=1),
+         'encerram': list(MOTIVOS_ENCERRAM_ACAO)}
     acoes = [dict(zip(ACAO_COLS, r)) for r in _ler(conn, SQL_ACOES, p)]
-    return acoes, dict(_ler(conn, SQL_RESPONSAVEIS, p))
+    abertas = [dict(zip(ACAO_COLS, r)) for r in _ler(conn, SQL_ACOES_ABERTAS_ANTERIORES, p)]
+    return acoes, dict(_ler(conn, SQL_RESPONSAVEIS, p)), abertas
 
 
 def ler_tudo(conn, hoje, lojas, mkt=MARKETPLACE):
@@ -2669,6 +2699,9 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
         erros = {**erros, 'ciente': 'erro'}
     tempos.append(('Cientes e plano de ação (relidos a cada carga)', time.perf_counter() - t))
     sinais, pendentes, upload_ate = sinais_da_loja_hoje(pacote, lojas, hoje)
+    acoes_plano, responsaveis, abertas_ant = plano if plano else ([], {}, [])
+    # R6: ações marcadas de planos anteriores ainda sem resposta seguem como sinal
+    sinais = sinais + _bloco('acoes', erros_bloco, [], sinais_acoes, abertas_ant, hoje)
     if dados.get('historico') is not None:
         sinais = _bloco('historico', erros_bloco, sinais, aparece_desde, sinais,
                         dados['historico'], dados.get('historico_dias'), hoje)
@@ -2679,7 +2712,6 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
     import streamlit
     from permissoes import _get_role, ve_todas_lojas
     usuario = (streamlit.session_state.get('usuario') or {}).get('username', '')
-    acoes_plano, responsaveis = plano if plano else ([], {})
     lojas_ver_acoes, lojas_acao = lojas_das_acoes(lojas, responsaveis, usuario, _get_role(),
                                                   ve_todas_lojas())
     ativos = [x for x in ativos if x['regra'] != 'ads_acao' or x['loja'] in lojas_ver_acoes]
