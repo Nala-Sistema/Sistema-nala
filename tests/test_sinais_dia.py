@@ -144,11 +144,11 @@ class Full(unittest.TestCase):
 
     def test_venda_de_outro_sku_no_mesmo_anuncio_nao_entra(self):
         ponte = [(LPT, 'MLB1', 'E1', 'L-0320', True)]
-        foto = [(LPT, 'E1', date(2026, 10, 4), 20, 0, 0)]
+        foto = [(LPT, 'E1', date(2026, 10, 4), 25, 0, 0)]
         vendas = [_vend(LPT, 'MLB1', 'L-0320', qtd_ritmo=7, qtd_30=30),
                   _vend(LPT, 'MLB1', 'K2-L-0320', qtd_ritmo=700, qtd_30=3000)]
         s = self._full(foto, ponte, vendas)
-        self.assertEqual(s, [])                               # 20 ÷ 1 = 20 dias
+        self.assertEqual(s, [])                               # 25 ÷ 1 = 25 dias (≥ 21)
 
     def test_full_zerado_com_ads_ligado_e_envio_que_entrou(self):
         foto = [(LPT, 'MLBU5071722523', date(2026, 10, 4), 0, 30, 0),

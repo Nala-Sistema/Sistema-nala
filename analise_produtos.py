@@ -51,6 +51,7 @@ import pandas as pd
 import io
 
 import estoque_peca
+import top_anuncios
 from datetime import date, timedelta
 
 from database_utils import get_engine, gravar_log_upload
@@ -337,189 +338,9 @@ def _tab_mais_vendidos(engine):
     )
 
 
-# Lojas com coleta por API (nome no banco -> sigla de exibição). Vendas, ads,
-# visitas e views usam o MESMO nome de loja no banco; só a Shopee da Nala foge
-# da sigla ("Shopee Lithouse(Nala)").
-_LOJAS_ATAQUE = {
-    'ML-LPT': 'ML-LPT',
-    'ML-Nala': 'ML-Nala',
-    'ML-YanniRJ': 'ML-YanniRJ',
-    'ML-YanniSP': 'ML-YanniSP',
-    'Shopee Lithouse(Nala)': 'Shopee-Nala',
-    'Shopee-LPT': 'Shopee-LPT',
-}
-_LOJAS_SEM_ADS = {'ML-YanniSP'}
-_ORIGENS_SUGESTAO = ('performance', 'ads', 'escala')
-
-# Vendas só de fact_vendas_snapshot (fonte única). Na Shopee a venda não traz o
-# item_id: ele vem pela PONTE fact_pedidos_itens_marketplace (loja, pedido, sku)
-# e, se faltar, de dim_estoque_anuncio quando o SKU tem um único anúncio. A
-# ponte nunca soma receita. ML: o anúncio é o codigo_anuncio da própria venda.
-# Ads, visitas e views entram já agregados por (loja, anúncio) para o JOIN não
-# multiplicar gasto nem visita.
-_SQL_ATAQUE = """
-WITH vend AS (
-    SELECT f.loja_origem AS loja, f.marketplace_origem AS mkt, f.data_venda, f.sku,
-           f.quantidade, f.valor_venda_efetivo, f.margem_total,
-           CASE WHEN f.marketplace_origem = 'SHOPEE'
-                THEN COALESCE(p.id_anuncio_plataforma, d.anuncio_id,
-                              'sem item ' || f.sku)
-                ELSE f.codigo_anuncio END AS chave
-    FROM fact_vendas_snapshot f
-    LEFT JOIN (SELECT DISTINCT loja, numero_pedido, sku, id_anuncio_plataforma
-               FROM fact_pedidos_itens_marketplace
-               WHERE marketplace = 'SHOPEE' AND loja = ANY(%(lojas)s)) p
-           ON f.marketplace_origem = 'SHOPEE' AND p.loja = f.loja_origem
-          AND p.numero_pedido = f.numero_pedido AND p.sku = f.sku
-    LEFT JOIN (SELECT loja, sku, MIN(anuncio_id) AS anuncio_id
-               FROM dim_estoque_anuncio
-               WHERE marketplace = 'SHOPEE' AND loja = ANY(%(lojas)s)
-               GROUP BY loja, sku HAVING COUNT(DISTINCT anuncio_id) = 1) d
-           ON f.marketplace_origem = 'SHOPEE' AND d.loja = f.loja_origem
-          AND d.sku = f.sku
-    WHERE f.loja_origem = ANY(%(lojas)s)
-      AND f.data_venda BETWEEN %(ini_ant)s AND %(fim)s
-),
-atual AS (
-    SELECT loja, mkt, chave,
-           SUM(quantidade)::bigint AS un,
-           SUM(valor_venda_efetivo) AS rec,
-           SUM(margem_total) AS marg,
-           string_agg(DISTINCT sku, ', ' ORDER BY sku) AS skus,
-           (array_agg(sku ORDER BY valor_venda_efetivo DESC))[1] AS sku_top
-    FROM vend WHERE data_venda BETWEEN %(ini)s AND %(fim)s
-    GROUP BY loja, mkt, chave
-),
-anterior AS (
-    SELECT loja, chave, SUM(quantidade)::bigint AS un, SUM(valor_venda_efetivo) AS rec
-    FROM vend WHERE data_venda BETWEEN %(ini_ant)s AND %(fim_ant)s
-    GROUP BY loja, chave
-),
-ads AS (
-    SELECT loja, codigo_anuncio AS chave, SUM(impressoes) AS imp, SUM(cliques) AS cli,
-           SUM(gasto_ads) AS gasto, SUM(receita_ads) AS rec_ads
-    FROM fact_ads_performance
-    WHERE loja = ANY(%(lojas)s) AND data BETWEEN %(ini)s AND %(fim)s
-    GROUP BY loja, codigo_anuncio
-),
-vis AS (
-    SELECT loja, codigo_anuncio AS chave, SUM(visitas) AS visitas
-    FROM vw_visitas_dia
-    WHERE loja = ANY(%(lojas)s) AND data BETWEEN %(ini)s AND %(fim)s
-    GROUP BY loja, codigo_anuncio
-),
-vws AS (
-    SELECT DISTINCT ON (loja, codigo_anuncio) loja, codigo_anuncio AS chave, views_30d
-    FROM vw_views_shopee_30d
-    WHERE loja = ANY(%(lojas)s) AND data <= %(fim)s
-    ORDER BY loja, codigo_anuncio, data DESC
-)
-SELECT a.loja, a.mkt, a.chave, a.skus,
-       COALESCE(pr.nome, '(sem cadastro)') AS nome,
-       a.un, a.rec, a.marg,
-       ant.un AS un_ant, ant.rec AS rec_ant,
-       ads.imp, ads.cli, ads.gasto, ads.rec_ads,
-       vis.visitas, vws.views_30d
-FROM atual a
-LEFT JOIN anterior ant ON ant.loja = a.loja AND ant.chave = a.chave
-LEFT JOIN ads ON ads.loja = a.loja AND ads.chave = a.chave
-LEFT JOIN vis ON vis.loja = a.loja AND vis.chave = a.chave
-LEFT JOIN vws ON vws.loja = a.loja AND vws.chave = a.chave
-LEFT JOIN dim_produtos pr ON pr.sku = a.sku_top
-ORDER BY a.rec DESC
-LIMIT %(limite)s
-"""
-
-
-def _periodo_anterior(ini, fim):
-    """Mesmo nº de dias imediatamente antes de `ini` (fim já é dia fechado)."""
-    dias = (fim - ini).days + 1
-    fim_ant = ini - timedelta(days=1)
-    return fim_ant - timedelta(days=dias - 1), fim_ant
-
-
-def _consultar_ataque(engine, lojas_db, ini, fim, limite):
-    ini_ant, fim_ant = _periodo_anterior(ini, fim)
-    df = _query_to_df(engine, _SQL_ATAQUE, {
-        'lojas': list(lojas_db), 'ini': ini, 'fim': fim,
-        'ini_ant': ini_ant, 'fim_ant': fim_ant, 'limite': limite,
-    })
-    df = _coerce_num(df, ['un', 'rec', 'marg', 'un_ant', 'rec_ant', 'imp', 'cli',
-                          'gasto', 'rec_ads', 'visitas', 'views_30d'])
-    return df, (ini_ant, fim_ant)
-
-
-def _sugestoes_da_linha(linha):
-    """
-    Sugestões da linha: lista de {'origem': performance|ads|escala, 'texto': str}.
-    v1: vazia. O motor vem das regras fixas dos analistas e plugará aqui; a
-    coluna da tabela já mostra todas, uma por origem.
-    """
-    return []
-
-
-def _fmt_sugestoes(sugestoes):
-    if not sugestoes:
-        return "—"
-    return " · ".join(f"[{s['origem']}] {s['texto']}" for s in sugestoes)
-
-
-def _fmt_seta(atual, anterior):
-    if atual is None or pd.isna(atual):
-        return "—"
-    if anterior is None or pd.isna(anterior) or anterior == 0:
-        return "novo" if atual > 0 else "—"
-    if anterior < 0:  # devolução maior que a venda: variação % não tem sentido
-        return "—"
-    v = (atual / anterior - 1) * 100
-    return f"{'▲' if v >= 0 else '▼'} {v:+.0f}%"
-
-
-def _pct_ou_traco(num, den):
-    if den is None or pd.isna(den) or den == 0 or num is None or pd.isna(num):
-        return None
-    return float(num) / float(den) * 100
-
-
-def _tabela_ataque(df, dias):
-    """Aplica as contas por linha e devolve DataFrame numérico (para tela e Excel)."""
-    out = pd.DataFrame({
-        'Loja': df['loja'].map(_LOJAS_ATAQUE),
-        'SKU': df['skus'],
-        'Produto': df['nome'],
-        'Anúncio': df['chave'],
-        'Unidades': df['un'],
-        'Receita': df['rec'],
-    })
-    out['Ticket médio'] = df['rec'] / df['un'].where(df['un'] != 0)
-    out['Margem %'] = [_pct_ou_traco(m, r) for m, r in zip(df['marg'], df['rec'])]
-    sem_ads = df['loja'].isin(_LOJAS_SEM_ADS)
-    ml = df['mkt'] == 'MERCADO LIVRE'
-    out['Visitas (ML)'] = df['visitas'].where(ml).fillna(0).where(ml)
-    out['Views 30d (Shopee)'] = df['views_30d'].where(~ml)
-    for rot, col in [('Impressões ads', 'imp'), ('Cliques ads', 'cli'),
-                     ('Invest. ads', 'gasto')]:
-        out[rot] = df[col].fillna(0).where(~sem_ads)
-    out['ACOS %'] = [None if sa else _pct_ou_traco(g, ra)
-                     for g, ra, sa in zip(df['gasto'], df['rec_ads'], sem_ads)]
-    out['TACOS %'] = [None if sa else _pct_ou_traco(0 if pd.isna(g) else g, r)
-                      for g, r, sa in zip(df['gasto'], df['rec'], sem_ads)]
-    # Conversão = unidades ÷ visitas (ML). Shopee: só quando o período é de 30
-    # dias, que é a janela das views.
-    conv = []
-    for un, vis, vw, is_ml in zip(df['un'], df['visitas'], df['views_30d'], ml):
-        if is_ml:
-            conv.append(_pct_ou_traco(un, 0 if pd.isna(vis) else vis))
-        else:
-            conv.append(_pct_ou_traco(un, vw) if dias == 30 else None)
-    out['Conversão %'] = conv
-    out['Receita ant.'] = df['rec_ant']
-    out['Unid. ant.'] = df['un_ant']
-    out['Δ Receita'] = [_fmt_seta(a, b) for a, b in zip(df['rec'], df['rec_ant'])]
-    out['Δ Unid.'] = [_fmt_seta(a, b) for a, b in zip(df['un'], df['un_ant'])]
-    out['Sugestão'] = [_fmt_sugestoes(_sugestoes_da_linha(r))
-                       for r in df.to_dict('records')]
-    return out
+# A consulta e a tabela de ataque moram em top_anuncios.py (módulo comum com
+# a aba "Semana" do Sinais do Dia, performance_semana.py): nunca copiar.
+_LOJAS_ATAQUE = top_anuncios.LOJAS_ATAQUE
 
 
 def _mais_vendidos_por_anuncio(engine):
@@ -530,7 +351,8 @@ def _mais_vendidos_por_anuncio(engine):
     nunca se somam numa linha: visita não é visualização.
     """
     st.caption(
-        "Top N anúncios por **receita do período**, por loja (ML e Shopee nunca somados). "
+        "Top N anúncios por **receita do período**, somando as lojas filtradas; cada linha "
+        "é loja · anúncio (ML e Shopee nunca somados numa linha). "
         "Margem % ponderada: SUM(margem_total) ÷ SUM(receita) — **antes** de ads e Full. "
         "TACOS = ads ÷ receita total do anúncio; ACOS = ads ÷ receita atribuída ao ads. "
         "Shopee: o anúncio é o item_id; ads e views ficam no item, sem ratear entre SKUs. "
@@ -539,7 +361,8 @@ def _mais_vendidos_por_anuncio(engine):
         "Período anterior = mesmo nº de dias fechados imediatamente antes. "
         "A tabela parte das vendas: anúncio com gasto de ads e **sem venda** no período "
         "não aparece, e o card Invest. ads soma só os anúncios listados (Top N), não o "
-        "gasto total da loja.")
+        "gasto total da loja. Sugestão = regras de ataque da última semana seg–dom "
+        "fechada (aba Semana do Sinais do Dia), só para o Top 30 de cada loja.")
 
     permitidas = [db for db in _LOJAS_ATAQUE
                   if ve_todas_lojas() or db in set(get_lojas_usuario())]
@@ -571,7 +394,8 @@ def _mais_vendidos_por_anuncio(engine):
                        key="mv_atq_limit")
 
     try:
-        df, (ini_ant, fim_ant) = _consultar_ataque(engine, lojas_db, ini, fim, limite)
+        df, (ini_ant, fim_ant) = top_anuncios.consultar_ataque(engine, lojas_db, ini, fim,
+                                                               limite)
     except Exception as e:
         st.error(f"Erro ao consultar a tabela de ataque: {e}")
         return
@@ -579,10 +403,20 @@ def _mais_vendidos_por_anuncio(engine):
         st.info("Nenhuma venda encontrada para os filtros selecionados.")
         return
 
+    # Sugestões = regras da última semana fechada, qualquer que seja o período
+    # do filtro (decisão do Thiago, 26/10). Falhar aqui não derruba a tabela.
+    sugestoes, aviso_sug = {}, None
+    try:
+        import performance_semana as ps
+        sugestoes, (s_ini, s_fim) = ps.sugestoes_ultima_semana(engine, lojas_db)
+        aviso_sug = f"Sugestões da semana {s_ini:%d/%m}–{s_fim:%d/%m}."
+    except Exception:  # noqa: BLE001
+        aviso_sug = "Sugestões indisponíveis agora (a tabela segue valendo)."
+
     dias = (fim - ini).days + 1
-    tab = _tabela_ataque(df, dias)
+    tab = top_anuncios.tabela_ataque(df, dias, sugestoes)
     st.caption(f"Período: {ini:%d/%m/%Y} a {fim:%d/%m/%Y} ({dias} dias) · "
-               f"anterior: {ini_ant:%d/%m/%Y} a {fim_ant:%d/%m/%Y}")
+               f"anterior: {ini_ant:%d/%m/%Y} a {fim_ant:%d/%m/%Y} · {aviso_sug}")
 
     sem_item = df['chave'].astype(str).str.startswith('sem item ')
     if sem_item.any():
