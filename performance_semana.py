@@ -862,11 +862,13 @@ def lojas_por_mkt(engine, lojas_db):
     return out
 
 
-def ler_dados(engine, hoje, lojas_db):
+def ler_dados(engine, hoje):
     """A leitura da semana (vai para a memória). {fonte: dado} e {fonte: erro}:
-    uma fonte que falhe só desliga as regras dela."""
+    uma fonte que falhe só desliga as regras dela. Sempre TODAS as lojas de
+    ataque (o filtro de loja do usuário vem depois, em montar): o conflito de
+    galpão do Full cruza as lojas (auditor 26/10, achado 1)."""
     j = semana_fechada(hoje)
-    lojas_mkt = lojas_por_mkt(engine, lojas_db)
+    lojas_mkt = lojas_por_mkt(engine, ta.LOJAS_ATAQUE)
     lojas = list(lojas_mkt)
     dados, erros = {'j': j, 'lojas_mkt': lojas_mkt}, {}
     top, _ant = ta.consultar_ataque(engine, lojas, j['ini30'], j['sem_fim'], TOP_N,
@@ -881,7 +883,9 @@ def ler_dados(engine, hoje, lojas_db):
     try:
         pacotes = {}
         for mkt in (sd.MARKETPLACE, sd.SHOPEE):
-            lm = [l for l, m in lojas_mkt.items() if m == mkt]
+            # todas as lojas do marketplace: a mesma chave de memória da aba do
+            # Sinais e da Full por loja (sem leitura fria a mais)
+            lm = sd.obter_lojas_ml(engine, mkt)
             if lm:
                 pacote, _mem = sd.obter_pacote(engine, hoje, lm, mkt)
                 faltam = [k for k in ('foto', 'ponte', 'vendas') if k in pacote['erros']]
@@ -1004,10 +1008,12 @@ def ler_marcacoes(conn, lojas, sem_ini):
     return [dict(zip(MARCACAO_COLS, r)) for r in linhas]
 
 
-def montar(dados, marcas, hoje):
-    """(ativos, silenciados) da semana."""
+def montar(dados, marcas, hoje, lojas=None):
+    """(ativos, silenciados) da semana; lojas = só estas (None = todas)."""
     linhas = dados['top'].to_dict('records')
     itens = regras_ataque(linhas, contexto(dados), hoje)
+    if lojas is not None:
+        itens = [i for i in itens if i['loja'] in lojas]
     return aplicar_marcacoes(itens, marcas, dados['j']['sem_ini'])
 
 
@@ -1016,13 +1022,14 @@ def montar(dados, marcas, hoje):
 _MEMORIA = {}
 
 
-def obter_dados(engine, hoje, lojas_db):
-    """Leitura da semana em memória por TTL_LEITURA_S; leitura com erro não fica."""
-    k = (hoje, tuple(sorted(lojas_db)))
+def obter_dados(engine, hoje):
+    """Leitura da semana em memória por TTL_LEITURA_S (uma só para todos os
+    usuários: o filtro de loja vem em montar); leitura com erro não fica."""
+    k = hoje
     agora = time.time()
     if k in _MEMORIA and agora - _MEMORIA[k][0] < TTL_LEITURA_S:
         return _MEMORIA[k][1]
-    dados, erros = ler_dados(engine, hoje, lojas_db)
+    dados, erros = ler_dados(engine, hoje)
     if not erros:
         _MEMORIA.clear()
         _MEMORIA[k] = (agora, (dados, erros))
@@ -1036,7 +1043,7 @@ def limpar_memoria():
 def sugestoes_ultima_semana(engine, lojas_db):
     """Para a Mais Vendidos: ({(loja, anúncio): [sugestões]}, (seg, dom))."""
     hoje = datetime.now(BRT).date()
-    dados, _erros = obter_dados(engine, hoje, lojas_db)
+    dados, _erros = obter_dados(engine, hoje)
     conn = engine.raw_connection()
     try:
         marcas = ler_marcacoes(conn, list(dados['lojas_mkt']), dados['j']['sem_ini'])
@@ -1044,7 +1051,7 @@ def sugestoes_ultima_semana(engine, lojas_db):
         marcas = None
     finally:
         conn.close()
-    ativos, _sil = montar(dados, marcas, hoje)
+    ativos, _sil = montar(dados, marcas, hoje, set(lojas_db))
     j = dados['j']
     return sugestoes_de(ativos), (j['sem_ini'], j['sem_fim'])
 
@@ -1135,9 +1142,10 @@ def render(st, engine):
     c1, c2 = st.columns([1, 5])
     if c1.button("Atualizar dados", key="ps_atualizar"):
         limpar_memoria()
+        sd.limpar_memoria()            # o Full vem da leitura do dia do Sinais
     try:
         with st.spinner("Calculando a semana…"):
-            dados, erros = obter_dados(engine, hoje, lojas_db)
+            dados, erros = obter_dados(engine, hoje)
     except Exception:  # noqa: BLE001
         st.error("Não consegui ler a semana agora. Tente de novo em instantes.")
         return
@@ -1168,7 +1176,7 @@ def render(st, engine):
                                            ve_todas_lojas())
 
     ctx = contexto(dados)
-    ativos, silenciados = montar(dados, marcas, hoje)
+    ativos, silenciados = montar(dados, marcas, hoje, set(lojas_db))
     linhas = {(r['loja'], r['chave']): r for r in dados['top'].to_dict('records')}
     carga = carga_incompleta(dados['carga'], dados['lojas_mkt'], j) if 'carga' not in erros \
         else {}
@@ -1233,7 +1241,7 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
             df.insert(1, 'Nota (marcação)', '')
             df.insert(2, 'Prazo (seu)', [None] * len(df))
             ed = st.data_editor(
-                df, key=f"ps_ed_{loja}", hide_index=True, use_container_width=True,
+                df, key=f"ps_ed_{loja}_{streamlit.session_state.get('ps_versao', 0)}", hide_index=True, use_container_width=True,
                 disabled=[c for c in df.columns if c not in ('Motivo', 'Nota (marcação)',
                                                              'Prazo (seu)')],
                 column_config={
@@ -1271,6 +1279,8 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
                     finally:
                         conn.close()
                     st.success(f"{n} marcação(ões) gravada(s).")
+                    # editor novo: o motivo escolhido não fica para um 2º clique
+                    streamlit.session_state['ps_versao'] =                         streamlit.session_state.get('ps_versao', 0) + 1
                     streamlit.rerun()
     if sil:
         with st.expander(f"Silenciados pela marcação ({len(sil)})"):
