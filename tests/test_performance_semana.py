@@ -211,9 +211,17 @@ class Full(unittest.TestCase):
     def test_t4_ml_transferencia_parada_pede_conferir(self):
         t4 = self._t4([3] * 10)
         self.assertEqual(len(t4), 1)
-        self.assertTrue(t4[0]['sugestao'].startswith('Transferência parada há 7 dias — conferir'))
+        self.assertTrue(t4[0]['sugestao'].startswith(
+            'Transferência parada há pelo menos 7 dias — conferir'))
         self.assertNotIn('Cobrar', t4[0]['sugestao'])
         self.assertIn('desde 10/10', t4[0]['sugestao'])         # os 10 dias parados
+
+    def test_t3_t4_nao_acendem_com_foto_velha(self):
+        # coletor parado: últimas fotos até 05/10 (hoje 20/10)
+        linhas = [('ML-LPT', 'MLB1', 'E1', True, date(2026, 10, 5) - timedelta(days=k),
+                   5, 3, 2, 0, 0, 10) for k in range(10)]
+        e = ps.resumir_estoque(linhas, ps.semana_fechada(HOJE))[('ML-LPT', 'MLB1')]
+        self.assertEqual((e['travado'], e['envio_parado']), (0, []))
 
     def test_t4_transferencia_que_diminuiu_nao_acende(self):
         self.assertEqual(self._t4([9, 9, 9, 9, 9, 9, 3, 3, 3, 3]), [])  # entrou no 7º dia antes

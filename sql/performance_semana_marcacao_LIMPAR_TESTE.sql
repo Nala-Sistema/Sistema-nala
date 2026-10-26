@@ -3,7 +3,7 @@
 -- =============================================================================
 -- 26/10/2026. O teste da marcação na aba Semana é feito SÓ com o usuário admin
 -- (o único ADMIN em dim_usuarios). Este arquivo apaga as marcações do admin em
--- perf_semana_marcacao, e nada mais: as das gestoras (Larissa, Patricia) ficam.
+-- perf_semana_marcacao, e nada mais: as de todos os outros usuários ficam.
 -- A tabela só acrescenta para o app (o gatilho recusa UPDATE); o DELETE é do dono.
 --
 -- ONDE RODAR: Neon "Gestão Marketplaces" (still-shape-14526725), branch

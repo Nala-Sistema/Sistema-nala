@@ -405,14 +405,17 @@ def resumir_estoque(linhas_est, j):
         dias_estoque = len({x[2] for x in sem if x[3] > 0 or (x[8] or 0) > 0})
         ult = max(x[2] for x in linhas)
         foto = [x for x in linhas if x[2] == ult]
-        travado = sum(x[5] + x[6] for x in foto)
+        # T3/T4 só com foto recente (ontem, ou anteontem se o coletor atrasou):
+        # coletor parado não pode acender com foto velha (auditor 26/10, achado 3)
+        foto_recente = ult >= j['ontem'] - timedelta(days=1)
+        travado = sum(x[5] + x[6] for x in foto) if foto_recente else 0
         tem_estoque_hoje = any(x[3] > 0 or (x[8] or 0) > 0 for x in foto)
         galpoes = [x[8] for x in foto if x[8] is not None]
         # T4: por estoque, transferência > 0 em todas as últimas ENVIO_PARADO_DIAS
         # fotos e sem nada entrar (a transferência não diminuiu de um dia para o
         # outro; unidades_recebidas não é preenchida, ver T4_LIGADA).
         parados = []
-        eids = {x[0] for x in linhas} if T4_LIGADA else set()
+        eids = {x[0] for x in linhas} if T4_LIGADA and foto_recente else set()
         for eid in eids:
             dia = {x[2]: x for x in linhas if x[0] == eid}
             datas = sorted(dia, reverse=True)
@@ -549,10 +552,13 @@ def regras_full(r, ctx, hoje):
         vd = max((i['venda_dia'] for i in full_itens), default=0)
         rd = max((_rec_dia(i) for i in full_itens), default=0)
         dias = min(DIAS_EM_JOGO_MAX, transf / vd) if vd > 0 else 0
-        out.append(_item(r, 'T4', f"Transferência parada há {ENVIO_PARADO_DIAS} dias — conferir "
-                                  f"envio ({transf} un. em transferência desde {_d(desde)})",
-                         f"estoque {eid}: {transf} un. em transferência há "
-                         f"{(hoje - desde).days} dias, sem diminuir de um dia para o outro",
+        # "desde" = desde quando há transferência (> 0) sem diminuir; a quantidade
+        # pode ter subido (envio novo), então o número é o de hoje (auditor, achado 1)
+        out.append(_item(r, 'T4', f"Transferência parada há pelo menos {ENVIO_PARADO_DIAS} dias "
+                                  f"— conferir envio ({transf} un. em transferência hoje; com "
+                                  f"transferência desde {_d(desde)})",
+                         f"estoque {eid}: transferência > 0 desde {_d(desde)} "
+                         f"({(hoje - desde).days} dias), sem diminuir de um dia para o outro",
                          rd * dias, hoje))
         break
     return out
