@@ -254,6 +254,27 @@ class LeituraDoDia(unittest.TestCase):
                                                                 sd.MARKETPLACE)
         self.assertTrue(sem_projecao)
 
+    def test_plano_traz_as_anteriores_abertas(self):
+        # auditor R6: marcadas de planos anteriores sem resposta seguem na tela
+        a = _acao(1, marcada=True, prazo=date(2026, 10, 27))
+        linha = tuple(a[c] for c in sd.ACAO_COLS)
+        with mock.patch.object(sd, '_ler', side_effect=[[(True,)], [], [linha], [(LPT, 'Larissa')]]) as m:
+            acoes, resp, abertas = sd.ler_plano(mock.MagicMock(), HOJE, [LPT])
+        self.assertEqual((acoes, resp), ([], {LPT: 'Larissa'}))
+        self.assertEqual([x['id'] for x in abertas], [1])
+        sql_abertas, p = m.call_args_list[2].args[1:]
+        self.assertIs(sql_abertas, sd.SQL_ACOES_ABERTAS_ANTERIORES)
+        self.assertEqual(set(p['encerram']), set(sd.MOTIVOS_ENCERRAM_ACAO))
+        # vencida (27/10 < hoje no C30) vira sinal urgente
+        s = sd.sinais_acoes(abertas, date(2026, 11, 2))
+        self.assertTrue(s[0]['urgente'])
+        self.assertEqual(s[0]['objeto'], 'acao:1')
+
+    def test_anteriores_abertas_so_saem_com_motivo_que_encerra(self):
+        self.assertIn("s.motivo = ANY(%(encerram)s)", sd.SQL_ACOES_ABERTAS_ANTERIORES)
+        self.assertIn("s.encerrado_em IS NULL", sd.SQL_ACOES_ABERTAS_ANTERIORES)
+        self.assertIn("d.vai_executar", sd.SQL_ACOES_ABERTAS_ANTERIORES)
+
     def test_plano_sem_a_tabela_e_none(self):
         with mock.patch.object(sd, '_ler', return_value=[(False,)]):
             self.assertIsNone(sd.ler_plano(mock.MagicMock(), HOJE, [LPT]))
