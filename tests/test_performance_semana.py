@@ -310,6 +310,16 @@ class Marcacao(unittest.TestCase):
         self.assertFalse(ps.validar_marcacao(it, 'vou_agir', '', ps.prazo_minimo(HOJE), HOJE))
         self.assertFalse(ps.validar_marcacao(it, 'ruido', '', None, HOJE))
 
+    def test_editor_pula_sem_marcacao_e_prazo_so_onde_vale(self):
+        a, b, c, d = (self.item(), self.item(), self.item(), self.item())
+        prazo = ps.prazo_minimo(HOJE)
+        out = ps.marcacoes_do_editor(
+            [a, b, c, d],
+            [ps.SEM_MOTIVO, ps.MOTIVOS['vou_agir'], ps.MOTIVOS['ruido'], None],
+            ['', 'nota', '', ''], [prazo, prazo, prazo, None])
+        self.assertEqual([(m, p) for _i, m, _n, p in out],
+                         [('vou_agir', prazo), ('ruido', None)])
+
     def test_gravar_so_responsavel(self):
         with self.assertRaises(PermissionError):
             ps.gravar_marcacoes(None, [(self.item(), 'ruido', '', None)], 'Patricia', HOJE,
