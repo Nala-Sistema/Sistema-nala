@@ -6,8 +6,10 @@ Módulo único com 4 tabs voltadas a entender o desempenho por produto (SKU):
 
   Tab 1 — 🏆 Mais Vendidos
         Ranking por período/lojas/marketplaces com receita, quantidade,
-        margem média (AVG(margem_percentual)), ticket, nº pedidos,
-        Curva ABC (dim_tags_anuncio) e mix por canal.
+        margem % ponderada pela receita, ticket, nº pedidos, Curva ABC
+        (dim_tags_anuncio) e mix por canal. Modo "Anúncio (loja)": tabela de
+        ataque dos Top N com visitas, ads, ACOS/TACOS, conversão e período
+        anterior (_mais_vendidos_por_anuncio).
 
   Tab 2 — 📈 Crescimento & Queda
         Compara dois períodos contíguos. Mostra top 20 em alta e top 20
@@ -52,7 +54,7 @@ import estoque_peca
 from datetime import date, timedelta
 
 from database_utils import get_engine, gravar_log_upload
-from filtro_periodo import filtro_periodo
+from filtro_periodo import filtro_periodo, hoje_brasil
 from permissoes import (
     ve_todas_lojas, get_lojas_usuario, filtrar_query_por_loja,
 )
@@ -211,12 +213,17 @@ def _montar_where_filtros(data_ini, data_fim, lojas, marketplaces, engine,
 
 def _tab_mais_vendidos(engine):
     st.subheader("🏆 Produtos Mais Vendidos")
-    st.caption("Ranking por SKU. Margem é média aritmética de margem_percentual.")
 
+    ver_por = st.radio("Ver por", ["SKU vendido", "Produto (peça)", "Anúncio (loja)"],
+                       horizontal=True, key="mv_ver_por")
+    if ver_por == "Anúncio (loja)":
+        _mais_vendidos_por_anuncio(engine)
+        return
+
+    st.caption("Ranking por SKU. Margem % ponderada pela receita: "
+               "SUM(margem_total) ÷ SUM(valor_venda_efetivo).")
     data_ini, data_fim, lojas, mkts = _filtros_periodo_loja_marketplace("mv")
 
-    ver_por = st.radio("Ver por", ["SKU vendido", "Produto (peça)"], horizontal=True,
-                       key="mv_ver_por")
     if ver_por == "Produto (peça)":
         _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts)
         return
@@ -225,7 +232,7 @@ def _tab_mais_vendidos(engine):
     with col_a:
         ordenar_por = st.selectbox(
             "Ordenar por",
-            ["Receita", "Quantidade", "Margem média", "Nº pedidos"],
+            ["Receita", "Quantidade", "Margem %", "Nº pedidos"],
             key="mv_ord",
         )
     with col_b:
@@ -243,7 +250,7 @@ def _tab_mais_vendidos(engine):
     ord_col = {
         "Receita":      "receita DESC",
         "Quantidade":   "quantidade DESC",
-        "Margem média": "margem_pct DESC NULLS LAST",
+        "Margem %":     "margem_pct DESC NULLS LAST",
         "Nº pedidos":   "pedidos DESC",
     }[ordenar_por]
 
@@ -254,7 +261,8 @@ def _tab_mais_vendidos(engine):
             SUM(f.quantidade)::bigint                            AS quantidade,
             SUM(f.valor_venda_efetivo)::numeric                  AS receita,
             COUNT(*)::bigint                                     AS pedidos,
-            AVG(f.margem_percentual)                             AS margem_pct,
+            SUM(f.margem_total)::numeric                         AS margem_total,
+            SUM(f.margem_total) / NULLIF(SUM(f.valor_venda_efetivo), 0) * 100 AS margem_pct,
             SUM(f.valor_venda_efetivo) / NULLIF(SUM(f.quantidade), 0) AS ticket_medio,
             COUNT(DISTINCT f.loja_origem)::int                   AS lojas_ativas,
             COUNT(DISTINCT f.marketplace_origem)::int            AS marketplaces_ativos,
@@ -281,7 +289,7 @@ def _tab_mais_vendidos(engine):
         return
 
     # NUMERIC do Postgres vem como Decimal/object → converter para float
-    df = _coerce_num(df, ['quantidade', 'receita', 'pedidos', 'margem_pct',
+    df = _coerce_num(df, ['quantidade', 'receita', 'pedidos', 'margem_pct', 'margem_total',
                           'ticket_medio', 'lojas_ativas', 'marketplaces_ativos'])
 
     # Métricas resumo no topo
@@ -290,8 +298,9 @@ def _tab_mais_vendidos(engine):
     c2.metric("Receita Total", _fmt_brl(df['receita'].sum()))
     c3.metric("Unidades", _fmt_int(df['quantidade'].sum()))
     c4.metric("Pedidos", _fmt_int(df['pedidos'].sum()))
-    margem_geral = df['margem_pct'].dropna().astype(float).mean() if df['margem_pct'].notna().any() else None
-    c5.metric("Margem média", _fmt_pct(margem_geral))
+    receita_geral = df['receita'].sum()
+    margem_geral = df['margem_total'].sum() / receita_geral * 100 if receita_geral else None
+    c5.metric("Margem % (ponderada)", _fmt_pct(margem_geral))
 
     st.markdown("---")
 
@@ -326,6 +335,289 @@ def _tab_mais_vendidos(engine):
         file_name=f"mais_vendidos_{data_ini}_{data_fim}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# Lojas com coleta por API (nome no banco -> sigla de exibição). Vendas, ads,
+# visitas e views usam o MESMO nome de loja no banco; só a Shopee da Nala foge
+# da sigla ("Shopee Lithouse(Nala)").
+_LOJAS_ATAQUE = {
+    'ML-LPT': 'ML-LPT',
+    'ML-Nala': 'ML-Nala',
+    'ML-YanniRJ': 'ML-YanniRJ',
+    'ML-YanniSP': 'ML-YanniSP',
+    'Shopee Lithouse(Nala)': 'Shopee-Nala',
+    'Shopee-LPT': 'Shopee-LPT',
+}
+_LOJAS_SEM_ADS = {'ML-YanniSP'}
+_ORIGENS_SUGESTAO = ('performance', 'ads', 'escala')
+
+# Vendas só de fact_vendas_snapshot (fonte única). Na Shopee a venda não traz o
+# item_id: ele vem pela PONTE fact_pedidos_itens_marketplace (loja, pedido, sku)
+# e, se faltar, de dim_estoque_anuncio quando o SKU tem um único anúncio. A
+# ponte nunca soma receita. ML: o anúncio é o codigo_anuncio da própria venda.
+# Ads, visitas e views entram já agregados por (loja, anúncio) para o JOIN não
+# multiplicar gasto nem visita.
+_SQL_ATAQUE = """
+WITH vend AS (
+    SELECT f.loja_origem AS loja, f.marketplace_origem AS mkt, f.data_venda, f.sku,
+           f.quantidade, f.valor_venda_efetivo, f.margem_total,
+           CASE WHEN f.marketplace_origem = 'SHOPEE'
+                THEN COALESCE(p.id_anuncio_plataforma, d.anuncio_id,
+                              'sem item ' || f.sku)
+                ELSE f.codigo_anuncio END AS chave
+    FROM fact_vendas_snapshot f
+    LEFT JOIN (SELECT DISTINCT loja, numero_pedido, sku, id_anuncio_plataforma
+               FROM fact_pedidos_itens_marketplace
+               WHERE marketplace = 'SHOPEE' AND loja = ANY(%(lojas)s)) p
+           ON f.marketplace_origem = 'SHOPEE' AND p.loja = f.loja_origem
+          AND p.numero_pedido = f.numero_pedido AND p.sku = f.sku
+    LEFT JOIN (SELECT loja, sku, MIN(anuncio_id) AS anuncio_id
+               FROM dim_estoque_anuncio
+               WHERE marketplace = 'SHOPEE' AND loja = ANY(%(lojas)s)
+               GROUP BY loja, sku HAVING COUNT(DISTINCT anuncio_id) = 1) d
+           ON f.marketplace_origem = 'SHOPEE' AND d.loja = f.loja_origem
+          AND d.sku = f.sku
+    WHERE f.loja_origem = ANY(%(lojas)s)
+      AND f.data_venda BETWEEN %(ini_ant)s AND %(fim)s
+),
+atual AS (
+    SELECT loja, mkt, chave,
+           SUM(quantidade)::bigint AS un,
+           SUM(valor_venda_efetivo) AS rec,
+           SUM(margem_total) AS marg,
+           string_agg(DISTINCT sku, ', ' ORDER BY sku) AS skus,
+           (array_agg(sku ORDER BY valor_venda_efetivo DESC))[1] AS sku_top
+    FROM vend WHERE data_venda BETWEEN %(ini)s AND %(fim)s
+    GROUP BY loja, mkt, chave
+),
+anterior AS (
+    SELECT loja, chave, SUM(quantidade)::bigint AS un, SUM(valor_venda_efetivo) AS rec
+    FROM vend WHERE data_venda BETWEEN %(ini_ant)s AND %(fim_ant)s
+    GROUP BY loja, chave
+),
+ads AS (
+    SELECT loja, codigo_anuncio AS chave, SUM(impressoes) AS imp, SUM(cliques) AS cli,
+           SUM(gasto_ads) AS gasto, SUM(receita_ads) AS rec_ads
+    FROM fact_ads_performance
+    WHERE loja = ANY(%(lojas)s) AND data BETWEEN %(ini)s AND %(fim)s
+    GROUP BY loja, codigo_anuncio
+),
+vis AS (
+    SELECT loja, codigo_anuncio AS chave, SUM(visitas) AS visitas
+    FROM vw_visitas_dia
+    WHERE loja = ANY(%(lojas)s) AND data BETWEEN %(ini)s AND %(fim)s
+    GROUP BY loja, codigo_anuncio
+),
+vws AS (
+    SELECT DISTINCT ON (loja, codigo_anuncio) loja, codigo_anuncio AS chave, views_30d
+    FROM vw_views_shopee_30d
+    WHERE loja = ANY(%(lojas)s) AND data <= %(fim)s
+    ORDER BY loja, codigo_anuncio, data DESC
+)
+SELECT a.loja, a.mkt, a.chave, a.skus,
+       COALESCE(pr.nome, '(sem cadastro)') AS nome,
+       a.un, a.rec, a.marg,
+       ant.un AS un_ant, ant.rec AS rec_ant,
+       ads.imp, ads.cli, ads.gasto, ads.rec_ads,
+       vis.visitas, vws.views_30d
+FROM atual a
+LEFT JOIN anterior ant ON ant.loja = a.loja AND ant.chave = a.chave
+LEFT JOIN ads ON ads.loja = a.loja AND ads.chave = a.chave
+LEFT JOIN vis ON vis.loja = a.loja AND vis.chave = a.chave
+LEFT JOIN vws ON vws.loja = a.loja AND vws.chave = a.chave
+LEFT JOIN dim_produtos pr ON pr.sku = a.sku_top
+ORDER BY a.rec DESC
+LIMIT %(limite)s
+"""
+
+
+def _periodo_anterior(ini, fim):
+    """Mesmo nº de dias imediatamente antes de `ini` (fim já é dia fechado)."""
+    dias = (fim - ini).days + 1
+    fim_ant = ini - timedelta(days=1)
+    return fim_ant - timedelta(days=dias - 1), fim_ant
+
+
+def _consultar_ataque(engine, lojas_db, ini, fim, limite):
+    ini_ant, fim_ant = _periodo_anterior(ini, fim)
+    df = _query_to_df(engine, _SQL_ATAQUE, {
+        'lojas': list(lojas_db), 'ini': ini, 'fim': fim,
+        'ini_ant': ini_ant, 'fim_ant': fim_ant, 'limite': limite,
+    })
+    df = _coerce_num(df, ['un', 'rec', 'marg', 'un_ant', 'rec_ant', 'imp', 'cli',
+                          'gasto', 'rec_ads', 'visitas', 'views_30d'])
+    return df, (ini_ant, fim_ant)
+
+
+def _sugestoes_da_linha(linha):
+    """
+    Sugestões da linha: lista de {'origem': performance|ads|escala, 'texto': str}.
+    v1: vazia. O motor vem das regras fixas dos analistas e plugará aqui; a
+    coluna da tabela já mostra todas, uma por origem.
+    """
+    return []
+
+
+def _fmt_sugestoes(sugestoes):
+    if not sugestoes:
+        return "—"
+    return " · ".join(f"[{s['origem']}] {s['texto']}" for s in sugestoes)
+
+
+def _fmt_seta(atual, anterior):
+    if atual is None or pd.isna(atual):
+        return "—"
+    if anterior is None or pd.isna(anterior) or anterior == 0:
+        return "novo" if atual > 0 else "—"
+    if anterior < 0:  # devolução maior que a venda: variação % não tem sentido
+        return "—"
+    v = (atual / anterior - 1) * 100
+    return f"{'▲' if v >= 0 else '▼'} {v:+.0f}%"
+
+
+def _pct_ou_traco(num, den):
+    if den is None or pd.isna(den) or den == 0 or num is None or pd.isna(num):
+        return None
+    return float(num) / float(den) * 100
+
+
+def _tabela_ataque(df, dias):
+    """Aplica as contas por linha e devolve DataFrame numérico (para tela e Excel)."""
+    out = pd.DataFrame({
+        'Loja': df['loja'].map(_LOJAS_ATAQUE),
+        'SKU': df['skus'],
+        'Produto': df['nome'],
+        'Anúncio': df['chave'],
+        'Unidades': df['un'],
+        'Receita': df['rec'],
+    })
+    out['Ticket médio'] = df['rec'] / df['un'].where(df['un'] != 0)
+    out['Margem %'] = [_pct_ou_traco(m, r) for m, r in zip(df['marg'], df['rec'])]
+    sem_ads = df['loja'].isin(_LOJAS_SEM_ADS)
+    ml = df['mkt'] == 'MERCADO LIVRE'
+    out['Visitas (ML)'] = df['visitas'].where(ml).fillna(0).where(ml)
+    out['Views 30d (Shopee)'] = df['views_30d'].where(~ml)
+    for rot, col in [('Impressões ads', 'imp'), ('Cliques ads', 'cli'),
+                     ('Invest. ads', 'gasto')]:
+        out[rot] = df[col].fillna(0).where(~sem_ads)
+    out['ACOS %'] = [None if sa else _pct_ou_traco(g, ra)
+                     for g, ra, sa in zip(df['gasto'], df['rec_ads'], sem_ads)]
+    out['TACOS %'] = [None if sa else _pct_ou_traco(0 if pd.isna(g) else g, r)
+                      for g, r, sa in zip(df['gasto'], df['rec'], sem_ads)]
+    # Conversão = unidades ÷ visitas (ML). Shopee: só quando o período é de 30
+    # dias, que é a janela das views.
+    conv = []
+    for un, vis, vw, is_ml in zip(df['un'], df['visitas'], df['views_30d'], ml):
+        if is_ml:
+            conv.append(_pct_ou_traco(un, 0 if pd.isna(vis) else vis))
+        else:
+            conv.append(_pct_ou_traco(un, vw) if dias == 30 else None)
+    out['Conversão %'] = conv
+    out['Receita ant.'] = df['rec_ant']
+    out['Unid. ant.'] = df['un_ant']
+    out['Δ Receita'] = [_fmt_seta(a, b) for a, b in zip(df['rec'], df['rec_ant'])]
+    out['Δ Unid.'] = [_fmt_seta(a, b) for a, b in zip(df['un'], df['un_ant'])]
+    out['Sugestão'] = [_fmt_sugestoes(_sugestoes_da_linha(r))
+                       for r in df.to_dict('records')]
+    return out
+
+
+def _mais_vendidos_por_anuncio(engine):
+    """
+    Tabela de ATAQUE dos campeões: Top N anúncios por receita do período, com
+    visitas, ads (ACOS e TACOS), conversão e o período anterior de mesmo tamanho.
+    Grão = loja · anúncio (na Shopee o item_id, com os SKUs dele). ML e Shopee
+    nunca se somam numa linha: visita não é visualização.
+    """
+    st.caption(
+        "Top N anúncios por **receita do período**, por loja (ML e Shopee nunca somados). "
+        "Margem % ponderada: SUM(margem_total) ÷ SUM(receita) — **antes** de ads e Full. "
+        "TACOS = ads ÷ receita total do anúncio; ACOS = ads ÷ receita atribuída ao ads. "
+        "Shopee: o anúncio é o item_id; ads e views ficam no item, sem ratear entre SKUs. "
+        "Views 30d é a janela móvel da Shopee (última foto até o fim do período), "
+        "e a conversão da Shopee só aparece com período de 30 dias. "
+        "Período anterior = mesmo nº de dias fechados imediatamente antes. "
+        "A tabela parte das vendas: anúncio com gasto de ads e **sem venda** no período "
+        "não aparece, e o card Invest. ads soma só os anúncios listados (Top N), não o "
+        "gasto total da loja.")
+
+    permitidas = [db for db in _LOJAS_ATAQUE
+                  if ve_todas_lojas() or db in set(get_lojas_usuario())]
+    if not permitidas:
+        st.info("Nenhuma das lojas com API está liberada para o seu usuário.")
+        return
+    siglas = {db: _LOJAS_ATAQUE[db] for db in permitidas}
+    escolha = st.multiselect("🏪 Lojas (vazio = todas as lojas com API)",
+                             list(siglas.values()), default=[], key="mv_atq_lojas")
+    lojas_db = [db for db, s in siglas.items() if not escolha or s in escolha]
+
+    # O último dia fechado é o mais antigo dos últimos dias de ads das lojas
+    # (ads do ML chega com atraso); nunca hoje.
+    ontem = hoje_brasil() - timedelta(days=1)
+    try:
+        ult = _query_to_df(engine, """
+            SELECT MIN(m) AS d FROM (SELECT MAX(data) AS m FROM fact_ads_performance
+                                     WHERE loja = ANY(%(l)s) GROUP BY loja) x""",
+                           {'l': lojas_db})['d'].iloc[0]
+    except Exception as e:
+        st.error(f"Erro ao consultar o último dia de dado: {e}")
+        return
+    dado_ate = ontem if ult is None or pd.isna(ult) else min(ontem, ult)
+
+    ini, fim = filtro_periodo("mv_atq", dado_ate=dado_ate, padrao="Últimos 30 dias")
+    if ini is None:
+        return
+    limite = st.slider("Top N", min_value=10, max_value=200, value=30, step=10,
+                       key="mv_atq_limit")
+
+    try:
+        df, (ini_ant, fim_ant) = _consultar_ataque(engine, lojas_db, ini, fim, limite)
+    except Exception as e:
+        st.error(f"Erro ao consultar a tabela de ataque: {e}")
+        return
+    if df.empty:
+        st.info("Nenhuma venda encontrada para os filtros selecionados.")
+        return
+
+    dias = (fim - ini).days + 1
+    tab = _tabela_ataque(df, dias)
+    st.caption(f"Período: {ini:%d/%m/%Y} a {fim:%d/%m/%Y} ({dias} dias) · "
+               f"anterior: {ini_ant:%d/%m/%Y} a {fim_ant:%d/%m/%Y}")
+
+    sem_item = df['chave'].astype(str).str.startswith('sem item ')
+    if sem_item.any():
+        st.warning(f"{int(sem_item.sum())} linha(s) da Shopee sem item_id na ponte "
+                   f"({_fmt_brl(df.loc[sem_item, 'rec'].sum())}): aparecem por SKU, "
+                   "sem visitas nem ads.")
+
+    rec = float(tab['Receita'].sum())
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Anúncios", _fmt_int(len(tab)))
+    c2.metric("Receita", _fmt_brl(rec))
+    c3.metric("Unidades", _fmt_int(tab['Unidades'].sum()))
+    c4.metric("Margem % (ponderada)",
+              _fmt_pct(df['marg'].sum() / rec * 100 if rec else None))
+    c5.metric("Invest. ads (só os listados)", _fmt_brl(df['gasto'].fillna(0).sum()))
+
+    def _m(v, f):
+        return "—" if v is None or pd.isna(v) else f(v)
+    disp = tab.copy()
+    for c in ['Receita', 'Ticket médio', 'Invest. ads', 'Receita ant.']:
+        disp[c] = tab[c].map(lambda v: _m(v, _fmt_brl))
+    for c in ['Unidades', 'Visitas (ML)', 'Views 30d (Shopee)', 'Impressões ads',
+              'Cliques ads', 'Unid. ant.']:
+        disp[c] = tab[c].map(lambda v: _m(v, _fmt_int))
+    for c in ['Margem %', 'ACOS %', 'TACOS %', 'Conversão %']:
+        disp[c] = tab[c].map(lambda v: _m(v, _fmt_pct))
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    buf = io.BytesIO()
+    tab.to_excel(buf, index=False, sheet_name='Ataque')
+    st.download_button(
+        "⬇️ Baixar Excel", data=buf.getvalue(),
+        file_name=f"mais_vendidos_ataque_{ini}_{fim}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="mv_atq_xlsx")
 
 
 def _mais_vendidos_por_peca(engine, data_ini, data_fim, lojas, mkts):
