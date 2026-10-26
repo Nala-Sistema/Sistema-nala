@@ -804,6 +804,20 @@ def validar_marcacao(item, motivo, nota, prazo, hoje):
     return [f"{item['regra']} · {item['chave']}: {e}" for e in erros]
 
 
+def marcacoes_do_editor(itens, rotulos, notas, prazos):
+    """Linhas do editor -> [(item, motivo, nota, prazo)]. Pula "sem marcação"
+    (e o selectbox limpo); o prazo só vai em MOTIVOS_COM_PRAZO."""
+    por_rotulo = {v: k for k, v in MOTIVOS.items()}
+    out = []
+    for item, rot, nota, pr in zip(itens, rotulos, notas, prazos):
+        if not rot or rot == SEM_MOTIVO or rot not in por_rotulo:
+            continue
+        motivo = por_rotulo[rot]
+        pr = None if pr is None or pd.isna(pr) else pd.Timestamp(pr).date()
+        out.append((item, motivo, nota, pr if motivo in MOTIVOS_COM_PRAZO else None))
+    return out
+
+
 def gravar_marcacoes(conn, marcacoes, usuario, hoje, sem_ini, lojas_decide):
     """A ÚNICA gravação. marcacoes = [(item, motivo, nota, prazo)]. Valida tudo
     antes de tocar no banco; uma transação só. Devolve o nº gravado."""
@@ -1271,18 +1285,9 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
                        f"Ruído, proposital e já resolvido calam o item por {SILENCIO_SEMANAS} "
                        "semanas (volta antes se piorar). Vale a marcação mais recente.")
             if st.button("Gravar marcações", key=f"ps_ok_{loja}"):
-                por_rotulo = {v: k for k, v in MOTIVOS.items()}
-                marc = []
-                for idx, item in enumerate(ordem):
-                    rot = ed['Motivo'].iloc[idx]
-                    if not rot or rot == SEM_MOTIVO:
-                        continue
-                    motivo = por_rotulo[rot]
-                    pr = ed['Prazo (seu)'].iloc[idx]
-                    pr = None if pr is None or pd.isna(pr) else pd.Timestamp(pr).date()
-                    if motivo not in MOTIVOS_COM_PRAZO:
-                        pr = None
-                    marc.append((item, motivo, ed['Nota (marcação)'].iloc[idx], pr))
+                marc = marcacoes_do_editor(ordem, list(ed['Motivo']),
+                                           list(ed['Nota (marcação)']),
+                                           list(ed['Prazo (seu)']))
                 if not marc:
                     st.warning("Nenhuma linha com motivo.")
                 else:
