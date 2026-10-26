@@ -42,8 +42,8 @@ R$ EM JOGO (por semana; aprovado pelo Thiago em 26/10)
   - T6, T8: a receita da semana do anúncio.
   - Full/estoque (T1–T5, T12): venda/dia em R$ × dias sem estoque, no
     máximo 7 (uma semana).
-  - Demais (proposta, a confirmar): T9, T10, T13 = receita da semana; T11 =
-    frete cobrado na semana; T14, T15, T16 = o que a venda caiu contra a média.
+  - T9, T10, T13 = receita da semana; T11 = frete cobrado na semana; T14,
+    T15, T16 = o que a venda caiu contra a média (aprovado em 26/10).
 
 MARCAÇÃO (tabela perf_semana_marcacao, sql/performance_semana_marcacao.sql)
   Só acrescenta; vale a mais recente de cada semana + loja + anúncio + regra.
@@ -83,11 +83,13 @@ G8_MIN_PED_T6_SHOPEE = 20       # T6: pedidos em 30 dias
 NOTA_MIN = 70                   # T6 exige nota ≥ 70; T9 acende abaixo
 
 ENVIO_PARADO_DIAS = 7           # T4 (p)
-# T4 DESLIGADA (26/10): a v2 pede "sem unidades_recebidas", mas a coluna está
-# vazia no ML desde 27/09 e nunca veio na Shopee. Ligada, usa o substituto
-# "a transferência não diminuiu em nenhum dos 7 dias" (nada entrou), que
-# aguarda o OK do Thiago.
-T4_LIGADA = False
+# T4 (Thiago, 26/10): a v2 pede "sem unidades_recebidas", mas a coluna está
+# vazia no ML desde 27/09 e nunca veio na Shopee (pendência do coletor de
+# estoque, fora desta frente). Substituto aprovado: "a transferência não
+# diminuiu em nenhum dos 7 dias", SÓ no ML e com texto de CONFERIR (nunca
+# afirma que o envio travou). Shopee desligada.
+T4_LIGADA = True
+T4_MARKETPLACES = (sd.MARKETPLACE,)
 RECLAMACOES_MIN = 3             # T10 (p)
 RECLAMACOES_DIAS = 30
 # T10: "diferente do anunciado". Na Shopee não há código equivalente
@@ -131,7 +133,7 @@ REGRAS = {
     'T2': ('Ruptura com galpão', 'gestora', 7,
            'Full > 0 todo dia e venda ≥ ritmo anterior'),
     'T3': ('Estoque travado no Full', 'gestora', 7, 'travado zerado'),
-    'T4': ('Envio parado', 'gestora', 7, 'entrada no Full'),
+    'T4': ('Transferência parada (conferir)', 'gestora', 7, 'entrada no Full'),
     'T5': ('Anúncio irmão com Full parado', 'gestora + Thiago', 14,
            'venda do anúncio parado sobe sem perder a do irmão'),
     'T6': ('Converte bem, pouca visita', 'ads', 14,
@@ -403,14 +405,17 @@ def resumir_estoque(linhas_est, j):
         dias_estoque = len({x[2] for x in sem if x[3] > 0 or (x[8] or 0) > 0})
         ult = max(x[2] for x in linhas)
         foto = [x for x in linhas if x[2] == ult]
-        travado = sum(x[5] + x[6] for x in foto)
+        # T3/T4 só com foto recente (ontem, ou anteontem se o coletor atrasou):
+        # coletor parado não pode acender com foto velha (auditor 26/10, achado 3)
+        foto_recente = ult >= j['ontem'] - timedelta(days=1)
+        travado = sum(x[5] + x[6] for x in foto) if foto_recente else 0
         tem_estoque_hoje = any(x[3] > 0 or (x[8] or 0) > 0 for x in foto)
         galpoes = [x[8] for x in foto if x[8] is not None]
         # T4: por estoque, transferência > 0 em todas as últimas ENVIO_PARADO_DIAS
         # fotos e sem nada entrar (a transferência não diminuiu de um dia para o
         # outro; unidades_recebidas não é preenchida, ver T4_LIGADA).
         parados = []
-        eids = {x[0] for x in linhas} if T4_LIGADA else set()
+        eids = {x[0] for x in linhas} if T4_LIGADA and foto_recente else set()
         for eid in eids:
             dia = {x[2]: x for x in linhas if x[0] == eid}
             datas = sorted(dia, reverse=True)
@@ -542,14 +547,19 @@ def regras_full(r, ctx, hoje):
         out.append(_item(r, 'T3', f"Resolver nota fiscal ou retirada: {e['travado']} un. travadas",
                          f"bloqueado fiscal + outros indisponível = {e['travado']} un. "
                          f"(foto {_d(e['foto'])})", rd * dias, hoje))
-    for eid, transf, desde in (e or {}).get('envio_parado', []):
+    envios = (e or {}).get('envio_parado', []) if r['mkt'] in T4_MARKETPLACES else []
+    for eid, transf, desde in envios:
         vd = max((i['venda_dia'] for i in full_itens), default=0)
         rd = max((_rec_dia(i) for i in full_itens), default=0)
         dias = min(DIAS_EM_JOGO_MAX, transf / vd) if vd > 0 else 0
-        out.append(_item(r, 'T4', f"Cobrar a logística: {transf} un. em transferência desde "
-                                  f"{_d(desde)}",
-                         f"estoque {eid}: em transferência há {(hoje - desde).days} dias "
-                         f"sem unidade recebida", rd * dias, hoje))
+        # "desde" = desde quando há transferência (> 0) sem diminuir; a quantidade
+        # pode ter subido (envio novo), então o número é o de hoje (auditor, achado 1)
+        out.append(_item(r, 'T4', f"Transferência parada há pelo menos {ENVIO_PARADO_DIAS} dias "
+                                  f"— conferir envio ({transf} un. em transferência hoje; com "
+                                  f"transferência desde {_d(desde)})",
+                         f"estoque {eid}: transferência > 0 desde {_d(desde)} "
+                         f"({(hoje - desde).days} dias), sem diminuir de um dia para o outro",
+                         rd * dias, hoje))
         break
     return out
 

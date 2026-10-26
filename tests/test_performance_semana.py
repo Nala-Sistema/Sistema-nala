@@ -195,12 +195,40 @@ class Full(unittest.TestCase):
         self.assertEqual([i['regra'] for i in itens], ['T3'])
         self.assertIn('4 un. travadas', itens[0]['sugestao'])
 
-    def test_t4_desligada_ate_o_ok(self):
-        self.assertFalse(ps.T4_LIGADA)
-        linhas = [('ML-LPT', 'MLB1', 'E1', True, date(2026, 10, 19) - timedelta(days=k),
-                   5, 3, 0, 0, 0, 10) for k in range(10)]
-        self.assertEqual(ps.resumir_estoque(linhas, ps.semana_fechada(HOJE))
-                         [('ML-LPT', 'MLB1')]['envio_parado'], [])
+    @staticmethod
+    def _hist(transf_por_dia, loja='ML-LPT', an='MLB1'):
+        """transf_por_dia: do dia mais antigo ao mais novo (19/10)."""
+        n = len(transf_por_dia)
+        return [(loja, an, 'E1', True, date(2026, 10, 19) - timedelta(days=n - 1 - k),
+                 5, t, 0, 0, 0, 10) for k, t in enumerate(transf_por_dia)]
+
+    def _t4(self, transf_por_dia, loja='ML-LPT', mkt=ML, an='MLB1'):
+        e = ps.resumir_estoque(self._hist(transf_por_dia, loja, an), ps.semana_fechada(HOJE))
+        c = ctx_base(full=[item_full(an, loja=loja, full=100, vd=1.0)], estoque=e)
+        return [i for i in ps.regras_full(linha(an, loja=loja, mkt=mkt), c, HOJE)
+                if i['regra'] == 'T4']
+
+    def test_t4_ml_transferencia_parada_pede_conferir(self):
+        t4 = self._t4([3] * 10)
+        self.assertEqual(len(t4), 1)
+        self.assertTrue(t4[0]['sugestao'].startswith(
+            'Transferência parada há pelo menos 7 dias — conferir'))
+        self.assertNotIn('Cobrar', t4[0]['sugestao'])
+        self.assertIn('desde 10/10', t4[0]['sugestao'])         # os 10 dias parados
+
+    def test_t3_t4_nao_acendem_com_foto_velha(self):
+        # coletor parado: últimas fotos até 05/10 (hoje 20/10)
+        linhas = [('ML-LPT', 'MLB1', 'E1', True, date(2026, 10, 5) - timedelta(days=k),
+                   5, 3, 2, 0, 0, 10) for k in range(10)]
+        e = ps.resumir_estoque(linhas, ps.semana_fechada(HOJE))[('ML-LPT', 'MLB1')]
+        self.assertEqual((e['travado'], e['envio_parado']), (0, []))
+
+    def test_t4_transferencia_que_diminuiu_nao_acende(self):
+        self.assertEqual(self._t4([9, 9, 9, 9, 9, 9, 3, 3, 3, 3]), [])  # entrou no 7º dia antes
+        self.assertEqual(self._t4([3] * 6), [])                 # menos de 7 fotos: não julga
+
+    def test_t4_desligada_na_shopee(self):
+        self.assertEqual(self._t4([3] * 10, loja='Shopee-LPT', mkt=SHP, an='I1'), [])
 
 
 class Ads(unittest.TestCase):
