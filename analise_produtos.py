@@ -465,8 +465,12 @@ def _fmt_sugestoes(sugestoes):
 
 
 def _fmt_seta(atual, anterior):
+    if atual is None or pd.isna(atual):
+        return "—"
     if anterior is None or pd.isna(anterior) or anterior == 0:
-        return "novo" if atual else "—"
+        return "novo" if atual > 0 else "—"
+    if anterior < 0:  # devolução maior que a venda: variação % não tem sentido
+        return "—"
     v = (atual / anterior - 1) * 100
     return f"{'▲' if v >= 0 else '▼'} {v:+.0f}%"
 
@@ -532,7 +536,10 @@ def _mais_vendidos_por_anuncio(engine):
         "Shopee: o anúncio é o item_id; ads e views ficam no item, sem ratear entre SKUs. "
         "Views 30d é a janela móvel da Shopee (última foto até o fim do período), "
         "e a conversão da Shopee só aparece com período de 30 dias. "
-        "Período anterior = mesmo nº de dias fechados imediatamente antes.")
+        "Período anterior = mesmo nº de dias fechados imediatamente antes. "
+        "A tabela parte das vendas: anúncio com gasto de ads e **sem venda** no período "
+        "não aparece, e o card Invest. ads soma só os anúncios listados (Top N), não o "
+        "gasto total da loja.")
 
     permitidas = [db for db in _LOJAS_ATAQUE
                   if ve_todas_lojas() or db in set(get_lojas_usuario())]
@@ -590,7 +597,7 @@ def _mais_vendidos_por_anuncio(engine):
     c3.metric("Unidades", _fmt_int(tab['Unidades'].sum()))
     c4.metric("Margem % (ponderada)",
               _fmt_pct(df['marg'].sum() / rec * 100 if rec else None))
-    c5.metric("Invest. ads", _fmt_brl(df['gasto'].fillna(0).sum()))
+    c5.metric("Invest. ads (só os listados)", _fmt_brl(df['gasto'].fillna(0).sum()))
 
     def _m(v, f):
         return "—" if v is None or pd.isna(v) else f(v)
