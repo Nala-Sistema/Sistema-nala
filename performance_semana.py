@@ -124,6 +124,8 @@ MOTIVOS = {'vou_agir': 'Vale a pena / vou agir',
 MOTIVOS_SILENCIAM = ('ruido', 'proposital', 'ja_resolvido')
 MOTIVOS_PEDEM_PRAZO = ('vou_agir',)
 MOTIVOS_PEDEM_NOTA = ('outro',)
+MOTIVOS_COM_PRAZO = ('vou_agir', 'em_andamento')   # nos outros o prazo não é gravado
+SEM_MOTIVO = '— (sem marcação)'
 NOTA_MAX = 500
 
 # Regra -> (nome curto, quem decide, dias para checar, prova). Da seção 1 da v2.
@@ -1098,6 +1100,9 @@ def tabela_itens(itens, linhas_por_chave, ctx):
         nota = ctx['nota'].get((i['loja'], i['chave']))
         m = i.get('marcacao') or {}
         rows.append({
+            # Regra e Sugestão primeiro: o mesmo anúncio aparece uma vez por regra
+            # e a gestora tem de ver o que está marcando sem rolar a tabela
+            'Regra': f"{i['regra']} {i['regra_nome']}", 'Sugestão': i['sugestao'],
             'Posição': i['pos'], 'Loja': ta.LOJAS_ATAQUE.get(i['loja'], i['loja']),
             'SKU': i['skus'], 'Produto': i['nome'], 'Anúncio': i['chave'],
             'Receita 30d': sd._brl(r.get('rec')) if r else '—',
@@ -1109,8 +1114,7 @@ def tabela_itens(itens, linhas_por_chave, ctx):
                                     + (_pct1(conv) if conv is not None else '—')),
             'Estoque': _estoque_txt(r, ctx) if r else '—',
             'Nota': '—' if nota is None else f"{_n(nota[0]):.0f}",
-            'Tipo': i['tipo'], 'Regra': f"{i['regra']} {i['regra_nome']}",
-            'Sugestão': i['sugestao'], 'Origem': i['origem'], 'Evidência': i['evidencia'],
+            'Tipo': i['tipo'], 'Origem': i['origem'], 'Evidência': i['evidencia'],
             'R$ em jogo/sem.': sd._brl(i['em_jogo']), 'Decide': i['decide'],
             'Prazo sugerido': _d(i['prazo']), 'Checar em': _d(i['checar_em']),
             'Prova': i['prova'],
@@ -1246,10 +1250,11 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
             st.dataframe(df, hide_index=True, use_container_width=True)
             st.caption(f"Só {resp or '(sem responsável cadastrada)'} marca os itens desta loja.")
         else:
-            rotulos = [''] + list(MOTIVOS.values())
-            df.insert(0, 'Motivo', '')
+            rotulos = [SEM_MOTIVO] + list(MOTIVOS.values())
+            df.insert(0, 'Motivo', SEM_MOTIVO)
             df.insert(1, 'Nota (marcação)', '')
-            df.insert(2, 'Prazo (seu)', [None] * len(df))
+            # vem com o prazo sugerido (D+2 útil): célula vazia mostrava "None"
+            df.insert(2, 'Prazo (seu)', [i['prazo'] for i in ordem])
             ed = st.data_editor(
                 df, key=f"ps_ed_{loja}_{streamlit.session_state.get('ps_versao', 0)}", hide_index=True, use_container_width=True,
                 disabled=[c for c in df.columns if c not in ('Motivo', 'Nota (marcação)',
@@ -1260,7 +1265,9 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
                         'Prazo (seu)', format="DD/MM/YYYY", min_value=prazo_minimo(hoje),
                         max_value=hoje + timedelta(days=PRAZO_MAX))})
             st.caption("Escolha o motivo nas linhas que quer marcar e clique em Gravar. "
-                       "\"Vale a pena / vou agir\" pede o prazo; \"Outro\" pede a nota. "
+                       "O prazo vem com o sugerido (D+2 útil); troque se quiser. Ele só "
+                       "é gravado em \"Vale a pena / vou agir\" e \"Já em andamento\". "
+                       "\"Outro\" pede a nota. "
                        f"Ruído, proposital e já resolvido calam o item por {SILENCIO_SEMANAS} "
                        "semanas (volta antes se piorar). Vale a marcação mais recente.")
             if st.button("Gravar marcações", key=f"ps_ok_{loja}"):
@@ -1268,11 +1275,14 @@ def _render_loja(st, streamlit, loja, ativos, silenciados, linhas, ctx, carga, h
                 marc = []
                 for idx, item in enumerate(ordem):
                     rot = ed['Motivo'].iloc[idx]
-                    if not rot:
+                    if not rot or rot == SEM_MOTIVO:
                         continue
+                    motivo = por_rotulo[rot]
                     pr = ed['Prazo (seu)'].iloc[idx]
                     pr = None if pr is None or pd.isna(pr) else pd.Timestamp(pr).date()
-                    marc.append((item, por_rotulo[rot], ed['Nota (marcação)'].iloc[idx], pr))
+                    if motivo not in MOTIVOS_COM_PRAZO:
+                        pr = None
+                    marc.append((item, motivo, ed['Nota (marcação)'].iloc[idx], pr))
                 if not marc:
                     st.warning("Nenhuma linha com motivo.")
                 else:
