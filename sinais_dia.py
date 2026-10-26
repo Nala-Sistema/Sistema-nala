@@ -248,7 +248,7 @@ DIAS_ROAS_SUBIU = 14             # ROAS objetivo subiu nesta janela → queda é
 JANELA_RITMO_FULL = 7            # venda recente (dias, terminando em D-3)
 JANELA_PISO_FULL = 30            # piso: média de 30 dias (terminando em D-3)
 FULL_URGENTE_DIAS = 7
-FULL_ATENCAO_DIAS = 14
+FULL_ATENCAO_DIAS = 21           # 21 dias em todo o sistema (Thiago, 23/10)
 
 DIAS_GASTO_SEM_VENDA = 3         # dias seguidos com gasto e zero venda de ads
 ESPIRAL_QUEDA_GASTO = 0.50       # gasto da semana < 50% da média semanal
@@ -3137,7 +3137,8 @@ def render(engine):
     st.caption("Painel diário: o que mudou ontem em cada loja, ordenado pelo R$ em jogo. "
                "Marque \"Ciente\" para responder a um sinal e silenciá-lo até uma data; "
                "os limiares estão em calibragem.")
-    aba_ml, aba_shopee, aba_full = st.tabs(["Mercado Livre", "Shopee", "Full por loja"])
+    aba_ml, aba_shopee, aba_full, aba_semana = st.tabs(
+        ["Mercado Livre", "Shopee", "Full por loja", "Semana"])
     with aba_ml:
         try:
             _render_mercado_livre(st, engine)
@@ -3156,4 +3157,11 @@ def render(engine):
             full_por_loja.render(st, engine)
         except Exception:  # noqa: BLE001
             st.error("A aba Full por loja não carregou agora. Tente de novo em instantes; "
+                     "se persistir, avise o time do sistema.")
+    with aba_semana:
+        try:
+            import performance_semana
+            performance_semana.render(st, engine)
+        except Exception:  # noqa: BLE001
+            st.error("A aba Semana não carregou agora. Tente de novo em instantes; "
                      "se persistir, avise o time do sistema.")
