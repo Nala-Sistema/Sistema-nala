@@ -131,7 +131,8 @@ vis AS (
     GROUP BY loja, codigo_anuncio
 ),
 vws AS (
-    SELECT DISTINCT ON (loja, codigo_anuncio) loja, codigo_anuncio AS chave, views_30d
+    SELECT DISTINCT ON (loja, codigo_anuncio) loja, codigo_anuncio AS chave, views_30d,
+           data AS views_foto
     FROM vw_views_shopee_30d
     WHERE loja = ANY(%(lojas)s) AND data <= %(fim)s
     ORDER BY loja, codigo_anuncio, data DESC
@@ -141,7 +142,7 @@ SELECT a.loja, a.mkt, a.chave, a.skus, a.sku_top, a.pos,
        a.un, a.rec, a.marg, a.ped,
        ant.un AS un_ant, ant.rec AS rec_ant,
        ads.imp, ads.cli, ads.gasto, ads.rec_ads,
-       vis.visitas, vws.views_30d,
+       vis.visitas, vws.views_30d, vws.views_foto,
        s.rec_sem, s.un_sem, s.ped_sem, s.rec_base, s.ped_base,
        vis.vis_sem, vis.vis_base,
        ads.imp_sem, ads.cli_sem, ads.gasto_sem, ads.rec_ads_sem,
@@ -223,6 +224,17 @@ def pct_ou_nada(num, den):
     return float(num) / float(den) * 100
 
 
+def foto_views(fotos):
+    """'foto 26/10' (ou 'fotos 25/10 a 26/10') das views da Shopee lidas; None
+    sem nenhuma. A foto é a última até o fim do período, não a última do banco."""
+    datas = sorted({pd.Timestamp(d).date() for d in fotos if d is not None and not pd.isna(d)})
+    if not datas:
+        return None
+    if len(datas) == 1:
+        return f"foto {datas[0]:%d/%m}"
+    return f"fotos {datas[0]:%d/%m} a {datas[-1]:%d/%m}"
+
+
 def tabela_ataque(df, dias, sugestoes=None):
     """Aplica as contas por linha e devolve DataFrame numérico (para tela e Excel).
     sugestoes: {(loja, chave): [{'origem', 'texto'}]} (None = nenhuma)."""
@@ -240,7 +252,8 @@ def tabela_ataque(df, dias, sugestoes=None):
     sem_ads = df['loja'].isin(LOJAS_SEM_ADS)
     ml = df['mkt'] == 'MERCADO LIVRE'
     out['Visitas (ML)'] = df['visitas'].where(ml).fillna(0).where(ml)
-    out['Views 30d (Shopee)'] = df['views_30d'].where(~ml)
+    foto = foto_views(df['views_foto'].where(~ml)) if 'views_foto' in df else None
+    out[f"Views 30d ({foto or 'Shopee'})"] = df['views_30d'].where(~ml)
     for rot, col in [('Impressões ads', 'imp'), ('Cliques ads', 'cli'),
                      ('Invest. ads', 'gasto')]:
         out[rot] = df[col].fillna(0).where(~sem_ads)

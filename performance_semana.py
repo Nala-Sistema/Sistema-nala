@@ -1106,6 +1106,9 @@ def _estoque_txt(r, ctx):
 def tabela_itens(itens, linhas_por_chave, ctx):
     """DataFrame das colunas da seção 3 da v2 (um item por anúncio × regra)."""
     rows = []
+    foto = ta.foto_views([r.get('views_foto') for r in linhas_por_chave.values()
+                          if not eh_ml(r)])
+    col_vis = 'Visitas / conversão' + (f" (views Shopee: {foto})" if foto else '')
     for i in sorted(itens, key=lambda x: (x['pos'], -x['em_jogo'])):
         r = linhas_por_chave.get((i['loja'], i['chave']), {})
         vis, ped, conv = visita_conversao(r) if r else (None, None, None)
@@ -1123,7 +1126,7 @@ def tabela_itens(itens, linhas_por_chave, ctx):
             'Semana × média 4 sem.': (f"{sd._brl(sem)} × {sd._brl(base)} "
                                       f"({(sem / base - 1) * 100:+.0f}%)" if base > 0
                                       else f"{sd._brl(sem)} × —"),
-            'Visitas / conversão': ('—' if vis is None else
+            col_vis: ('—' if vis is None else
                                     f"{vis:.0f} {'vis. sem.' if eh_ml(r) else 'views 30d'} · "
                                     + (_pct1(conv) if conv is not None else '—')),
             'Estoque': _estoque_txt(r, ctx) if r else '—',
