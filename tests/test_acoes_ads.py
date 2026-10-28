@@ -35,7 +35,8 @@ def _acao(id_, loja=LPT, marcada=False, prazo=None, checar=date(2026, 10, 25), s
             'checar_em': checar, 'vai_executar': True if marcada else None,
             'prazo': prazo if marcada else None,
             'decidido_por': 'Larissa' if marcada else None,
-            'decidido_em': datetime(2026, 10, 22, 9) if marcada else None}
+            'decidido_em': datetime(2026, 10, 22, 9) if marcada else None,
+            'gravado_em': datetime(2026, 10, 22, 8, 24)}
 
 
 class SinalDaAcao(unittest.TestCase):
@@ -284,6 +285,47 @@ class LeituraDoDia(unittest.TestCase):
         self.assertEqual(df['Situação'].iloc[0], '')
         self.assertIn('Larissa', df['Situação'].iloc[1])
         self.assertIn('29/10', df['Situação'].iloc[1])
+
+
+class TrocaDeCiclo(unittest.TestCase):
+    """C28 marcado; o rodar_ciclo grava o C29 com a leitura do dia ainda em memória
+    (feita quando o C28 era o atual). Antes: a ação do C28 vinha da memória E das
+    anteriores abertas (duplicada) e, fora do histórico do job, aparecia "🆕 hoje"."""
+    DIA = date(2026, 11, 2)
+
+    def setUp(self):
+        self.c28 = [_acao(i, marcada=True, prazo=date(2026, 10, 27)) for i in (1, 2)]
+        c29 = _acao(20, marcada=True, prazo=date(2026, 11, 9))
+        c29.update(ciclo='C29', gravado_em=datetime(2026, 11, 2, 10, 50))
+        self.c29 = [c29]
+        memoria = sd.sinais_acoes(self.c28, self.DIA)           # leitura de antes do C29
+        outro = sd._sinal(LPT, 'ADS', 'MLB1', ('A',), 'x', 'y', 10, regra='ads_custo')
+        self.sinais = memoria + [outro]
+
+    def _acoes(self, sinais):
+        return sorted(x['objeto'] for x in sinais if x['regra'] == 'ads_acao')
+
+    def test_cada_acao_uma_vez(self):
+        s = sd.com_acoes_do_plano(self.sinais, (self.c29, {}, self.c28), self.DIA)
+        self.assertEqual(self._acoes(s), ['acao:1', 'acao:2', 'acao:20'])
+        self.assertEqual(len([x for x in s if x['regra'] == 'ads_custo']), 1)
+
+    def test_mesma_acao_nas_duas_listas_entra_uma_vez(self):
+        s = sd.com_acoes_do_plano([], (self.c28, {}, self.c28), self.DIA)
+        self.assertEqual(self._acoes(s), ['acao:1', 'acao:2'])
+
+    def test_sem_plano_ficam_as_da_memoria(self):
+        self.assertIs(sd.com_acoes_do_plano(self.sinais, None, self.DIA), self.sinais)
+
+    def test_desde_e_a_entrega_do_ciclo_nao_o_historico_do_job(self):
+        s = sd.com_acoes_do_plano(self.sinais, (self.c29, {}, self.c28), self.DIA)
+        # o job nunca gravou as anteriores: histórico só com o outro sinal
+        hist = [(date(2026, 11, 1), LPT, 'ads_custo', 'MLB1')]
+        txt = {x['objeto']: x['desde_txt'] for x in
+               sd.aparece_desde(s, hist, [date(2026, 11, 1)], self.DIA)}
+        self.assertEqual(txt['acao:1'], 'há 11 dias (desde 22/10)')
+        self.assertEqual(txt['acao:20'], '🆕 hoje')               # entregue hoje
+        self.assertEqual(txt['MLB1'], 'há 1 dias (desde 01/11)')  # outros sinais: como antes
 
 
 class DdlConfereComOCodigo(unittest.TestCase):

@@ -707,7 +707,7 @@ SQL_ACOES = """
     )
     SELECT a.id, a.loja, a.ciclo, a.periodo_ini, a.periodo_fim, a.ordem, a.objeto,
            a.codigo_anuncio, a.sku, a.nome_produto, a.acao, a.dono, a.numero_esperado,
-           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em
+           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em, a.gravado_em
       FROM v_ads_acao_vigente a
       JOIN ult u ON u.loja = a.loja AND u.ciclo = a.ciclo
       LEFT JOIN ads_acao_decisao d ON d.id_acao = a.id AND d.decidido_em < %(amanha)s
@@ -728,7 +728,7 @@ SQL_ACOES_ABERTAS_ANTERIORES = """
     )
     SELECT a.id, a.loja, a.ciclo, a.periodo_ini, a.periodo_fim, a.ordem, a.objeto,
            a.codigo_anuncio, a.sku, a.nome_produto, a.acao, a.dono, a.numero_esperado,
-           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em
+           a.checar_em, d.vai_executar, d.prazo, d.decidido_por, d.decidido_em, a.gravado_em
       FROM v_ads_acao_vigente a
       JOIN ads_acao_decisao d ON d.id_acao = a.id AND d.vai_executar
      WHERE a.marketplace = %(marketplace)s AND a.loja = ANY(%(lojas)s)
@@ -756,7 +756,8 @@ SQL_DECIDIR_ACAO = """
 
 ACAO_COLS = ('id', 'loja', 'ciclo', 'periodo_ini', 'periodo_fim', 'ordem', 'objeto',
              'codigo_anuncio', 'sku', 'nome_produto', 'acao', 'dono', 'numero_esperado',
-             'checar_em', 'vai_executar', 'prazo', 'decidido_por', 'decidido_em')
+             'checar_em', 'vai_executar', 'prazo', 'decidido_por', 'decidido_em',
+             'gravado_em')
 
 FONTES_FRESCOR = ('Vendas', 'Estoque', 'Ads', 'Config. de ads', 'Experiência')
 
@@ -1554,7 +1555,9 @@ def sinais_acoes(linhas, hoje):
     """Um sinal 'ads_acao' por ação que a responsável marcou ("vou executar") no
     plano do ciclo mais recente da loja. Chave do Ciente = 'acao:<id>'. Prazo
     vencido = urgente e vermelho. Não tem R$ em jogo (fica na seção própria da
-    loja, fora das 10 vagas por R$)."""
+    loja, fora das 10 vagas por R$). 'desde' = o dia em que o ciclo foi gravado
+    (a entrega à gestora), não o histórico do job: o job não grava as ações de
+    ciclos anteriores, e sem isto elas viravam "🆕 hoje" todo dia."""
     out = []
     for r in linhas or []:
         a = r if isinstance(r, dict) else dict(zip(ACAO_COLS, r))
@@ -1562,7 +1565,7 @@ def sinais_acoes(linhas, hoje):
             continue
         prazo = pd.Timestamp(a['prazo']).date()
         vencido = hoje > prazo
-        out.append(_sinal(
+        out.append({**_sinal(
             a['loja'], 'AÇÃO ADS', a['codigo_anuncio'] or '',
             (a['sku'],) if a['sku'] else (),
             f"{a['ciclo']} · {a['objeto']}: {a['acao']}",
@@ -1570,8 +1573,23 @@ def sinais_acoes(linhas, hoje):
             + (" (vencido)" if vencido else "") + f". Dono: {a['dono']}.",
             0, urgente=vencido, regra='ads_acao', objeto=f"acao:{a['id']}",
             periodo=f"{pd.Timestamp(a['periodo_ini']):%d/%m}–{pd.Timestamp(a['periodo_fim']):%d/%m}",
-            cor='vermelho' if vencido else ''))
+            cor='vermelho' if vencido else ''),
+            'desde': pd.Timestamp(a['gravado_em']).date()})
     return out
+
+
+def com_acoes_do_plano(sinais, plano, hoje):
+    """Troca as ações da leitura em memória (até TTL_LEITURA_S de idade) pelas
+    do plano relido agora: ciclo atual + anteriores sem resposta, uma vez cada.
+    Com as duas juntas, um ciclo gravado dentro da janela da memória fazia a
+    mesma ação entrar duas vezes. Sem plano (erro na leitura ou etapa 2 ausente)
+    ficam as da memória."""
+    if plano is None:
+        return sinais
+    acoes, _resp, abertas = plano
+    unicas = {a['id']: a for a in list(acoes) + list(abertas)}
+    return ([x for x in sinais if x['regra'] != 'ads_acao']
+            + sinais_acoes(list(unicas.values()), hoje))
 
 
 def lojas_das_acoes(lojas, responsaveis, usuario, role, ve_todas):
@@ -2297,7 +2315,8 @@ def aparece_desde(sinais, historico, dias_job, hoje):
     """Marca em cada sinal 'desde' (data em que a sequência começou) e
     'desde_txt' ("🆕 hoje" / "há N dias (desde dd/mm)"). historico: [(data,
     loja, regra, objeto)] dos dias anteriores; dias_job: os dias em que o job
-    rodou no marketplace — só eles contam (dia sem execução não quebra)."""
+    rodou no marketplace — só eles contam (dia sem execução não quebra).
+    Sinal que já traz 'desde' (a ação de ads) fica com ele."""
     por_dia = {}
     for d, loja, regra, objeto in historico or []:
         por_dia.setdefault(pd.Timestamp(d).date(), set()).add((loja, regra, objeto))
@@ -2307,12 +2326,13 @@ def aparece_desde(sinais, historico, dias_job, hoje):
     out = []
     for x in sinais:
         chave = (x['loja'], x['regra'], x['objeto'])
-        desde = hoje
-        for d in dias:
-            if chave in por_dia.get(d, ()):
-                desde = d
-            else:
-                break
+        desde = x.get('desde') or hoje
+        if not x.get('desde'):
+            for d in dias:
+                if chave in por_dia.get(d, ()):
+                    desde = d
+                else:
+                    break
         n = (hoje - desde).days
         out.append({**x, 'desde': desde,
                     'desde_txt': '🆕 hoje' if n == 0 else f"há {n} dias (desde {desde:%d/%m})"})
@@ -2699,9 +2719,10 @@ def _render_marketplace(st, engine, mkt=MARKETPLACE):
         erros = {**erros, 'ciente': 'erro'}
     tempos.append(('Cientes e plano de ação (relidos a cada carga)', time.perf_counter() - t))
     sinais, pendentes, upload_ate = sinais_da_loja_hoje(pacote, lojas, hoje)
-    acoes_plano, responsaveis, abertas_ant = plano if plano else ([], {}, [])
-    # R6: ações marcadas de planos anteriores ainda sem resposta seguem como sinal
-    sinais = sinais + _bloco('acoes', erros_bloco, [], sinais_acoes, abertas_ant, hoje)
+    acoes_plano, responsaveis, _abertas = plano if plano else ([], {}, [])
+    # R6: ações marcadas de planos anteriores ainda sem resposta seguem como sinal.
+    # Todas as ações saem do plano relido agora, nunca da leitura em memória.
+    sinais = _bloco('acoes', erros_bloco, sinais, com_acoes_do_plano, sinais, plano, hoje)
     if dados.get('historico') is not None:
         sinais = _bloco('historico', erros_bloco, sinais, aparece_desde, sinais,
                         dados['historico'], dados.get('historico_dias'), hoje)
