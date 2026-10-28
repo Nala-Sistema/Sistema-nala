@@ -438,7 +438,8 @@ def _mais_vendidos_por_anuncio(engine):
     disp = tab.copy()
     for c in ['Receita', 'Ticket médio', 'Invest. ads', 'Receita ant.']:
         disp[c] = tab[c].map(lambda v: _m(v, _fmt_brl))
-    for c in ['Unidades', 'Visitas (ML)', 'Views 30d (Shopee)', 'Impressões ads',
+    col_views = next(c for c in tab.columns if c.startswith('Views 30d'))
+    for c in ['Unidades', 'Visitas (ML)', col_views, 'Impressões ads',
               'Cliques ads', 'Unid. ant.']:
         disp[c] = tab[c].map(lambda v: _m(v, _fmt_int))
     for c in ['Margem %', 'ACOS %', 'TACOS %', 'Conversão %']:

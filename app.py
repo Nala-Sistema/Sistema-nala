@@ -920,12 +920,7 @@ def main():
         st.session_state.usuario = {}
 
     engine = get_engine()
-    _garantir_tabela_usuario_lojas(engine)
-    _garantir_tabela_estoque(engine)
-    _garantir_tabela_estoque_mensal(engine)
-    _garantir_coluna_visivel_painel(engine)
-    _garantir_tabela_tiktok_skus(engine)
-    _garantir_colunas_custos_extras(engine)
+    _garantir_schema(engine)
 
     if not st.session_state.logado:
         total = _contar_usuarios(engine)
@@ -935,6 +930,59 @@ def main():
             _tela_login(engine)
     else:
         _area_logada(engine)
+
+
+# Tudo o que as _garantir_* abaixo criam. Se já existe, a abertura não tenta
+# DDL: o usuário do app (app_nala) não tem CREATE/ALTER, e cada tentativa era
+# uma ida ao banco perdida, falhando calada, a cada clique.
+SQL_SCHEMA_EM_DIA = """
+    SELECT to_regclass('public.dim_usuario_lojas') IS NOT NULL
+       AND to_regclass('public.dim_estoque') IS NOT NULL
+       AND to_regclass('public.ix_dim_estoque_data') IS NOT NULL
+       AND to_regclass('public.fact_estoque_mensal') IS NOT NULL
+       AND to_regclass('public.ix_estoque_mensal_ref') IS NOT NULL
+       AND to_regclass('public.ix_estoque_mensal_loja') IS NOT NULL
+       AND to_regclass('public.dim_tiktok_skus') IS NOT NULL
+       AND to_regclass('public.ix_custos_extras_anuncio') IS NOT NULL
+       AND to_regclass('public.ix_custos_extras_periodo') IS NOT NULL
+       AND (SELECT count(*)
+              FROM (VALUES ('dim_usuarios', 'nome'),
+                           ('dim_lojas', 'visivel_no_painel'),
+                           ('fact_custos_extras', 'sku'),
+                           ('fact_custos_extras', 'codigo_anuncio'),
+                           ('fact_custos_extras', 'arquivo_origem')) c(tabela, coluna)
+              JOIN pg_attribute a
+                ON a.attrelid = to_regclass('public.' || c.tabela)
+               AND a.attname = c.coluna
+               AND NOT a.attisdropped) = 5
+"""
+
+
+def _schema_em_dia(engine):
+    try:
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        cursor.execute(SQL_SCHEMA_EM_DIA)
+        em_dia = bool(cursor.fetchone()[0])
+        cursor.close()
+        conn.close()
+        return em_dia
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def _garantir_schema(_engine):
+    """Uma vez por processo; só roda a DDL se faltar alguma peça.
+    visivel_no_painel NULL já conta como visível em todas as telas."""
+    if _schema_em_dia(_engine):
+        return
+    _garantir_tabela_usuario_lojas(_engine)
+    _garantir_tabela_estoque(_engine)
+    _garantir_tabela_estoque_mensal(_engine)
+    _garantir_coluna_visivel_painel(_engine)
+    _garantir_tabela_tiktok_skus(_engine)
+    _garantir_colunas_custos_extras(_engine)
 
 
 def _garantir_tabela_usuario_lojas(engine):

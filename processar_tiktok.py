@@ -107,21 +107,17 @@ def _buscar_tiktok_sku_map(engine):
 
 
 def _upsert_tiktok_nomes(engine, nomes_dict):
-    """Upsert nome_produto/nome_sku_variante sem sobrescrever sku_interno."""
+    """Upsert nome_produto/nome_sku_variante sem sobrescrever sku_interno.
+
+    A tabela já existe (app.py cria na abertura). Não pôr CREATE aqui: o
+    usuário do app não tem CREATE, e na mesma transação o erro derrubava
+    a gravação dos nomes sem aviso.
+    """
     if not nomes_dict:
         return
     try:
         conn = engine.raw_connection()
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS dim_tiktok_skus (
-                id_sku_tiktok     VARCHAR(50) PRIMARY KEY,
-                nome_produto      TEXT,
-                nome_sku_variante TEXT,
-                sku_interno       VARCHAR(120),
-                atualizado_em     TIMESTAMP DEFAULT NOW()
-            )
-        """)
         for sku_tiktok, (nome_prod, nome_var) in nomes_dict.items():
             cursor.execute("""
                 INSERT INTO dim_tiktok_skus (id_sku_tiktok, nome_produto, nome_sku_variante)

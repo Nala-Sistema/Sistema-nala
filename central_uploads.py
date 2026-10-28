@@ -289,7 +289,16 @@ def _garantir_tabela_devolucoes(engine):
     """
     try:
         conn = engine.raw_connection(); cursor = conn.cursor()
-        cursor.execute(ddl)
+        # Já existe: não tenta DDL. O app_nala não tem CREATE e o erro sujava
+        # o log com "permission denied" a cada upload.
+        cursor.execute("""
+            SELECT to_regclass('public.fact_devolucoes') IS NOT NULL
+               AND to_regclass('public.idx_devolucoes_pedido') IS NOT NULL
+               AND to_regclass('public.idx_devolucoes_data') IS NOT NULL
+               AND to_regclass('public.idx_devolucoes_marketplace') IS NOT NULL
+        """)
+        if not cursor.fetchone()[0]:
+            cursor.execute(ddl)
         conn.commit(); cursor.close(); conn.close()
     except Exception as e:
         print(f"[NALA] Erro ao criar fact_devolucoes: {e}")

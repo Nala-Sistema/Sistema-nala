@@ -346,6 +346,30 @@ class Carga(unittest.TestCase):
         self.assertEqual(out, {'ML-LPT': ['visitas']})  # YanniSP não tem ads
 
 
+class FotoDasViews(unittest.TestCase):
+    """A data da foto de views da Shopee vai no título da coluna (Mais Vendidos e
+    aba Semana): a foto é a última até o fim do período, não a última do banco."""
+
+    def test_rotulo(self):
+        self.assertIsNone(ta.foto_views([None, float('nan')]))
+        self.assertEqual(ta.foto_views([date(2026, 10, 26), date(2026, 10, 26)]), 'foto 26/10')
+        self.assertEqual(ta.foto_views([date(2026, 10, 26), datetime(2026, 10, 25)]),
+                         'fotos 25/10 a 26/10')
+
+    def test_titulo_da_coluna_na_mais_vendidos(self):
+        import pandas as pd
+        base = {'skus': 'A', 'nome': 'P', 'un': 10, 'rec': 100.0, 'marg': 10.0, 'visitas': None,
+                'imp': 0, 'cli': 0, 'gasto': 0, 'rec_ads': 0, 'rec_ant': 90.0, 'un_ant': 9}
+        df = pd.DataFrame([
+            {**base, 'loja': 'ML-LPT', 'mkt': ML, 'chave': 'MLB1', 'visitas': 50,
+             'views_30d': None, 'views_foto': None},
+            {**base, 'loja': 'Shopee-LPT', 'mkt': SHP, 'chave': '22', 'views_30d': 400,
+             'views_foto': date(2026, 10, 26)}])
+        self.assertIn('Views 30d (foto 26/10)', ta.tabela_ataque(df, 30).columns)
+        sem_shopee = df.iloc[:1]
+        self.assertIn('Views 30d (Shopee)', ta.tabela_ataque(sem_shopee, 30).columns)
+
+
 class SQL(unittest.TestCase):
     def test_sem_porcento_solto(self):
         for sql in ps.TODAS_AS_SQL + (ta.SQL_ATAQUE,):
