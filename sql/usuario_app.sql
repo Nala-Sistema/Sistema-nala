@@ -24,7 +24,10 @@
 --   5. Confere tudo no fim. Se algo sair do desenho, da ERRO e desfaz tudo.
 --
 -- O QUE NAO FAZ (de proposito)
---   - Nenhum CREATE/ALTER/DROP: o app nao cria mais tabela (commit 1b0c0dc).
+--   - Nenhum CREATE/ALTER/DROP. A abertura do app (1b0c0dc) e o upload de
+--     devolucoes so tentam DDL se faltar a tabela. Sobram tentativas caladas
+--     (sem log) em processar_ads_shopee.py e matching_ads_titulos.py: falham
+--     sem efeito, as tabelas/colunas ja existem.
 --   - NAO escreve em sinal_historico (so o job, usuario sinais_historico),
 --     ads_acao (so o rodar_ciclo, usuario ciclo_ads) nem dim_estoque (upload
 --     parado). So le.
@@ -232,6 +235,7 @@ BEGIN
                    CASE WHEN has_table_privilege(r, o.oid, 'REFERENCES')
                           OR has_any_column_privilege(r, o.oid, 'REFERENCES') THEN 'REFERENCES' END,
                    CASE WHEN has_table_privilege(r, o.oid, 'TRIGGER') THEN 'TRIGGER' END,
+                   CASE WHEN has_table_privilege(r, o.oid, 'MAINTAIN') THEN 'MAINTAIN' END,
                    CASE WHEN NOT has_table_privilege(r, o.oid, 'SELECT')
                          AND has_any_column_privilege(r, o.oid, 'SELECT') THEN 'SELECT(colunas)' END,
                    CASE WHEN NOT has_table_privilege(r, o.oid, 'INSERT')
@@ -394,6 +398,7 @@ tem_hoje AS (
                CASE WHEN has_table_privilege('app_nala', o.oid, 'REFERENCES')
                       OR has_any_column_privilege('app_nala', o.oid, 'REFERENCES') THEN 'REFERENCES' END,
                CASE WHEN has_table_privilege('app_nala', o.oid, 'TRIGGER') THEN 'TRIGGER' END,
+               CASE WHEN has_table_privilege('app_nala', o.oid, 'MAINTAIN') THEN 'MAINTAIN' END,
                CASE WHEN NOT has_table_privilege('app_nala', o.oid, 'SELECT')
                      AND has_any_column_privilege('app_nala', o.oid, 'SELECT') THEN 'SELECT(colunas)' END,
                CASE WHEN NOT has_table_privilege('app_nala', o.oid, 'INSERT')

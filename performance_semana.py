@@ -1106,8 +1106,9 @@ def _estoque_txt(r, ctx):
 def tabela_itens(itens, linhas_por_chave, ctx):
     """DataFrame das colunas da seção 3 da v2 (um item por anúncio × regra)."""
     rows = []
-    foto = ta.foto_views([r.get('views_foto') for r in linhas_por_chave.values()
-                          if not eh_ml(r)])
+    # só os anúncios desta tabela: a de uma loja do ML não leva data da Shopee
+    linhas = [linhas_por_chave.get((i['loja'], i['chave'])) for i in itens]
+    foto = ta.foto_views([r.get('views_foto') for r in linhas if r and not eh_ml(r)])
     col_vis = 'Visitas / conversão' + (f" (views Shopee: {foto})" if foto else '')
     for i in sorted(itens, key=lambda x: (x['pos'], -x['em_jogo'])):
         r = linhas_por_chave.get((i['loja'], i['chave']), {})

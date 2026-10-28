@@ -58,7 +58,11 @@ BEGIN
     -- tabela nova deixa de nascer legivel para ele
     EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE neondb_owner IN SCHEMA public '
                    'REVOKE ALL ON TABLES FROM %I', r);
-    EXECUTE format('DROP OWNED BY %I', r);   -- so tira os GRANTs (nao e dono de nada)
+    -- Tira os GRANTs um a um. NAO usar DROP OWNED BY: no PG17 o neondb_owner
+    -- so tem ADMIN no papel (sem INHERIT/SET) e o comando da permission denied.
+    EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA public FROM %I', r);
+    EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM %I', r);
+    EXECUTE format('REVOKE ALL ON SCHEMA public FROM %I', r);
     EXECUTE format('DROP ROLE %I', r);
     RAISE NOTICE '% apagado.', r;
 END
