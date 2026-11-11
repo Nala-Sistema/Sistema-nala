@@ -487,23 +487,28 @@ SQL_ADS = """
 
 # Foto de config de hoje × a foto anterior de cada campanha. A foto sai às
 # ~05h30: o que a gestora mudou ONTEM aparece na foto de HOJE.
+# A campanha é o CÓDIGO (chave; sem código, o id_campanha, como na Shopee); id_campanha
+# e campanha saem da própria foto, porque o objeto do Ciente é montado com esse nome
+# (mudar para o primeiro nome reabriria a marcação da Larissa na Fita, 30/10).
 SQL_CONFIG_MUDOU = """
     WITH c AS (
-        SELECT DISTINCT ON (loja, id_campanha, data_captura::date)
-               loja, id_campanha, campanha, data_captura::date AS dia,
+        SELECT DISTINCT ON (loja, COALESCE(codigo_campanha, id_campanha), data_captura::date)
+               loja, COALESCE(codigo_campanha, id_campanha) AS chave, id_campanha, campanha,
+               data_captura::date AS dia,
                roas_objetivo, orcamento_diario, detalhe->>'item_id' AS item_id
           FROM fact_ads_campanha_config
          WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
            AND data_captura >= %(ini_curto)s AND data_captura < %(amanha)s
-         ORDER BY loja, id_campanha, data_captura::date, data_captura DESC),
+         ORDER BY loja, COALESCE(codigo_campanha, id_campanha), data_captura::date,
+                  data_captura DESC),
     r AS (
-        SELECT c.*, row_number() OVER (PARTITION BY loja, id_campanha ORDER BY dia DESC) AS k
+        SELECT c.*, row_number() OVER (PARTITION BY loja, chave ORDER BY dia DESC) AS k
           FROM c)
     SELECT a.loja, a.id_campanha, a.campanha, b.dia AS dia_antes, a.dia AS dia_agora,
            b.roas_objetivo AS roas_antes, a.roas_objetivo AS roas_agora,
            b.orcamento_diario AS orc_antes, a.orcamento_diario AS orc_agora, a.item_id
       FROM r a
-      JOIN r b ON b.loja = a.loja AND b.id_campanha = a.id_campanha AND b.k = 2
+      JOIN r b ON b.loja = a.loja AND b.chave = a.chave AND b.k = 2
      WHERE a.k = 1 AND a.dia = %(hoje)s
        AND (a.roas_objetivo IS DISTINCT FROM b.roas_objetivo
             OR a.orcamento_diario IS DISTINCT FROM b.orcamento_diario)
@@ -514,18 +519,20 @@ SQL_CONFIG_MUDOU = """
 # depois (a gestora apertou o ROAS de propósito) — vira informativo, não espiral.
 SQL_ROAS_SUBIU = """
     WITH c AS (
-        SELECT DISTINCT ON (loja, id_campanha, data_captura::date)
-               loja, id_campanha, campanha, data_captura::date AS dia,
+        SELECT DISTINCT ON (loja, COALESCE(codigo_campanha, id_campanha), data_captura::date)
+               loja, COALESCE(codigo_campanha, id_campanha) AS chave, id_campanha, campanha,
+               data_captura::date AS dia,
                roas_objetivo, detalhe->>'item_id' AS item_id
           FROM fact_ads_campanha_config
          WHERE marketplace = %(marketplace)s AND loja = ANY(%(lojas)s)
            AND data_captura >= %(ini_roas)s AND data_captura < %(amanha)s
-         ORDER BY loja, id_campanha, data_captura::date, data_captura DESC),
+         ORDER BY loja, COALESCE(codigo_campanha, id_campanha), data_captura::date,
+                  data_captura DESC),
     l AS (
-        SELECT c.*, lag(roas_objetivo) OVER (PARTITION BY loja, id_campanha ORDER BY dia) AS antes
+        SELECT c.*, lag(roas_objetivo) OVER (PARTITION BY loja, chave ORDER BY dia) AS antes
           FROM c),
     s AS (
-        SELECT l.*, row_number() OVER (PARTITION BY loja, id_campanha ORDER BY dia DESC) AS k
+        SELECT l.*, row_number() OVER (PARTITION BY loja, chave ORDER BY dia DESC) AS k
           FROM l
          WHERE antes > 0 AND roas_objetivo > antes AND dia >= %(roas_desde)s)
     SELECT loja, id_campanha, campanha, dia, antes, roas_objetivo, item_id
