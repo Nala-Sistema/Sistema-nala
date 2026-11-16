@@ -88,7 +88,7 @@ def carregar_vendas_30d(_engine, lojas_tuple):
     ph = ", ".join(ph_list)
     query = text(f"""
         SELECT sku, loja_origem AS loja, COUNT(*) AS qtd_vendas_30d,
-               AVG(margem_percentual) AS margem_real_30d
+               SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100 AS margem_real_30d
         FROM fact_vendas_snapshot
         WHERE loja_origem IN ({ph}) AND data_venda >= :data_corte
         GROUP BY sku, loja_origem

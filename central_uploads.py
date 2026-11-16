@@ -1007,8 +1007,9 @@ def tab_vendas_consolidadas(engine):
     ped_a = len(df_cc); ped_ant = len(df_ac) if not df_ac.empty else 0
     var_p = ((ped_a-ped_ant)/ped_ant*100) if ped_ant > 0 else 0
     c2.metric("Pedidos", formatar_quantidade(ped_a), formatar_percentual(var_p))
-    mg_a = df_cc['margem_percentual'].mean() if not df_cc.empty else 0
-    mg_ant = df_ac['margem_percentual'].mean() if not df_ac.empty else 0
+    # Margem ponderada pela receita (SUM margem ÷ SUM receita), não média das % por linha
+    mg_a = (float(df_cc['margem_total'].sum()) / float(rec_a) * 100) if rec_a > 0 else 0
+    mg_ant = (float(df_ac['margem_total'].sum()) / float(rec_ant) * 100) if rec_ant > 0 else 0
     c3.metric("Margem Média", formatar_percentual(mg_a), formatar_percentual(mg_a - mg_ant))
     c4.metric("Pendentes", formatar_quantidade(len(df_sc)),
         formatar_valor(df_sc['valor_venda_efetivo'].sum()) + " não contabilizados", delta_color="off")

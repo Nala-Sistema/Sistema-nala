@@ -360,7 +360,7 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None, data_fim=None
             SELECT codigo_anuncio, MAX(sku) as sku, logistica,
                    SUM(quantidade)::float as qtd_vendas,
                    SUM(valor_venda_efetivo)::float as fat_vendas,
-                   AVG(margem_percentual)::float as margem_atual
+                   COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0)::float as margem_atual
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
               AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
@@ -372,7 +372,7 @@ def buscar_realizados_mes(engine, loja, ano_mes, marketplace=None, data_fim=None
                    MAX(sku) as sku, NULL as logistica,
                    SUM(quantidade)::float as qtd_vendas,
                    SUM(valor_venda_efetivo)::float as fat_vendas,
-                   AVG(margem_percentual)::float as margem_atual
+                   COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0)::float as margem_atual
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
               AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
@@ -538,7 +538,7 @@ def buscar_margem_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
 
     if is_amazon:
         sql = """
-            SELECT codigo_anuncio, logistica, AVG(margem_percentual) as margem_media
+            SELECT codigo_anuncio, logistica, COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0) as margem_media
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
               AND codigo_anuncio IS NOT NULL AND TRIM(codigo_anuncio) != ''
@@ -547,7 +547,7 @@ def buscar_margem_mes_anterior(engine, loja, ano_mes_ref, marketplace=None):
     else:
         sql = """
             SELECT COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) as codigo_anuncio,
-                   AVG(margem_percentual) as margem_media
+                   COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0) as margem_media
             FROM fact_vendas_snapshot
             WHERE loja_origem = %s AND data_venda >= %s AND data_venda <= %s
               AND COALESCE(NULLIF(TRIM(codigo_anuncio), ''), sku) IS NOT NULL
