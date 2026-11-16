@@ -179,7 +179,7 @@ def _buscar_dados_contexto(engine, contexto_usuario):
             SELECT 
                 COUNT(*) as total_vendas,
                 COALESCE(SUM(valor_venda_efetivo), 0) as faturamento,
-                COALESCE(AVG(margem_percentual), 0) as margem_media,
+                COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0) as margem_media,
                 COUNT(DISTINCT sku) as skus_vendidos,
                 COUNT(DISTINCT loja_origem) as lojas_ativas
             FROM fact_vendas_snapshot
@@ -198,7 +198,7 @@ def _buscar_dados_contexto(engine, contexto_usuario):
         # Top 5 SKUs do mês
         colunas_select = "sku, SUM(quantidade) as qtd, SUM(valor_venda_efetivo) as receita"
         if ver_custos:
-            colunas_select += ", AVG(margem_percentual) as margem_pct"
+            colunas_select += ", COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0) as margem_pct"
 
         cursor.execute(f"""
             SELECT {colunas_select}

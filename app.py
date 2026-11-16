@@ -351,7 +351,7 @@ def _metricas_inicio_cached(ano_mes, lojas_key):
         cursor.execute(f"""
             SELECT COALESCE(SUM(valor_venda_efetivo), 0),
                    COALESCE(COUNT(*), 0),
-                   COALESCE(AVG(margem_percentual), 0)
+                   COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0)
             FROM fact_vendas_snapshot
             WHERE data_venda >= %s AND data_venda <= %s {where_loja}
         """, [primeiro_sel, ultimo_sel] + params_loja)
@@ -360,7 +360,7 @@ def _metricas_inicio_cached(ano_mes, lojas_key):
         cursor.execute(f"""
             SELECT COALESCE(SUM(valor_venda_efetivo), 0),
                    COALESCE(COUNT(*), 0),
-                   COALESCE(AVG(margem_percentual), 0)
+                   COALESCE(SUM(margem_total) / NULLIF(SUM(valor_venda_efetivo), 0) * 100, 0)
             FROM fact_vendas_snapshot
             WHERE data_venda >= %s AND data_venda <= %s {where_loja}
         """, [primeiro_ant, ultimo_ant] + params_loja)
@@ -499,7 +499,8 @@ def _panorama_lojas_cached(ano_mes, lojas_key):
                     WHERE f.data_venda >= %s
                       AND f.data_venda <= COALESCE(md.max_mes_sel - INTERVAL '1 month', %s::date)
                 ), 0)                                                                                            AS fat_ant_prop,
-                AVG(f.margem_percentual) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s)                AS margem_pct_sel
+                SUM(f.margem_total) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s) * 100
+                    / NULLIF(SUM(f.valor_venda_efetivo) FILTER (WHERE f.data_venda >= %s AND f.data_venda <= %s), 0)  AS margem_pct_sel
             FROM lojas_visiveis lv
             LEFT JOIN fact_vendas_snapshot f ON f.loja_origem = lv.loja
             LEFT JOIN max_dates md ON md.loja_origem = lv.loja
@@ -513,6 +514,7 @@ def _panorama_lojas_cached(ano_mes, lojas_key):
             primeiro_sel, ultimo_sel,
             primeiro_ant, ultimo_ant,
             primeiro_ant, fallback_ant,
+            primeiro_sel, ultimo_sel,
             primeiro_sel, ultimo_sel,
         ]
 
@@ -632,9 +634,10 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     tot_meta = 0.0
     tot_projetado = 0.0
     tot_projetado_com_meta = 0.0  # apenas lojas COM meta — usado no cálculo de performance
-    # v3.6: agregação ponderada da margem para a linha TOTAL
-    soma_margem_x_vendas = 0.0
-    soma_vendas_com_margem = 0
+    # Margem TOTAL ponderada pela receita: soma(margem% × faturamento) ÷ soma(faturamento)
+    # = SUM(margem_total) ÷ SUM(valor_venda_efetivo) de todas as lojas
+    soma_margem_x_fat = 0.0
+    soma_fat_com_margem = 0.0
 
     for row in rows:
         # v3.6: tupla agora tem 8 colunas (8ª = margem_pct_sel)
@@ -650,9 +653,9 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
         tot_fat_ant += float(fat_ant_t)
         tot_fat_ant_prop += float(fat_ant_p)
 
-        if margem_pct is not None and vendas_int > 0:
-            soma_margem_x_vendas += float(margem_pct) * vendas_int
-            soma_vendas_com_margem += vendas_int
+        if margem_pct is not None and fat_sel_f > 0:
+            soma_margem_x_fat += float(margem_pct) * fat_sel_f
+            soma_fat_com_margem += fat_sel_f
 
         # Meta e modelo da loja
         meta_info = metas.get(loja)
@@ -710,8 +713,8 @@ def _renderizar_panorama(rows, metas, ano_mes, engine):
     tot_proj_html = fmt_brl_short(tot_projetado) if tot_projetado > 0 else '<span class="pct-zero">—</span>'
     # Performance total: considera APENAS projetado de lojas que têm meta cadastrada
     tot_perf = (tot_projetado_com_meta / tot_meta * 100) if tot_meta > 0 and tot_projetado_com_meta > 0 else None
-    # Margem total: média aritmética ponderada pelo nº de vendas de cada loja
-    tot_margem = (soma_margem_x_vendas / soma_vendas_com_margem) if soma_vendas_com_margem > 0 else None
+    # Margem total: ponderada pelo faturamento de cada loja
+    tot_margem = (soma_margem_x_fat / soma_fat_com_margem) if soma_fat_com_margem > 0 else None
 
     html += f'''<tr class="row-total">
         <td>TOTAL</td>

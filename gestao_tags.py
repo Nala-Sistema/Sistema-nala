@@ -305,7 +305,7 @@ def _calcular_curva_abc_sku(engine, dias=30, marketplace=None, loja=None):
                COALESCE(p.nome, '') as produto,
                SUM(v.quantidade) as qtd_vendas,
                SUM(v.valor_venda_efetivo) as receita,
-               AVG(v.margem_percentual) as margem_media,
+               COALESCE(SUM(v.margem_total) / NULLIF(SUM(v.valor_venda_efetivo), 0) * 100, 0) as margem_media,
                COUNT(DISTINCT v.loja_origem) as lojas,
                COUNT(DISTINCT v.marketplace_origem) as marketplaces,
                COALESCE(ts.tag_status, '') as tag_status,
