@@ -258,23 +258,28 @@ def _historico_campanhas(engine):
         return
     loja = st.selectbox("Loja", lojas, key="cfg_ml_loja")
 
+    # A campanha é o CÓDIGO (renomear não quebra a história); o nome exibido é o
+    # PRIMEIRO que ela teve, o mesmo critério do ciclo de ads.
     diario = _q(engine, """
         WITH d AS (
-            SELECT DISTINCT ON (campanha, data_captura::date)
-                   campanha, data_captura::date AS dia, data_captura,
+            SELECT DISTINCT ON (COALESCE(codigo_campanha, id_campanha), data_captura::date)
+                   COALESCE(codigo_campanha, id_campanha) AS chave,
+                   campanha AS nome_da_foto, data_captura::date AS dia, data_captura,
                    roas_objetivo, orcamento_diario, status_campanha,
                    diagnostico_ml, arquivo_origem
             FROM fact_ads_campanha_config
             WHERE marketplace='MERCADO LIVRE' AND loja=%s
-            ORDER BY campanha, data_captura::date, data_captura DESC
+            ORDER BY COALESCE(codigo_campanha, id_campanha), data_captura::date,
+                     data_captura DESC
         )
         SELECT d.*,
+               FIRST_VALUE(nome_da_foto) OVER w AS campanha,
                LAG(dia)              OVER w AS dia_ant,
                LAG(roas_objetivo)    OVER w AS roas_ant,
                LAG(orcamento_diario) OVER w AS orc_ant,
                LAG(status_campanha)  OVER w AS status_ant
         FROM d
-        WINDOW w AS (PARTITION BY campanha ORDER BY dia)
+        WINDOW w AS (PARTITION BY chave ORDER BY dia)
     """, (loja,))
     if diario.empty:
         st.info("Nenhuma foto desta loja.")
