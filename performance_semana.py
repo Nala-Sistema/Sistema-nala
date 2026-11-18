@@ -211,27 +211,48 @@ SQL_ESTOQUE = """
 
 # Campanhas: gasto da semana, os anúncios de cada campanha (base + semana) e
 # o orçamento diário médio das fotos da semana (a foto das ~05h30 vale o dia).
+# A campanha é o CÓDIGO (sem código, o id_campanha, como na Shopee): renomear no meio da
+# semana não parte o gasto em duas. Nome exibido = o primeiro, como no ciclo de ads; `nomes`
+# guarda os id_campanha da campanha, porque a SQL_ROAS_SUBIU devolve o nome da foto.
 SQL_CAMPANHAS = """
     WITH g AS (
-        SELECT loja, id_campanha::text AS id_campanha, MAX(campanha) AS campanha,
+        SELECT loja, COALESCE(codigo_campanha, id_campanha::text) AS chave,
+               MAX(campanha) AS campanha,
                SUM(gasto_ads) FILTER (WHERE data BETWEEN %(sem_ini)s AND %(sem_fim)s) AS gasto_sem,
-               array_agg(DISTINCT codigo_anuncio) AS anuncios
+               array_agg(DISTINCT codigo_anuncio) AS anuncios,
+               array_agg(DISTINCT id_campanha::text) AS nomes
           FROM fact_ads_performance
          WHERE loja = ANY(%(lojas)s) AND data BETWEEN %(base_ini)s AND %(sem_fim)s
            AND id_campanha IS NOT NULL AND codigo_anuncio IS NOT NULL
-         GROUP BY loja, id_campanha::text),
+         GROUP BY loja, COALESCE(codigo_campanha, id_campanha::text)),
     o AS (
-        SELECT loja, id_campanha, AVG(orcamento_diario) AS orc_medio, COUNT(*) AS dias_orc
-          FROM (SELECT DISTINCT ON (loja, id_campanha::text, data_captura::date)
-                       loja, id_campanha::text AS id_campanha, orcamento_diario
+        SELECT loja, chave, AVG(orcamento_diario) AS orc_medio, COUNT(*) AS dias_orc
+          FROM (SELECT DISTINCT ON (loja, COALESCE(codigo_campanha, id_campanha::text),
+                                    data_captura::date)
+                       loja, COALESCE(codigo_campanha, id_campanha::text) AS chave,
+                       orcamento_diario
                   FROM fact_ads_campanha_config
                  WHERE loja = ANY(%(lojas)s)
                    AND data_captura >= %(sem_ini)s AND data_captura < %(sem_fim_mais1)s
-                 ORDER BY loja, id_campanha::text, data_captura::date, data_captura DESC) x
+                 ORDER BY loja, COALESCE(codigo_campanha, id_campanha::text),
+                          data_captura::date, data_captura DESC) x
          WHERE orcamento_diario > 0
-         GROUP BY loja, id_campanha)
-    SELECT g.loja, g.id_campanha, g.campanha, g.gasto_sem, g.anuncios, o.orc_medio, o.dias_orc
-      FROM g LEFT JOIN o ON o.loja = g.loja AND o.id_campanha = g.id_campanha
+         GROUP BY loja, chave),
+    p AS (
+        SELECT DISTINCT ON (loja, chave) loja, chave, campanha
+          FROM (SELECT loja, codigo_campanha AS chave, campanha, data AS dia
+                  FROM fact_ads_performance
+                 WHERE loja = ANY(%(lojas)s) AND codigo_campanha IS NOT NULL
+                UNION ALL
+                SELECT loja, codigo_campanha, campanha, data_captura::date
+                  FROM fact_ads_campanha_config
+                 WHERE loja = ANY(%(lojas)s) AND codigo_campanha IS NOT NULL) x
+         ORDER BY loja, chave, dia, campanha)
+    SELECT g.loja, g.chave AS id_campanha, COALESCE(p.campanha, g.campanha) AS campanha,
+           g.gasto_sem, g.anuncios, o.orc_medio, o.dias_orc, g.nomes
+      FROM g
+      LEFT JOIN o ON o.loja = g.loja AND o.chave = g.chave
+      LEFT JOIN p ON p.loja = g.loja AND p.chave = g.chave
 """
 
 SQL_NOTA = """
@@ -992,8 +1013,11 @@ def contexto(dados):
             parados[i['loja']].append(i)
     camps = [{'loja': l, 'id_campanha': c, 'campanha': n, 'gasto_sem': g,
               'anuncios': list(a or []), 'orc_medio': o, 'dias_orc': d}
-             for l, c, n, g, a, o, d in dados['campanhas']]
-    por_camp = {(c['loja'], c['id_campanha']): c['anuncios'] for c in camps}
+             for l, c, n, g, a, o, d, _nomes in dados['campanhas']]
+    por_camp = {}                       # pelo nome da foto: é o que a SQL_ROAS_SUBIU devolve
+    for linha in dados['campanhas']:
+        for nome in linha[7] or []:
+            por_camp.setdefault((linha[0], nome), set()).update(linha[4] or [])
     roas = []
     for loja, id_c, campanha, dia, antes, depois, item_id in dados['roas']:
         an = set(por_camp.get((loja, str(id_c)), []))
